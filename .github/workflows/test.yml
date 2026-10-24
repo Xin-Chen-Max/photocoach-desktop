@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-lock.txt
+      - name: Install PhotoCoach
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Run offline tests
+        run: python -m pytest -q
+      - name: Verify wheel
+        run: python scripts/verify_wheel.py --output verification-runs/wheel
