@@ -1,51 +1,76 @@
 # Testing and verification
 
-The October 24, 2026 publication check on Windows / Python 3.12 completed with **968 passed, 2 skipped**. The isolated wheel build and headless package smoke check also passed, with zero API attempts. Real-RAW and live-provider checks were not rerun for this publication.
+## 0.12.0 release checks
 
-## Offline suite
+The public source completed **1,238 tests with 2 skips** on Windows / Python 3.12.14, exit 0. The skips are the opt-in real credential test and a symlink operation unavailable to this Windows account. The isolated wheel build and package smoke test also passed.
 
-From the repository root:
-
-```powershell
-& .\.venv\Scripts\python.exe -m pytest -q
-```
-
-The suite isolates `%LOCALAPPDATA%` in temporary directories and removes common key variables from each test environment. GUI checks use Qt's offscreen platform. Provider checks inject fake transports; they do not call a live model service.
-
-Coverage includes processing invariants, exact preview/export agreement on synthetic arrays, grouped undo/redo, project migration and replay, source overwrite protection, connection recovery, credential selection, cancellation, response escaping, and preview scheduling.
-
-Real Windows Credential Manager smoke testing is opt-in. Filesystem tests may skip operations that require unavailable Windows privileges. Test output identifies each skip; a skip is not a passed manual check.
-
-## Real-RAW workflow
-
-Use your own camera files and a new output directory. The parent output directory must already exist. These commands create local projects, exports, screenshots, and reports; those outputs may contain your photographs and source paths and are ignored by Git.
+The default suite isolates settings, removes common key variables and injects fake provider transports. It covers image operators, state/history, migration, file protection, request handling, cancellation, response escaping and Qt interactions. It requires no camera file or paid API call.
 
 ```powershell
-New-Item -ItemType Directory -Force verification-runs | Out-Null
-& .\.venv\Scripts\python.exe scripts\verify_workflow.py C:\photos\first.ARW --second C:\photos\second.ARW --output verification-runs\workflow-check
-& .\.venv\Scripts\python.exe scripts\verify_coach_workflow.py C:\photos\first.ARW --output verification-runs\coach-check
-```
-
-The coach workflow uses a fake provider transport, including success, cancellation, and failure paths. It checks request construction without a paid request. Source hashes are checked to detect modification of the originals.
-
-## Build check
-
-```powershell
+& .\.venv\Scripts\python.exe -m pytest -q -rs
 & .\.venv\Scripts\python.exe scripts\verify_wheel.py --output verification-runs\wheel-check
 ```
 
-This builds a wheel without dependency downloads, extracts it outside the checkout, verifies packaged modules/assets, and opens an offscreen window using the extracted package.
+A test run passes only if its process exits normally. Qt is owned for the test session, and test windows/workers are closed before interpreter teardown.
 
-## Preview benchmark
+## Native-scale detail regression
+
+Before 0.12.0, dragging applied sharpening/NR to an already reduced preview. Refinement filtered native pixels before reducing, so Fit could show an exaggerated temporary effect. At 100% the two paths were much closer.
+
+Active spatial detail now uses native sampling during dragging and refinement, including a detail gesture that reaches zero. Tests cover sharpening, edge masking with sharpening enabled, both NR controls, the preset, rotation, cold/warm decodes, zero endpoints, cancellation and one-gesture history. Active-detail project refreshes also use native filters.
+
+`verify_parameter_previews.py` passed **113 cases on synthetic hue/texture data and 113 on a native Sony RAW region**. It covers global tone, curves, all 24 HSL controls in both directions, base modes, lens correction, detail, crop/straighten, linear/radial mask fields and combined edits. Formal 8-bit previews matched the export path; actual 16-bit TIFF files were written/read with at most one 8-bit level of quantization difference. Five full RAW re-decodes checked warmth, tint and each relative RGB gain.
+
+`verify_parameter_ui.py` passed **113 native-window cases** on a real Sony ARW. Scalar, HSL, lens and individual detail cases used slider signals. Discrete composition/base changes and compound mask snapshots used their state commit interfaces. Displayed final pixels, Undo/Redo and stale-frame guards were checked. English/Chinese 1280x800 and 1920x1080 captures covered Fit/100% and dragging/refinement. No claim is made about every possible crop/mask pointer trajectory.
 
 ```powershell
-& .\.venv\Scripts\python.exe scripts\benchmark_preview.py C:\photos\large.ARW --output verification-runs\preview-benchmark
+& .\.venv\Scripts\python.exe scripts\verify_parameter_previews.py C:\photos\sample.ARW verification-runs\parameters
+& .\.venv\Scripts\python.exe scripts\verify_parameter_ui.py C:\photos\sample.ARW verification-runs\native-ui
 ```
 
-This measures synchronous worker rendering and records output hashes. It excludes GUI input latency, painting, and physical display scaling. Comparisons require the same source file, parameters, dependencies, and hardware. A benchmark result on one machine does not establish general desktop responsiveness.
+Use a fresh output directory. Reports and images can contain photographs and local paths; they stay local and are ignored by Git.
 
-## Manual checks
+## Editing and request workflows
 
-Before treating a release as suitable for a particular workflow, inspect orientation, color, crop/mask geometry, zoom and pan, drag behavior, project reopening, and exported files on the target Windows display. Evaluate each live provider/model separately when cloud coaching is needed.
+The two-source real-RAW workflow passed ten edits, exact Undo/Redo pixels, project save/reopen with redo, aligned comparison, photo switching and full JPEG/TIFF export. An independent full decode/render matched every 16-bit TIFF value; the native preview comparison had zero 8-bit difference. Original source hashes were unchanged.
 
-The repository's demonstration screenshot uses a public-domain JPEG preview fixture. It provides no real-RAW decoding, color-calibration, or live-model evidence.
+The simulated cloud workflow passed request review, exact parameter context, editing while a request waited, stale reply rejection, timeout without retry and continued editing. It made three simulated attempts and zero remote calls. A regression also covers a timeout exception without duration metadata, which must produce a safe message rather than a formatting error.
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\verify_workflow.py C:\photos\first.ARW --second C:\photos\second.ARW --output verification-runs\workflow
+& .\.venv\Scripts\python.exe scripts\verify_coach_workflow.py C:\photos\first.ARW --output verification-runs\coach
+```
+
+## Performance observations
+
+Five warmed repeats on one Windows workstation and one Sony ARW measured:
+
+| Work | Median | Slowest |
+| --- | ---: | ---: |
+| Fit, Sharpening 80, native filtering | 1,549.70 ms | 1,783.73 ms |
+| 100%, 960x640 region, Sharpening 80 | 83.95 ms | 91.72 ms |
+| Fit, exposure-only fast approximation | 43.01 ms | 112.08 ms |
+
+Cold quick import was 1.199 seconds. The first formal Fit render including full decode was 2.582 seconds. Repeated edits caused no additional RAW decodes. Retained linear data stayed below 512 MiB; measured process peak working set was about 944 MiB. This is a local reference, not a guarantee for another camera or machine. Fit detail is intentionally more expensive than the old reduced-grid filter, which did different work.
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\benchmark_detail_preview.py C:\photos\sample.ARW verification-runs\detail-timing
+```
+
+## Win64 package
+
+The final unsigned AMD64 ZIP was extracted into a new path containing spaces and Unicode. With project Python and the checkout removed from PATH, it opened the real RAW, applied Sharpening 80, undid it, loaded its icon and verified TIFF output. No cloud request or credential read was used. The builder records dependency versions and LF-normalized source hashes. The package includes the MIT license and component notices.
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+& .\.venv\Scripts\python.exe scripts\build_windows.py --output dist\win64
+& .\.venv\Scripts\python.exe scripts\verify_windows_bundle.py dist\win64\PhotoCoach-0.12.0-win64.zip verification-runs\bundle --raw C:\photos\sample.ARW
+```
+
+The SHA-256 checksum for the downloadable file is in the release's `SHA256SUMS.txt`. Rebuilds can have different archive hashes. Another physical machine, ARM64, code signing and SmartScreen reputation remain unverified.
+
+## Evidence limits
+
+Real-photo verification used developer-supplied Sony files that are not redistributed. Synthetic colors exercise hue bands absent from a particular scene. The README screenshot uses a credited public-domain JPEG and demonstrates the UI, not RAW decoding. Live-provider quality, calibrated monitor color, camera-JPEG/Lightroom matching and aesthetic accuracy of local models were not established by these checks.
+
+The earlier October 24, 2026 source publication recorded 968 passed and 2 skipped. Those historical results are separate from the 0.12.0 checks above.

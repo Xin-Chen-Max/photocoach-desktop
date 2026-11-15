@@ -74,8 +74,16 @@ def test_v6_non_neutral_linear_history_migrates_unchanged(tmp_path):
     g=LinearGradient('l','Existing',(.2,.3),(.8,.7),exposure_ev=.4)
     store.set_parameter('local_gradients',(g,));store.set_exposure(.2);store.undo()
     data=snapshot_project(store);data['schema_version']=6;data['pipeline_version']='phase1-sdr-srgb-v6'
+    def strip_lens(value):
+        if isinstance(value, dict):
+            value.pop('base_rendering', None)
+            value.pop('lens_corrections', None)
+            for child in value.values(): strip_lens(child)
+        elif isinstance(value, list):
+            for child in value: strip_lens(child)
+    strip_lens(data)
     old=copy.deepcopy(data);up=upgrade_project(data)
-    assert data==old and up['schema_version']==7
+    assert data==old and up['schema_version']==9
     undo,redo=validate_project(up)
     assert undo==store.undo_stack and redo==store.redo_stack
     bad=copy.deepcopy(data);bad['state']['parameters']['local_gradients']=[radial().to_dict()]

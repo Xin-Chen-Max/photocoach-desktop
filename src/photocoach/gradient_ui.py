@@ -26,7 +26,8 @@ class GradientEditor(QWidget):
         self.new_shape=QComboBox();self.new_shape.addItems(('Linear','Radial'))
         self.new_shape.setAccessibleName('New mask shape')
         self.new_shape.setToolTip('Shape for the next new mask. Existing masks are unchanged.')
-        creation=QHBoxLayout();creation.addWidget(QLabel('New mask'));creation.addWidget(self.new_shape,1)
+        self.new_mask_label=QLabel('New mask')
+        creation=QHBoxLayout();creation.addWidget(self.new_mask_label);creation.addWidget(self.new_shape,1)
         layout.addLayout(creation)
         row=QHBoxLayout()
         self.add=QPushButton('Add mask');self.done=QPushButton('Done')
@@ -39,7 +40,7 @@ class GradientEditor(QWidget):
         self.enabled=QCheckBox('Enabled');self.inverted=QCheckBox('Invert')
         switches.addWidget(self.enabled);switches.addWidget(self.inverted);body.addLayout(switches)
         self.sliders={};self.labels={}
-        for name,title,limit in (('exposure_ev','Exposure',300),('highlights','Highlights',100),('shadows','Shadows',100)):
+        for name,title,limit in (('exposure_ev','Exposure',300),('highlights','Highlights',100),('shadows','Shadows',100),('warmth','Warmth',100)):
             label=ParameterLabel();slider=EditSlider(Qt.Orientation.Horizontal)
             slider.setRange(-limit,limit);slider.setAccessibleName(f'Local gradient {title}')
             slider.sliderPressed.connect(self.gestureStarted);slider.sliderReleased.connect(self.gestureEnded)
@@ -54,14 +55,25 @@ class GradientEditor(QWidget):
         self.feather.sliderReleased.connect(self.gestureEnded)
         self.feather.valueChanged.connect(lambda value:self._change(feather=value/100))
         body.addWidget(self.feather_label);body.addWidget(self.feather)
+        self.angle_label=ParameterLabel()
+        self.angle=EditSlider(Qt.Orientation.Horizontal)
+        self.angle.setRange(-90,90);self.angle.setAccessibleName('Radial angle')
+        self.angle.setToolTip('Tilt angle of the radial light beam (-90° to +90°).')
+        self.angle.sliderPressed.connect(self.gestureStarted)
+        self.angle.sliderReleased.connect(self.gestureEnded)
+        self.angle.valueChanged.connect(lambda value:self._change(angle=float(value)))
+        body.addWidget(self.angle_label);body.addWidget(self.angle)
         self.redraw=QPushButton('Redraw mask')
         self.reset=QPushButton('Reset adjustments');self.delete=QPushButton('Delete mask')
-        for button in (self.redraw,self.reset,self.delete):body.addWidget(button)
+        mask_actions=QHBoxLayout();mask_actions.addWidget(self.redraw);mask_actions.addWidget(self.delete)
+        body.addLayout(mask_actions);body.addWidget(self.reset)
         self.edit_on_photo=QCheckBox('Edit on photo');self.show_mask=QCheckBox('Show selected mask')
-        body.addWidget(self.edit_on_photo);body.addWidget(self.show_mask)
+        overlay_row=QHBoxLayout();overlay_row.addWidget(self.edit_on_photo);overlay_row.addWidget(self.show_mask)
+        body.addLayout(overlay_row)
         layout.addWidget(self.controls)
         self.hint=QLabel('Add a gradient, then drag from the fully affected side toward the unaffected side.')
-        self.hint.setWordWrap(True);self.hint.setMinimumHeight(55);layout.addWidget(self.hint)
+        self.hint.setProperty('secondary',True)
+        self.hint.setWordWrap(True);self.hint.setMinimumHeight(38);layout.addWidget(self.hint)
         self.setToolTip('Up to four manual linear or radial masks, attached to original image coordinates. Exposure adds in stops; overlapping Highlights/Shadows combine with global amounts and are limited to −1…+1. No RAW recovery or automatic subject detection.')
         self.add.clicked.connect(lambda:self.drawRequested.emit(False))
         self.redraw.clicked.connect(lambda:self.drawRequested.emit(True))
@@ -69,7 +81,7 @@ class GradientEditor(QWidget):
         self.name.editingFinished.connect(self._rename)
         self.enabled.toggled.connect(lambda v:self._change(enabled=v))
         self.inverted.toggled.connect(lambda v:self._change(inverted=v))
-        self.reset.clicked.connect(lambda:self._change(exposure_ev=0.,highlights=0.,shadows=0.))
+        self.reset.clicked.connect(lambda:self._change(exposure_ev=0.,highlights=0.,shadows=0.,warmth=0.))
         self.delete.clicked.connect(self._delete)
         self.list.currentIndexChanged.connect(self._select)
         self.show_mask.toggled.connect(self.overlayChanged)
@@ -125,6 +137,11 @@ class GradientEditor(QWidget):
         self.feather.setValue(round(current.feather*100) if radial else 50)
         self.feather.blockSignals(False)
         self.feather_label.setText(f'Feather  {self.feather.value()}%')
+        self.angle_label.setVisible(radial);self.angle.setVisible(radial)
+        self.angle.blockSignals(True)
+        self.angle.setValue(round(getattr(current,'angle',0.)) if radial else 0)
+        self.angle.blockSignals(False)
+        self.angle_label.setText(f'Angle  {self.angle.value():+d}°')
         self.controls.setEnabled(current is not None)
         self.done.setEnabled(current is not None or self.edit_on_photo.isChecked())
         for widget,value in ((self.name,current.name if current else ''),
@@ -157,7 +174,7 @@ class GradientController:
     def sync(self):
         state=self.window.store.current
         self.editor.set_values(state.local_gradients if state else (),self.drawing_id)
-        self.window.coach_text.set_gradients(state.local_gradients if state else ())
+        self.window.coach_text.set_edit_values(state.values if state else None)
         current=self.editor.selected
         if current and not self.layer.new_drawing:
             size=self.window.preview.full_size
@@ -255,6 +272,7 @@ class GradientController:
         self.window.tabs.setCurrentIndex(0)
         def reveal():
             if not self.window._closing:
+                self.window.edit_scroll.ensureWidgetVisible(self.editor.reset)
                 self.window.edit_scroll.ensureWidgetVisible(self.editor.list)
                 self.editor.list.setFocus()
         QTimer.singleShot(0,self.window,reveal)

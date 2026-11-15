@@ -50,6 +50,7 @@ def main():
         request_started.set()
         wait_for_release.wait(10)
         feedback = {name: "Simulated provider response for integration verification." for name in FEEDBACK_FIELDS}
+        feedback["actions"] = []
         response = {"status": "completed", "output": [{"type": "message", "content": [{
             "type": "output_text", "text": json.dumps(feedback)}]}],
             "usage": {"input_tokens": 1400, "output_tokens": 200}}
@@ -85,7 +86,7 @@ def main():
     def idle():
         return (window._active is None and window._pending is None and window._pending_detail is None
                 and not window._protected_jobs and not window._render_timer.isActive()
-                and not window._detail_timer.isActive())
+                and not window._detail_timer.isActive() and not window._settle_timer.isActive())
     try:
         window.open_raw(source)
         until(lambda: idle() and window.store.current is not None, "RAW open")
@@ -106,7 +107,9 @@ def main():
         settings.deleteLater()
         window.analyze()
         until(lambda: idle() and window.api_budget.attempts == 1 and window._network_active is None, "first simulated analysis")
-        assert "AI · " + config.model in window.coach_text.toPlainText()
+        assert window.coach_text._feedback is not None
+        assert window.coach_text._feedback.source == "AI · " + config.model
+        assert "Simulated provider response" in window.coach_text.toPlainText()
         context = json.loads(captured[0]["contents"][0]["parts"][0]["text"] if config.protocol == "gemini"
                              else captured[0]["input"][0]["content"][0]["text"])
         assert context["parameters"] == window.store.current.values.to_dict()

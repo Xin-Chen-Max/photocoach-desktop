@@ -4,6 +4,7 @@ import math
 import numpy as np
 
 from .scratch import Scratch
+from .lens import map_to_source
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ def output_size(size, composition):
 
 
 def sample_composition(linear, composition, *, source_size=None, rect=None, target_size=None,
-                       scratch: Scratch | None = None):
+                       scratch: Scratch | None = None, distortion=0.):
     """Sample output pixel centers in linear light, including an optional ROI.
 
     source_size describes the full decode even for reduced preview input. A full
@@ -79,7 +80,7 @@ def sample_composition(linear, composition, *, source_size=None, rect=None, targ
     if tw < 1 or th < 1:
         raise ValueError("Invalid composition sample size.")
     cl, ct, _, _ = crop_bounds(size, composition)
-    if composition.angle == 0 and size == (linear.shape[1], linear.shape[0]) and (tw, th) == (r-l, b-t):
+    if not distortion and composition.angle == 0 and size == (linear.shape[1], linear.shape[0]) and (tw, th) == (r-l, b-t):
         return linear[ct+t:ct+b, cl+l:cl+r]
     if scratch is None:
         scratch = Scratch()
@@ -94,11 +95,15 @@ def sample_composition(linear, composition, *, source_size=None, rect=None, targ
     fl = scratch.get("comp_fl", shape, np.float64)
     np.add((c*x)[None, :], (s*y)[:, None], out=sx)
     sx += size[0]/2
+    np.add((-s*x)[None, :], (c*y)[:, None], out=sy)
+    sy += size[1]/2
+    if distortion:
+        warped_x, warped_y = map_to_source(sx, sy, size, distortion)
+        np.copyto(sx, warped_x)
+        np.copyto(sy, warped_y)
     sx *= linear.shape[1]/size[0]
     sx -= .5
     np.clip(sx, 0, linear.shape[1]-1, out=sx)
-    np.add((-s*x)[None, :], (c*y)[:, None], out=sy)
-    sy += size[1]/2
     sy *= linear.shape[0]/size[1]
     sy -= .5
     np.clip(sy, 0, linear.shape[0]-1, out=sy)

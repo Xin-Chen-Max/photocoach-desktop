@@ -8,6 +8,13 @@ from pathlib import Path
 import tempfile
 from typing import Callable, Iterable
 
+SUPPORTED_RAW_SUFFIXES = (".arw", ".nef")
+
+
+def is_supported_raw_suffix(path: str | Path) -> bool:
+    """Return True for supported read-only RAW source extensions (.ARW, .NEF)."""
+    return Path(path).suffix.lower() in SUPPORTED_RAW_SUFFIXES
+
 
 def sha256_file(path: str | Path) -> str:
     """Hash source bytes using an explicitly read-only handle."""
@@ -26,8 +33,8 @@ def validate_destination(
     if ":" in requested.name or requested.name.endswith((".", " ")):
         # Reject NTFS alternate data streams and Win32 path normalization aliases.
         raise ValueError("The destination filename cannot contain a colon or end with a space or period.")
-    if requested.suffix.lower() == ".arw":
-        raise ValueError("Original ARW files are read-only and cannot be output destinations.")
+    if is_supported_raw_suffix(requested):
+        raise ValueError("Original RAW files (.ARW, .NEF) are read-only and cannot be output destinations.")
     parent = requested.parent.resolve(strict=True)
     if not parent.is_dir():
         raise NotADirectoryError(str(parent))

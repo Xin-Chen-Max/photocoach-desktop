@@ -27,7 +27,7 @@ SCHEMA_VERSION = 2
 MAX_CONNECTIONS = 16
 MAX_FAVORITES = 50
 MAX_RECENT = 8
-PROVIDERS = ("gemini", "openai", "custom")
+PROVIDERS = ("gemini", "openai", "custom", "ollama")
 _ID = re.compile(r"[A-Za-z0-9_-]{1,32}")
 _CONNECTION_FIELDS = frozenset(("id", "provider", "label", "config", "key_source", "key_environment",
                                 "favorites", "recent"))
@@ -35,6 +35,8 @@ _DOCUMENT_FIELDS = frozenset(("schema_version", "connections", "active", "budget
 
 
 def infer_provider(config: ApiConfig) -> str:
+    if config.protocol == "ollama":
+        return "ollama"
     if config.protocol == "gemini":
         return "gemini"
     host = (urlsplit(config.endpoint).hostname or "").lower()
@@ -114,12 +116,15 @@ class ConnectionBook:
             return existing
         from .api_coach import GEMINI_ENDPOINT
         defaults = {
-            "gemini": (GEMINI_ENDPOINT, "gemini-2.5-flash", "gemini", "Google Gemini"),
+            "ollama": ("http://127.0.0.1:11435/api/chat", "qwen3.6:27b", "ollama", "Local AI"),
+            "gemini": (GEMINI_ENDPOINT, "gemini-3.8-flash", "gemini", "Google Gemini"),
             "openai": ("https://api.openai.com/v1/responses", "gpt-4o", "responses", "OpenAI"),
             "custom": ("https://api.openai.com/v1/chat/completions", "gpt-4o", "chat_completions", "Custom service"),
         }
         endpoint, model, protocol, label = defaults.get(provider, defaults["custom"])
-        config = ApiConfig(endpoint=endpoint, model=model, protocol=protocol)
+        config = ApiConfig(endpoint=endpoint, model=model, protocol=protocol,
+                           timeout_seconds=300 if protocol == "ollama" else 60 if protocol == "gemini" else 30,
+                           max_output_tokens=4096 if protocol == "ollama" else 8192 if protocol == "gemini" else 1500)
         return Connection(new_connection_id(), provider, label, config)
 
     def with_connection(self, connection: Connection, *, activate=True) -> "ConnectionBook":
@@ -160,7 +165,7 @@ def new_connection_id() -> str:
 def connection_from_settings(settings: ApiSettings, *, connection_id=None, label=None) -> Connection:
     config, _ = _config_values(settings.config)
     provider = infer_provider(config)
-    names = {"gemini": "Google Gemini", "openai": "OpenAI", "custom": "Custom service"}
+    names = {"gemini": "Google Gemini", "openai": "OpenAI", "custom": "Custom service", "ollama": "Local AI"}
     return Connection(connection_id or new_connection_id(), provider, label or names[provider], config,
                       settings.key_source, settings.key_environment)
 

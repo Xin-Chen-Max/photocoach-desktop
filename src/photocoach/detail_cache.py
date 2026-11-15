@@ -35,18 +35,18 @@ class DetailGeometryCache:
         self._rect = None
         self._pixels = None
 
-    def region(self, linear, identity, composition, rect, *, max_bytes, reserve):
+    def region(self, linear, identity, composition, rect, *, max_bytes, reserve, distortion=0.):
         width, height = output_size((linear.shape[1], linear.shape[0]), composition)
         left, top, right, bottom = rect
         if not (0 <= left < right <= width and 0 <= top < bottom <= height):
             raise ValueError("Invalid detail region.")
         # Unrotated crops are already cheap native array slices.
         limit = min(GEOMETRY_CACHE_BYTES, max_bytes)
-        if (composition.angle == 0 or linear.dtype != np.float32
+        if ((composition.angle == 0 and not distortion) or linear.dtype != np.float32
                 or (right-left) * (bottom-top) * 12 > limit):
             self.clear()
             return None
-        key = (identity, composition)
+        key = (identity, composition, distortion)
         if (self._source is not None and self._source() is linear and self._key == key
                 and self.retained_bytes <= limit):
             l, t, r, b = self._rect
@@ -69,7 +69,7 @@ class DetailGeometryCache:
             for start in range(t, b, 128):
                 end = min(start+128, b)
                 pixels[start-t:end-t] = sample_composition(
-                    linear, composition, rect=(l, start, r, end))
+                    linear, composition, rect=(l, start, r, end), distortion=distortion)
         except MemoryError:
             # Reuse is optional; the original bounded strip renderer still works.
             return None

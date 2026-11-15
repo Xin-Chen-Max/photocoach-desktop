@@ -1,5 +1,14 @@
 # Release notes
 
+## 0.12.0
+
+- Fixed sharpening and NR previews that used a larger effective radius during dragging than after refinement. Spatial filters now run before display reduction; inspect detail at 100%.
+- Added manual lens correction, detail controls, Natural/Neutral base modes and schema 9 migration that keeps old project rendering in Legacy.
+- Added explicit structured Coach actions, fixed target values, single-step application, stale-reply protection and a simpler collapsible Coach panel.
+- Added optional local Ollama model preparation and English/Chinese controls.
+- Added a standalone unsigned Windows AMD64 ZIP with licenses, dependency/source metadata and isolated runtime verification.
+- Updated real-image verification scripts for settled detail frames, safe timeout messages and source-only public documentation.
+
 ## 0.10.2
 
 Initial public source release.

@@ -65,6 +65,7 @@ class ImageView(QWidget):
         self.full_size = (0, 0)
         self.source_size = (0, 0)
         self.composition = Composition()
+        self.distortion = 0.
         self.center = (0.0, 0.0)
         self.zoom = 1.0
         self.fit_mode = True
@@ -75,7 +76,7 @@ class ImageView(QWidget):
         self._detail = QImage()
         self._detail_temporary = False
         self._detail_rect = (0, 0, 0, 0)
-        self._message = "Open a Sony .ARW to begin"
+        self._message = "Open a Sony .ARW or Nikon .NEF to begin"
         self._space = False
         self._drag = None
         self.picking_neutral = False
@@ -116,6 +117,7 @@ class ImageView(QWidget):
         self.full_size = tuple(size)
         self.source_size = tuple(size)
         self.composition = Composition()
+        self.distortion = 0.
         self._quick = QImage()
         self._detail = QImage()
         self.quick_current = False
@@ -123,16 +125,21 @@ class ImageView(QWidget):
         self.fit_mode = True
         self._changed()
 
-    def set_composition(self, composition):
-        if composition == self.composition or not all(self.source_size):
+    def set_composition(self, composition, *, distortion=0.):
+        if (composition == self.composition and distortion == self.distortion) or not all(self.source_size):
             return
+        composition_changed = composition != self.composition
         self.composition = composition
+        self.distortion = distortion
         self.clear_overlay()
         self.full_size = output_size(self.source_size, composition)
-        self._quick = QImage()
-        self._detail = QImage()
+        if composition_changed:
+            self._quick = QImage()
+            self._detail = QImage()
+            self._message = "Updating composition…"
+        # Distortion keeps output dimensions: retain the prior raster until its
+        # replacement arrives. Its quality is marked Adjusting/Refining.
         self.quick_current = False
-        self._message = "Updating composition…"
         self.fit_mode = True
         self._changed()
 
@@ -151,6 +158,7 @@ class ImageView(QWidget):
         if request.generation != self.view_generation or request.full_size != self.full_size:
             return False
         self._detail = display_image(pixels)
+        self._message = ""
         self._detail_temporary = False
         self.clear_overlay()
         self._detail_rect = request.rect
@@ -163,6 +171,7 @@ class ImageView(QWidget):
         if request.generation != self.view_generation or request.full_size != self.full_size:
             return False
         self._detail = display_image(pixels)
+        self._message = ""
         self._detail_temporary = True
         self.clear_overlay()
         self._detail_rect = request.rect
@@ -251,12 +260,39 @@ class ImageView(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#202020"))
+        painter.fillRect(self.rect(), QColor("#1e1e1e"))
+        w, h = self.width(), self.height()
         if self._message:
-            painter.setPen(QColor("#ababab"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            cw, ch = min(380, max(220, w - 40)), (104 if self._message == "Open a Sony .ARW or Nikon .NEF to begin" else 54)
+            card = QRectF((w - cw) / 2, (h - ch) / 2, cw, ch)
+            painter.setPen(QColor("#383838"))
+            painter.setBrush(QColor("#252525"))
+            painter.drawRoundedRect(card, 6, 6)
+            if self._message == "Open a Sony .ARW or Nikon .NEF to begin":
+                font = painter.font()
+                font.setPixelSize(14)
+                font.setBold(True)
+                painter.setFont(font)
+                painter.setPen(QColor("#e4e4e4"))
+                painter.drawText(QRectF(card.left() + 16, card.top() + 18, cw - 32, 24),
+                                 Qt.AlignmentFlag.AlignCenter, self._message)
+                font.setPixelSize(12)
+                font.setBold(False)
+                painter.setFont(font)
+                painter.setPen(QColor("#9e9e9e"))
+                painter.drawText(QRectF(card.left() + 16, card.top() + 46, cw - 32, 42),
+                                 Qt.AlignmentFlag.AlignCenter,
+                                 "Click Open (Ctrl+O) or Open project…\nOriginals remain strictly read-only.")
+            else:
+                painter.setPen(QColor("#cccccc"))
+                painter.drawText(card, Qt.AlignmentFlag.AlignCenter, self._message)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QColor("#303030"))
+            painter.drawRect(0, 0, w - 1, h - 1)
             return
-        if self._quick.isNull():
+        if self._quick.isNull() and self._detail.isNull():
             return
         scale = self.zoom / self.devicePixelRatioF()
         painter.translate(self.width() / 2 - self.center[0] * scale,
@@ -276,6 +312,12 @@ class ImageView(QWidget):
             painter.drawImage(QRectF(l,t,r-l,b-t),self._overlay)
         if self.gradient_layer is not None:
             self.gradient_layer.paint(painter)
+        painter.resetTransform()
+        painter.setClipping(False)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QColor("#303030"))
+        painter.drawRect(0, 0, w - 1, h - 1)
 
     def clear_overlay(self):
         self._overlay=QImage()

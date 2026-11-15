@@ -2,26 +2,42 @@
 
 A Windows RAW photo editor with non-destructive adjustments and an optional AI coach that can see the current edit, its parameters, and the changes that led to it.
 
-PhotoCoach keeps the original file untouched. Editing, project recovery, and export run locally. Cloud coaching starts only when you ask for it.
+The original photograph stays untouched. Editing, project recovery, and export run locally. Cloud coaching starts only when you ask for it.
 
 ![PhotoCoach editor workspace](docs/images/editor.png)
 
-*Workspace demonstration using a public-domain JPEG. This screenshot shows the editor and its controls; it does not demonstrate RAW decoding. [Image credit](THIRD_PARTY_NOTICES.md#demonstration-photograph).*
+*Workspace demonstration using a public-domain JPEG. It shows the interface and controls, not RAW decoding. [Image credit](THIRD_PARTY_NOTICES.md#demonstration-photograph).*
+
+## Download for Windows
+
+[Download PhotoCoach 0.12.0 for Windows 64-bit](https://github.com/Xin-Chen-Max/photocoach-desktop/releases/tag/v0.12.0).
+
+Extract the whole ZIP and run **PhotoCoach/PhotoCoach.exe**. Keep `_internal` beside it. Python is included. The executable is unsigned and targets Windows AMD64. Ollama and model weights are separate downloads. Verify the ZIP with the release's `SHA256SUMS.txt` if needed.
 
 ## Features
 
 - Exposure, highlights, shadows, whites, blacks, contrast, saturation, vibrance, and sensor white balance.
-- A shared RGB tone curve and an eight-color HSL mixer.
-- Crop, straighten, and up to four linear or radial adjustment masks.
-- Progressive previews, zoom and pan, a histogram, clipping overlays, and a neutral white balance picker.
-- Grouped undo/redo and local project files that preserve editing history.
+- Natural / As Shot and Neutral base rendering, a shared RGB curve, and an eight-color HSL mixer.
+- Crop, straighten, manual lens distortion/vignetting, and up to four linear or radial masks.
+- Sharpening, edge masking, luminance noise reduction, and color noise reduction.
+- Progressive previews, 100% detail inspection, zoom/pan, histogram, clipping overlays, and a neutral white balance picker.
+- Grouped undo/redo and local projects that preserve edit history.
 - Full-resolution JPEG and 16-bit TIFF export with an embedded sRGB profile.
-- Optional manual coaching through OpenAI Responses, Chat Completions compatible services, or the native Gemini API.
-- Saved connections, model selection, request review, session attempt limits, and Windows Credential Manager integration.
+- Manual coaching through OpenAI Responses, Chat Completions compatible services, native Gemini, or a separately prepared local Ollama vision model.
+- Reviewed suggestions with visible target values, explicit application, cancellation and stale-response protection.
+- English and Chinese interface controls; documentation is in English.
 
-## Run on Windows
+## Use the editor
 
-Use 64-bit Python 3.12. Sony Bayer `.ARW` files are the tested input format; other camera formats are not advertised as supported.
+Open a Sony `.ARW` or Nikon `.NEF`, make an adjustment, and compare it with the baseline. Save a `.photocoach` project to resume editing later, or export a JPEG/TIFF. Projects reference the original RAW, so keep that file available. Sony ARW is the primary real-image validation set; camera coverage is limited.
+
+Inspect sharpening and noise reduction at **100%** after **Full detail** appears. Spatial filters now run at native pixel scale before display reduction. Fit hides fine changes and takes more processing time with active detail filters. Ordinary tonal gestures retain a faster approximation.
+
+Open the bottom **Coach** panel and choose a saved connection, configure a cloud provider, or prepare a local model through **Choose coach**. Type a question and click **Analyze photo**; Ctrl+Enter submits and Enter adds a line. Review cloud requests before sending. Suggestions only change the photograph after an explicit **Apply suggestion** click. API usage is billed by the provider. See [usage and privacy](docs/usage.md).
+
+## Run from source
+
+Use 64-bit Python 3.12:
 
 ```powershell
 git clone https://github.com/Xin-Chen-Max/photocoach-desktop.git
@@ -32,38 +48,43 @@ py -3.12 -m venv .venv
 & .\.venv\Scripts\python.exe -m photocoach
 ```
 
-After setup, you can also use **Start PhotoCoach.cmd**. The launcher uses the virtual environment in this directory.
-
-Open a RAW file, make an adjustment, and compare it with the baseline. Save a `.photocoach` project to resume editing later, or export a JPEG/TIFF. Project files reference the original RAW; keep that file available.
-
-An API key is optional. For cloud coaching, select **Set up AI coach**, choose a connection and model, and review the request before sending. API usage is billed by the selected provider. See the [usage guide](docs/usage.md).
+**Start PhotoCoach.cmd** uses the virtual environment in this directory.
 
 ## Engineering
 
-The desktop interface uses PySide6. rawpy/LibRaw decodes RAW data into linear sRGB, NumPy applies edits, and Pillow/tifffile write exports.
+PySide6 provides the desktop interface. rawpy/LibRaw decodes RAW data into linear sRGB, NumPy applies edits, and Pillow/tifffile write exports.
 
-Immutable editing snapshots separate user actions from background work. Preview results carry source, state, viewport, and quality identifiers so an older job cannot overwrite a newer view. Dragging uses a bounded temporary preview; settling and export use the formal processing path.
+Immutable editing snapshots separate user actions from background work. Results carry source, revision, viewport and quality identifiers so an older job cannot overwrite a newer view. Rendering uses bounded strips, reusable decoded data and coalesced preview requests. Spatial filters use halo padding so settled 100% regions agree with exports.
 
-Rendering and cloud requests have separate lifecycles. A photo change, new edit, or connection change invalidates outdated feedback. Requests are never retried automatically.
+Rendering and model requests have separate lifecycles. A photo, question, edit or coach change invalidates outdated suggestions. Validated relative actions become fixed targets for the analyzed revision and apply as one undo step. Requests are never retried automatically.
 
-Read the [architecture](docs/architecture.md) for module responsibilities, processing order, and design trade-offs.
+Read the [architecture](docs/architecture.md) for processing order, module boundaries and trade-offs.
 
-## Tests
+## Tests and builds
 
 ```powershell
 & .\.venv\Scripts\python.exe -m pytest -q
+& .\.venv\Scripts\python.exe scripts\verify_wheel.py --output verification-runs\wheel-check
 ```
 
-The default suite uses synthetic images, temporary settings, and fake provider transports. It covers image processing, state/history, migration, file protection, request handling, and headless Qt interactions. It does not require a camera file or a paid API call. [Testing and verification](docs/testing.md) explains the separate real-RAW checks.
+The default suite uses synthetic images, temporary settings and fake provider transports. Real-RAW checks and native UI captures are separate. [Testing and verification](docs/testing.md) records their coverage and limits.
+
+To build a portable executable on Windows:
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+& .\.venv\Scripts\python.exe scripts\build_windows.py --output dist\win64
+& .\.venv\Scripts\python.exe scripts\verify_windows_bundle.py dist\win64\PhotoCoach-0.12.0-win64.zip verification-runs\bundle-check
+```
 
 ## Current limits
 
-- Windows is the supported desktop target. This repository does not include an installer or a bundled executable.
-- The rendering pipeline is SDR. LibRaw output can clip highlights before subsequent edits; exposure reduction cannot recover data already lost during decoding.
-- Output is tagged sRGB. Monitor-profile conversion and HDR display are not implemented.
-- Temporary adjustment previews are approximate. Inspect detail after **Full detail** appears.
-- Lens correction, sharpening, denoising, brush masks, healing, and a photo library are not included.
-- AI advice is advisory and is never applied automatically. A model listing does not prove image-analysis support, account access, or available quota.
+- The pipeline is SDR. LibRaw's integer output can clip highlights or out-of-gamut colors before later edits; negative exposure cannot recover those values.
+- Natural is an independent baseline look. It does not reproduce a camera JPEG or a commercial RAW processor. Camera profiles, monitor-profile conversion and HDR display are not implemented.
+- Native detail processing makes large Fit updates slower. Retained-cache limits do not bound total process peak memory.
+- Brush masks, healing, a photo library, automatic saving and AI denoise are not included.
+- Model capability checks do not establish aesthetic judgment, account quota or repeated coaching quality. A local model and Ollama require separate installation/preparation.
+- The executable is unsigned. Another physical Windows machine and ARM64 have not been validated.
 
 ## Documentation
 

@@ -76,12 +76,13 @@ def test_payload_images_context_and_result_binding(coach_request, protocol, incl
 
 
 @pytest.mark.parametrize("protocol", ["responses", "chat_completions", "gemini"])
-@pytest.mark.parametrize("question", ["How can I adjust the RGB curve?", "How do I adjust the RGB curve?"])
+@pytest.mark.parametrize("question", ["具体怎么调整rgb？", "How do I adjust the RGB curve?"])
 def test_question_and_actionable_answer_survive_all_adapters(coach_request, protocol, question):
     request = replace(coach_request, question=question)
     answer = {name: "No new visible comparison is established." for name in api.FEEDBACK_FIELDS}
-    answer["answer"] = "The shared RGB curve affects all three channels.\nKeep the black and white endpoints, then try a small midtone lift."
-    answer["next_step_or_stop"] = "1. Double-click the RGB curve to add a midtone point.\n2. Drag it upward slightly; use Undo if tonal separation is lost."
+    answer["actions"] = [{"operation": "add", "parameter": "exposure_ev", "value": 0.35}]
+    answer["answer"] = "这里先按 RGB 总曲线解释；它同时影响三个通道，不是分通道调色。\n先保留黑白端点，再尝试小幅抬高中间调。"
+    answer["next_step_or_stop"] = "1. 在 RGB curve 中双击添加中间控制点。\n2. 向上小幅拖动；如果失去层次，用 Undo 撤销。"
     captured = []
     config = (api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-test", "gemini") if protocol == "gemini"
               else api.ApiConfig(model="test", protocol=protocol))
@@ -100,6 +101,10 @@ def test_question_and_actionable_answer_survive_all_adapters(coach_request, prot
         context = json.loads(payload["messages"][1]["content"][0]["text"])
         schema = payload["response_format"]["json_schema"]["schema"]
     assert context["question"] == question
+    assert "actions" in schema["required"]
+    action, = result.feedback.actions
+    assert action.new_value == pytest.approx(0.65)
+    assert "0.65 EV" in action.label
     assert "answer" in schema["required"]
     assert result.feedback.answer == answer["answer"]
     assert result.feedback.next_step_or_stop == answer["next_step_or_stop"]
@@ -279,3 +284,11 @@ def test_error_diagnostics_distinguish_http400_and_http404_without_body(coach_re
         with pytest.raises(api.ApiError) as error:
             api.ApiCoach(api.ApiConfig(model="test"), "dummy", lambda *a: (status, b"secret-provider-error")).analyze(coach_request)
         assert expected in str(error.value) and "secret-provider-error" not in str(error.value)
+
+
+
+@pytest.mark.parametrize("model", ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-4-argon"])
+def test_gemini_3_and_4_models_use_low_thinking_level_to_prevent_timeout(coach_request, model):
+    config = api.ApiConfig(endpoint=api.GEMINI_ENDPOINT, model=model, protocol="gemini", max_output_tokens=8192)
+    payload = api.build_payload(config, coach_request)
+    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "LOW"}

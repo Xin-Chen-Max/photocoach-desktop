@@ -1,4 +1,4 @@
-"""Editing invariants: processing, transactions, persistence, and coach context."""
+"""Phase 1 invariants: processing, transactions, persistence, and coach context."""
 import json
 
 import numpy as np
@@ -152,6 +152,17 @@ def test_relocation_requires_identical_source(store, tmp_path):
     wrong.write_bytes(b"wrong")
     with pytest.raises(ValueError, match="hash"):
         read_project(path, source_override=wrong)
+
+    nef = tmp_path / "nikon_sample.NEF"
+    nef.write_bytes(b"nikon nef read-only bytes")
+    nef_store = store.__class__()
+    nef_store.activate(nef, sha256_file(nef))
+    nef_store.set_exposure(0.4)
+    nef_project = tmp_path / "nikon.photocoach"
+    write_project(nef_project, snapshot_project(nef_store))
+    restored_nef = read_project(nef_project)
+    assert restored_nef.current.source_path == nef.resolve()
+    assert restored_nef.current.exposure_ev == 0.4
 
 
 def test_project_after_switch_uses_continuous_sequence(store, tmp_path):

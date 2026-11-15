@@ -1,6 +1,6 @@
 # Third-party notices
 
-The [MIT license](LICENSE) covers PhotoCoach source. Dependencies retain their own licenses and are installed separately; this repository does not redistribute their binaries.
+The [MIT license](LICENSE) covers PhotoCoach source. Dependencies retain their own licenses. Source installations obtain them separately; the Win64 release ZIP includes their runtime binaries and license texts under licenses/.
 
 | Dependency | Purpose | License reference |
 | --- | --- | --- |
@@ -12,7 +12,7 @@ The [MIT license](LICENSE) covers PhotoCoach source. Dependencies retain their o
 | tifffile | TIFF output | [tifffile license](https://github.com/cgohlke/tifffile/blob/master/LICENSE) |
 | pytest | Test runner | [pytest license](https://docs.pytest.org/en/stable/license.html) |
 
-Bundling an executable or distributing dependency binaries requires a separate review of those components and their notices, including Qt and LibRaw. Installing from source does not change dependency licenses.
+The portable ZIP includes Python, PySide6/Qt and shiboken6, rawpy/LibRaw, NumPy, Pillow and tifffile. Qt/shiboken libraries remain separate DLLs so compatible modified versions can replace them. The bundle includes component copyright/license texts and source links in THIRD_PARTY_NOTICES.txt. Installing from source does not change dependency licenses.
 
 ## Demonstration photograph
 

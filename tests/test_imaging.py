@@ -225,12 +225,28 @@ def test_decode_rejects_non_16bit_rgb_decoder_output(fake_raw_decoder, invalid_p
         imaging.decode_raw(fake_raw_decoder.source)
 
 
-def test_decode_rejects_other_extensions_before_decoder_call(fake_raw_decoder, tmp_path) -> None:
+def test_decode_accepts_nikon_nef_and_rejects_other_extensions(fake_raw_decoder, tmp_path, monkeypatch) -> None:
+    nef_source = tmp_path / "fixture.NEF"
+    nef_source.write_bytes(fake_raw_decoder.original)
+    decoded = imaging.decode_raw(nef_source)
+    assert decoded.source_path == nef_source.resolve()
+    assert decoded.linear_rgb.shape == (4, 3, 3)
+    assert nef_source.read_bytes() == fake_raw_decoder.original
+
     source = tmp_path / "preview.jpg"
     source.write_bytes(b"not RAW")
-    with pytest.raises(ValueError, match="Sony"):
+    with pytest.raises(ValueError, match=r"Sony \.ARW or Nikon \.NEF"):
         imaging.decode_raw(source)
-    assert not fake_raw_decoder.calls
+    assert len(fake_raw_decoder.calls) == 1
+
+    class FakeLibRawError(Exception):
+        pass
+
+    import sys
+    monkeypatch.setattr(sys.modules["rawpy"], "LibRawError", FakeLibRawError, raising=False)
+    monkeypatch.setattr(sys.modules["rawpy"], "imread", lambda stream: (_ for _ in ()).throw(FakeLibRawError("unsupported HE NEF")))
+    with pytest.raises(ValueError, match="not supported by the local LibRaw decoder"):
+        imaging.decode_raw(nef_source)
 
 
 def test_cache_reuses_decode_for_exposure_and_invalidates_wb_size_source_and_pipeline(fake_raw_decoder, monkeypatch) -> None:
@@ -238,6 +254,8 @@ def test_cache_reuses_decode_for_exposure_and_invalidates_wb_size_source_and_pip
     cache = DecodedCache(max_entries=6)
     original = cache.get(source)
     baseline = render_srgb(original.linear_rgb, 0)
+    render_srgb(original.linear_rgb, 0, base_rendering="natural_v1")
+    render_srgb(original.linear_rgb, 0, base_rendering="neutral_v1")
     changed = render_srgb(original.linear_rgb, 1)
     assert cache.get(source) is original
     assert len(fake_raw_decoder.calls) == 1

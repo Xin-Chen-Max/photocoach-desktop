@@ -1,49 +1,47 @@
-# Usage
+# Usage and privacy
 
-## Edit a photo
+## Editing a photo
 
-Open a Sony Bayer `.ARW` file. Use the Edit panel for basic tone, the RGB curve, Color Mixer, crop/straighten, and local adjustments. Edits change parameters and previews; the source RAW remains untouched.
+Open a Sony ARW or Nikon NEF. New imports use Natural / As Shot base rendering and neutral creative sliders. Natural includes a fixed baseline tone transform; Neutral omits that shaping. Old projects use Legacy to preserve their earlier appearance. A base-mode change is undoable and does not re-decode RAW.
 
-During a drag, **Adjusting** displays a reduced sample. **Refining** keeps the image visible while a formal render runs. Wait for **Full detail** before judging fine detail. Use Fit for composition and 100% for pixel inspection. Space + drag pans the image.
+White balance starts from camera metadata when valid. Warmth, Tint and relative RGB gains are drafts until **Apply white balance** is clicked. Applying white balance can decode RAW again. The values are relative sensor gains, not calibrated Kelvin. Use the neutral picker on an evenly lit matte neutral surface; unsuitable dark, clipped or uneven samples are rejected.
 
-The histogram samples the whole edited photo. Red and blue clipping overlays describe the displayed SDR limits, not sensor clipping or RAW highlight recoverability. Small regions can be missed in reduced previews. Overlays are excluded from exports and coach images.
+Use Light, Color, Curve, Crop and straighten, Lens corrections, Detail and Local adjustments. Slider drags group into one undo step. Crop and masks follow source coordinates. Lens corrections are manual; no lens profile is inferred. A mask can adjust exposure, highlights, shadows and warmth. Up to four masks are supported.
 
-## Local adjustments
+Baseline retains the current base rendering and geometry for comparison, with creative adjustments neutral. It is not the embedded camera JPEG. Reset edits keeps the selected base rendering. Save preserves the source reference, edits and undo/redo history; it does not embed RAW pixels. Opening an older project migrates it in memory without rewriting that file.
 
-Expand **Local adjustments** and add a linear or radial mask. Up to four masks can affect exposure, highlights, and shadows. Drag the on-image handles to change the geometry, and use **Done** to hide them. Each adjustment is undoable. Mask selection and visibility do not alter the image.
+## Preview quality
 
-## Save and export
+**Adjusting** identifies a temporary visible-region update. **Refining** keeps the last image visible while formal processing runs. **Full detail** marks the settled rendering path.
 
-Save a `.photocoach` project to preserve the source reference, editing values, and operation history. Project files contain the source path and hash; they do not embed the RAW. Treat a project file as local working data when it contains a private path.
+At 100%, source pixels map to physical display pixels. Inspect sharpening and NR there. Native filtering occurs before display reduction, including during detail gestures; Fit can update more slowly. The first native render may require one full-resolution decode. Camera/WB changes may require another. Source, state and viewport checks reject obsolete frames.
 
-Export JPEG for an 8-bit image or TIFF for 16-bit RGB. Both use sRGB encoding and embed an sRGB ICC profile. Source EXIF/GPS and editing overlays are omitted. Export renders a captured current state at full resolution instead of reusing a temporary preview.
+## Export
 
-Monitor ICC conversion and HDR display are not implemented. Color-critical work needs separate evaluation on the intended display and output workflow.
+Export writes the current edit as JPEG or 16-bit TIFF with an sRGB ICC profile. It omits source EXIF/GPS. Export requires a new output filename and protects source RAWs, hard links, symlinks and alternate data streams. Keep a project file separately if you need editable history.
 
-## Configure the coach
+## Manual coaching
 
-Select **Set up AI coach**, then choose a protocol, endpoint, model, and key source. Supported protocols are OpenAI Responses, Chat Completions compatible APIs, and native Gemini. A compatible HTTP protocol alone does not prove that a model supports image input or the required response schema.
+Expand the bottom Coach pane and open **Choose coach**. Select a saved connection/model, configure **Cloud connections**, or open **Local models**. Opening these controls does not send a photograph.
 
-Model refresh loads metadata and sends the selected key to the configured destination; it does not upload a photo or generate a coaching answer. Unknown model IDs can be entered manually. No model is selected, tested, or retried automatically.
+Type a question or choose a common question. Enter adds a line; Ctrl+Enter or **Analyze photo** starts the manual flow. **More / Edit goal** reveals an optional goal. **Usage and diagnostics** contains budgets and troubleshooting.
 
-Write a goal and a specific question, such as "How can I lift these midtones without losing contrast?" Select **Ask coach**, inspect the review, then send. The coach returns an answer, suggested steps, a stopping condition, and supporting explanation. Suggestions do not modify editing values.
+The cloud review shows the destination, model, matching preview images and editing context before sending. The original RAW, source path and source EXIF/GPS are not attached. Text entered into the goal or question is part of the displayed request. Provider retention rules and possible charges still apply. Session-only direct sending requires an explicit choice and is reset by connection changes or restart.
 
-Control-navigation links recognize the English control names used in the interface. Provider text is rendered as escaped text. A response remains attached to its original question and editing revision when later changes make it a reference.
+Replies separate the answer, suggestion and checks, with evidence/reasoning expandable. Validated target values appear beside **Apply suggestion**. Long lists are available through **Reply options / View changes**. Applying submits the complete action list in one undo step and cannot repeat the same action. Advice remains reference-only after the photo, edit, question or coach changes. Cancel discards late replies but cannot retract a request already received by a provider.
 
-## Data sent to a provider
+## Local vision models
 
-A manual analysis sends reduced current/before images, selected editing parameters and history context, and the goal/question you enter. The review shows the content and destination. You may omit the before image.
+Local models use an installed Ollama executable and a separately selected PhotoCoach model directory. Downloads begin only after a user click. The recommended large model requires substantial disk/RAM/VRAM; the UI shows its size and hardware guidance. Engine/model installation and model weights are not part of the Win64 ZIP.
 
-Requests exclude the original RAW, original filesystem path, source EXIF/GPS, and display overlays. Text entered in the goal or question is transmitted as part of the request. Provider retention and billing rules apply to that provider.
+PhotoCoach starts its own Ollama instance as needed at `127.0.0.1:11435`, with a separate model directory and cloud access disabled for that instance. It does not manage unrelated Ollama processes. Readiness requires vision capability and a generated-image structured-output probe tied to model digest and engine version. This probe does not certify editing taste. Analysis remains manual.
 
-Startup restores nonsecret configuration without contacting a provider. There are no automatic cloud analyses. Developer mode (`--dev` or `PHOTOCOACH_DEV=1`) exposes a local mock and optional automatic local mock feedback.
+Local inference does not use an API key or the cloud dollar budget. It has a separate session request limit. Closing the model window cancels its task; installed model data remains available for the next session.
 
-## Keys and limits
+## Settings and credentials
 
-Connection settings are stored under `%LOCALAPPDATA%\PhotoCoach`. Remembering a connection saves nonsecret metadata. **Remember API key on this PC** separately stores a credential in Windows Credential Manager for the current Windows account. Keys are not written to settings, model caches, or projects.
+Nonsecret connection settings live under `%LOCALAPPDATA%/PhotoCoach`, outside the repository and photo projects. A cloud key can be session-only, explicitly saved to Windows Credential Manager, or resolved from a named environment variable. There is no fallback between key sources. JSON settings, model metadata and projects do not contain key values. Startup restores configuration without reading the credential vault or contacting providers.
 
-A key can instead remain in memory for the session or come from a named environment variable. There is no silent fallback between key sources. Startup does not read the credential vault. Credential access is not a defense against another malicious process running as the same user.
+Deleting/changing a connection does not erase photo projects or local model downloads. Session budgets are application guards, not a provider billing guarantee. Restarting resets local counters, not provider charges or quota.
 
-Session attempt limits count failed and cancelled requests too. Optional USD limits depend on the rates and reserve values you configure; they cannot guarantee the provider's final bill. Restarting the application resets the local session ledger, not provider charges or quotas. A ChatGPT subscription does not pay API charges.
-
-Cancelling or editing invalidates pending feedback locally. It cannot undo an upload or charge that has already reached the provider. There are no automatic retries.
+Developer mock coaching is available only with `--dev` or `PHOTOCOACH_DEV=1`. It is a rules demonstration and cannot interpret arbitrary questions.

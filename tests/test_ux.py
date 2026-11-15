@@ -152,7 +152,7 @@ def test_toolbar_states_and_diagnostics(window):
     window.store.mark_saved(window.store.current.revision)
     window._refresh_history()
     assert not window.unsaved_label.isVisible()
-    assert [a.text() for a in window.open_button.menu().actions()] == ["Open ARW…", "Open project…"]
+    assert [a.text() for a in window.open_button.menu().actions()] == ["Open RAW…", "Open project…"]
     assert "Save diagnostics…" in [a.text() for a in window.more_button.menu().actions()]
     assert not window.version_label.isVisible()
 

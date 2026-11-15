@@ -19,7 +19,7 @@ SOURCES = {
     'openai': 'https://developers.openai.com/api/docs/models/',
 }
 KNOWN_VISION_MODELS = {
-    'gemini': {'gemini-3.5-flash-lite'},
+    'gemini': {'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'},
     'openai': {'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-4.1', 'gpt-4o'},
 }
 DEFAULT_CURATED = {p: sorted(ids) for p, ids in KNOWN_VISION_MODELS.items()}
@@ -46,9 +46,19 @@ def classify_model(provider: str, model_id: str) -> str:
     return 'supported' if mid in KNOWN_VISION_MODELS.get(provider, ()) else 'manual'
 
 
+def is_ui_selectable_model(provider: str, model_id: str) -> bool:
+    """Only allow vision-capable models; for Gemini require >= 3.5-flash-lite (exclude legacy < 3.5)."""
+    mid = model_id.lower().strip()
+    if classify_model(provider, mid) == 'unsupported':
+        return False
+    if provider == 'gemini' and re.match(r'^gemini-(?:1\.|2\.|3\.0|3\.1|3-(?:pro|flash))', mid):
+        return False
+    return True
+
+
 def capability_evidence(provider, model_id):
     if classify_model(provider, model_id) == 'supported':
-        url = SOURCES[provider] + (model_id if provider == 'gemini' else model_id)
+        url = SOURCES[provider] + model_id
         if model_id.startswith('gpt-6'):
             url = SOURCES[provider]
         return url, CHECKED_UTC

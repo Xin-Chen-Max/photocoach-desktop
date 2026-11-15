@@ -26,3 +26,9 @@ htmlcov/
 settings.json
 models.json
 .DS_Store
+
+*.NEF
+*.nef
+.agents/
+AGENTS.md
+PROJECT_AUDIT_REPORT.md

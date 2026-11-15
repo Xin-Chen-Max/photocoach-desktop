@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 import math
 import re
 import numpy as np
+from .lens import map_to_source, map_from_source
 from .composition import Composition, canvas_size, crop_bounds, output_size
 
 
@@ -23,6 +24,7 @@ class LinearGradient:
     exposure_ev: float = 0.
     highlights: float = 0.
     shadows: float = 0.
+    warmth: float = 0.
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", self.id):
@@ -39,21 +41,22 @@ class LinearGradient:
             raise ValueError("Drag farther to create a gradient transition.")
         if type(self.enabled) is not bool or type(self.inverted) is not bool:
             raise ValueError("Gradient switches must be boolean.")
-        for key, limit in (("exposure_ev",3),("highlights",1),("shadows",1)):
+        for key, limit in (("exposure_ev",3),("highlights",1),("shadows",1),("warmth",1)):
             object.__setattr__(self,key,number(getattr(self,key),-limit,limit))
 
     @property
     def active(self):
-        return self.enabled and bool(self.exposure_ev or self.highlights or self.shadows)
+        return self.enabled and bool(self.exposure_ev or self.highlights or self.shadows or self.warmth)
 
     def to_dict(self):
         return dict(id=self.id,name=self.name,start=list(self.start),end=list(self.end),
                     enabled=self.enabled,inverted=self.inverted,exposure_ev=self.exposure_ev,
-                    highlights=self.highlights,shadows=self.shadows)
+                    highlights=self.highlights,shadows=self.shadows,**({"warmth":self.warmth} if self.warmth else {}))
 
     @classmethod
     def from_dict(cls,value):
-        if not isinstance(value,dict) or set(value) != {"id","name","start","end","enabled","inverted","exposure_ev","highlights","shadows"}:
+        base = {"id","name","start","end","enabled","inverted","exposure_ev","highlights","shadows"}
+        if not isinstance(value,dict) or not (base <= set(value) <= (base | {"warmth"})):
             raise ValueError("Invalid gradient parameters.")
         return cls(**value)
 
@@ -62,20 +65,25 @@ class LinearGradient:
 class RadialGradient(LinearGradient):
     """An ellipse whose opposite bounding corners use original-image coordinates."""
     feather: float = .5
+    angle: float = 0.
 
     def __post_init__(self):
         super().__post_init__()
         if any(abs(a-b)<1e-5 for a,b in zip(self.start,self.end)):
             raise ValueError("Drag wider and taller to create a radial mask.")
         object.__setattr__(self,'feather',number(self.feather,0,1))
+        object.__setattr__(self,'angle',number(self.angle,-90,90))
 
     def to_dict(self):
-        return dict(super().to_dict(),kind='radial',feather=self.feather)
+        d = dict(super().to_dict(),kind='radial',feather=self.feather)
+        if self.angle:
+            d['angle'] = self.angle
+        return d
 
     @classmethod
     def from_dict(cls,value):
         required={'id','name','start','end','enabled','inverted','exposure_ev','highlights','shadows','kind','feather'}
-        if not isinstance(value,dict) or set(value)!=required or value['kind']!='radial':
+        if not isinstance(value,dict) or not (required <= set(value) <= (required | {'warmth','angle'})) or value.get('kind')!='radial':
             raise ValueError('Invalid radial mask parameters.')
         return cls(**{k:v for k,v in value.items() if k!='kind'})
 
@@ -100,6 +108,7 @@ class RenderGeometry:
     composition: Composition
     rect: tuple[float,float,float,float]
     target_size: tuple[int,int]
+    distortion: float = 0.
 
     def __post_init__(self):
         if len(self.source_size)!=2 or any(type(v) is not int or v<1 for v in self.source_size):
@@ -114,8 +123,8 @@ class RenderGeometry:
             raise ValueError("Sample region is outside the photo.")
 
     @classmethod
-    def full(cls,source_size,composition,target_size):
-        return cls(tuple(source_size),composition,(0,0,*output_size(source_size,composition)),tuple(target_size))
+    def full(cls,source_size,composition,target_size,distortion=0.):
+        return cls(tuple(source_size),composition,(0,0,*output_size(source_size,composition)),tuple(target_size),distortion)
 
     def rows(self,top,bottom):
         l,t,r,b=self.rect
@@ -131,20 +140,23 @@ class RenderGeometry:
         x=cl+l+(np.arange(tw,dtype=np.float64)+.5)*(r-l)/tw-cw/2
         y=ct+t+(np.arange(th,dtype=np.float64)+.5)*(b-t)/th-ch/2
         a=math.radians(self.composition.angle); c,s=math.cos(a),math.sin(a)
-        return (c*x[None,:]+s*y[:,None]+self.source_size[0]/2,
-                -s*x[None,:]+c*y[:,None]+self.source_size[1]/2)
+        return map_to_source(c*x[None,:]+s*y[:,None]+self.source_size[0]/2,
+                -s*x[None,:]+c*y[:,None]+self.source_size[1]/2,self.source_size,self.distortion)
 
 
-def source_point(point,source_size,composition,*,inverse=False):
+def source_point(point,source_size,composition,*,inverse=False,distortion=0.):
     """Map a composed canvas pixel center to original pixels, or reverse it."""
     cw,ch=canvas_size(source_size,composition.angle)
     cl,ct,_,_=crop_bounds(source_size,composition)
     a=math.radians(composition.angle); c,s=math.cos(a),math.sin(a)
     if inverse:
+        point=map_from_source(point,source_size,distortion)
+        if point is None:
+            return None
         x,y=point[0]-source_size[0]/2,point[1]-source_size[1]/2
         return (c*x-s*y+cw/2-cl,s*x+c*y+ch/2-ct)
     x,y=point[0]+cl-cw/2,point[1]+ct-ch/2
-    return (c*x+s*y+source_size[0]/2,-s*x+c*y+source_size[1]/2)
+    return map_to_source(c*x+s*y+source_size[0]/2,-s*x+c*y+source_size[1]/2,source_size,distortion)
 
 
 def gradient_weight(gradient,geometry,grid=None):
@@ -155,7 +167,12 @@ def gradient_weight(gradient,geometry,grid=None):
         cy=(gradient.start[1]+gradient.end[1])*h/2
         rx=abs(gradient.end[0]-gradient.start[0])*w/2
         ry=abs(gradient.end[1]-gradient.start[1])*h/2
-        radius=np.sqrt(((sx-cx)/rx)**2+((sy-cy)/ry)**2)
+        dx,dy=sx-cx,sy-cy
+        if gradient.angle:
+            rad=math.radians(gradient.angle)
+            ca,sa=math.cos(rad),math.sin(rad)
+            dx,dy=ca*dx+sa*dy,-sa*dx+ca*dy
+        radius=np.sqrt((dx/rx)**2+(dy/ry)**2)
         if gradient.feather:
             t=np.clip((radius-(1-gradient.feather))/gradient.feather,0,1).astype(np.float32)
             weight=np.float32(1)-t*t*(np.float32(3)-np.float32(2)*t)
@@ -169,8 +186,8 @@ def gradient_weight(gradient,geometry,grid=None):
     return t if gradient.inverted else np.float32(1)-t
 
 
-def tone_fields(gradients,geometry,highlights,shadows):
-    grid=geometry.source_grid()
+def tone_fields(gradients,geometry,highlights,shadows,grid=None):
+    grid=geometry.source_grid() if grid is None else grid
     shape=(geometry.target_size[1],geometry.target_size[0])
     ev=np.zeros(shape,np.float32)
     hl=np.full(shape,highlights,np.float32); sh=np.full(shape,shadows,np.float32)
@@ -182,6 +199,19 @@ def tone_fields(gradients,geometry,highlights,shadows):
             sh+=weight*np.float32(g.shadows)
     np.clip(hl,-1,1,out=hl); np.clip(sh,-1,1,out=sh)
     return ev,hl,sh
+
+
+def warmth_field(gradients,geometry,grid=None):
+    if not any(g.active and g.warmth for g in gradients):
+        return None
+    grid=geometry.source_grid() if grid is None else grid
+    shape=(geometry.target_size[1],geometry.target_size[0])
+    wf=np.zeros(shape,np.float32)
+    for g in gradients:
+        if g.active and g.warmth:
+            wf+=gradient_weight(g,geometry,grid)*np.float32(g.warmth)
+    np.clip(wf,-1.5,1.5,out=wf)
+    return wf
 
 
 @dataclass(frozen=True)

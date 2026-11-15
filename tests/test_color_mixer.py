@@ -154,8 +154,10 @@ def test_legacy_history_migration_is_complete_strict_and_read_only(tmp_path, ver
     def strip(value):
         if isinstance(value, dict):
             if "white_balance" in value:
+                value.pop("base_rendering")
                 value.pop("color_mixer")
                 value.pop("local_gradients")
+                value.pop("lens_corrections")
                 for name in ("whites", "blacks", "vibrance"): value.pop(name)
                 if version < 3: value.pop("composition")
                 if version < 2:
@@ -170,7 +172,7 @@ def test_legacy_history_migration_is_complete_strict_and_read_only(tmp_path, ver
     original = copy.deepcopy(data)
     upgraded = upgrade_project(data)
     undo, redo = validate_project(upgraded)
-    assert data == original and upgraded["schema_version"] == 7
+    assert data == original and upgraded["schema_version"] == 9
     assert undo == store.undo_stack and redo == store.redo_stack
     bad = copy.deepcopy(data)
     bad["state"]["parameters"]["color_mixer"] = {}
@@ -189,14 +191,14 @@ def test_ten_edits_history_restore_and_ai_context(tmp_path):
     write_project(target, snapshot_project(store))
     loaded = read_project(target)
     assert loaded.current.values == final and loaded.undo_stack == store.undo_stack
-    assert json.loads(target.read_text())["schema_version"] == 7
+    assert json.loads(target.read_text())["schema_version"] == 9
     pixels = np.zeros((4, 6, 3), np.uint8)
     request = build_request(store.current, before, store.events, pixels, pixels)
     assert request.parameters["color_mixer"]["yellow"]["lightness"] == 10
     reply = MockCoach().analyze(request)
     assert "Yellow" in reply.main_change and "Lightness +10" in reply.main_change
     assert related_control(reply.next_step_or_stop) == "color_mixer.yellow"
-    assert related_control("Adjust blue saturation in the Color Mixer") == "color_mixer.blue"
+    assert related_control("在颜色混合器中调整蓝色饱和度") == "color_mixer.blue"
     loaded.reset()
     assert loaded.current.color_mixer.neutral
     loaded.undo()

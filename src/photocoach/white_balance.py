@@ -6,6 +6,7 @@ import numpy as np
 
 from .imaging import RawOptions, effective_whitebalance, _fingerprint
 from .composition import canvas_size, crop_bounds, output_size
+from .lens import map_to_source
 from .safe_io import sha256_file
 
 
@@ -31,7 +32,7 @@ def balance_gains(warmth, tint):
     return tuple(min(4., max(.25, v*scale)) for v in gains)
 
 
-def sensor_position(size, flip, composition, position):
+def sensor_position(size, flip, composition, position, *, distortion=0.):
     """Map a composed, oriented pixel center back to visible sensor coordinates.
 
     LibRaw flip bits transpose first, then reverse sensor row/column. The same
@@ -51,6 +52,10 @@ def sensor_position(size, flip, composition, position):
     a = math.radians(composition.angle)
     sx = math.cos(a)*x + math.sin(a)*y + oriented[0]/2 - .5
     sy = -math.sin(a)*x + math.cos(a)*y + oriented[1]/2 - .5
+    if distortion:
+        sx, sy = map_to_source(sx+.5, sy+.5, oriented, distortion)
+        sx -= .5
+        sy -= .5
     col, row = (sy, sx) if flip & 4 else (sx, sy)
     if flip & 2:
         row = h-1-row
@@ -99,7 +104,7 @@ def sample_white_balance(state, position):
             raise ValueError("The white balance picker currently supports Bayer RGBG sensors only.")
         data = raw.raw_image_visible
         colors = raw.raw_colors_visible
-        x, y = sensor_position((data.shape[1], data.shape[0]), int(raw.sizes.flip), state.composition, position)
+        x, y = sensor_position((data.shape[1], data.shape[0]), int(raw.sizes.flip), state.composition, position, distortion=state.lens_corrections.distortion)
         rect = (slice(max(0, y-16), min(data.shape[0], y+17)),
                 slice(max(0, x-16), min(data.shape[1], x+17)))
         gains = estimate_neutral_gains(data[rect], colors[rect], raw.black_level_per_channel,

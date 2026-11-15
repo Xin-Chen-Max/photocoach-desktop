@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 
 from .adjustments import render_edit
+from .detail import DETAIL_HALO_PX
 from .imaging import quantize_srgb
 from .state import EditValues
 from .composition import output_size, sample_composition
@@ -44,6 +45,7 @@ class DetailRequest:
     step: int = 1
     source_size: tuple[int, int] | None = None
     adjusting_edge: int | None = None  # Display-only cap, captured at gesture start.
+    native_detail: bool = False  # Keep source-pixel filters consistent through zero.
 
 
 def visible_region(full_size, viewport, center, zoom: float, dpr: float) -> tuple[int, int, int, int]:
@@ -86,14 +88,30 @@ def render_region(linear: np.ndarray, values: EditValues, request: DetailRequest
             raise CancelledError()
         scratch = pool.for_thread()
         count = min(rows, height - offset)
-        with timed(timer, "geometry"):
-            region = (sample_composition(linear, values.composition,
-                                        rect=(left, top+offset, right, top+offset+count),
-                                        scratch=scratch)
-                      if composed_region is None else composed_region[offset:offset+count])
-        rendered = render_edit(region, values, cancel=cancel, timer=timer, scratch=scratch,
-            geometry=RenderGeometry((linear.shape[1],linear.shape[0]),values.composition,
-                                    (left,top+offset,right,top+offset+count),(width,count)))
+        if values.detail.active:
+            halo = DETAIL_HALO_PX
+            p_left = max(0, left - halo)
+            p_right = min(request.full_size[0], right + halo)
+            p_top = max(0, top + offset - halo)
+            p_bottom = min(request.full_size[1], top + offset + count + halo)
+            with timed(timer, "geometry"):
+                region = sample_composition(linear, values.composition,
+                                            rect=(p_left, p_top, p_right, p_bottom),
+                                            scratch=scratch, distortion=values.lens_corrections.distortion)
+            padded = render_edit(region, values, cancel=cancel, timer=timer, scratch=scratch,
+                geometry=RenderGeometry((linear.shape[1],linear.shape[0]),values.composition,
+                                        (p_left,p_top,p_right,p_bottom),(p_right-p_left,p_bottom-p_top),values.lens_corrections.distortion))
+            rendered = padded[top + offset - p_top : top + offset - p_top + count,
+                              left - p_left : left - p_left + width]
+        else:
+            with timed(timer, "geometry"):
+                region = (sample_composition(linear, values.composition,
+                                            rect=(left, top+offset, right, top+offset+count),
+                                            scratch=scratch, distortion=values.lens_corrections.distortion)
+                          if composed_region is None else composed_region[offset:offset+count])
+            rendered = render_edit(region, values, cancel=cancel, timer=timer, scratch=scratch,
+                geometry=RenderGeometry((linear.shape[1],linear.shape[0]),values.composition,
+                                        (left,top+offset,right,top+offset+count),(width,count),values.lens_corrections.distortion))
         if step != 1:
             size = (output_w, math.ceil(count / step))
             with timed(timer, "reduction"):

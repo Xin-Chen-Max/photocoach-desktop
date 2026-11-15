@@ -40,7 +40,7 @@ def application():
 def window(application, monkeypatch):
     view = desktop.MainWindow()
     # No actual RAW, filesystem output, or visible desktop interaction is used.
-    state = view.store.activate(Path("C:/photocoach-tests/synthetic-a.ARW"), "photo-a")
+    state = view.store.activate(Path("synthetic-a.ARW"), "photo-a")
     view.store.mark_preview(state)
     view._set_controls(True)
     view._show_metadata({"visible_size": [6, 4], "photo_id": "photo-a"})
@@ -107,7 +107,11 @@ def test_visual_identity_assets_and_main_window_surface(application, tmp_path):
         view.coach_collapse.click()
         assert view.goal.text() == "Natural light"
         assert view.question.text() == "How should I adjust the shared RGB curve?"
-        scroll = view.coach_composer_scroll
+        from PySide6.QtWidgets import QScrollArea
+        assert view.question.isVisible()
+        view._show_coach_details()
+        application.processEvents()
+        scroll = view.coach_details.findChild(QScrollArea)
         scroll.ensureWidgetVisible(view.coach_usage)
         application.processEvents()
         assert scroll.viewport().rect().contains(view.coach_usage.mapTo(
@@ -215,7 +219,7 @@ def test_session_confirmation_uses_fresh_requests_and_preserves_limits(window, m
 
     send()
     assert len(reviews) == len(sent) == 1
-    assert window.analyze_button.text() == "Send to coach"
+    assert window.analyze_button.text() == "Analyze photo"
     window.store.set_exposure(.5)
     window.question.setText("What about this new exposure?")
     send()
@@ -327,7 +331,7 @@ def test_switching_photo_discards_previous_photos_inflight_preview(window, appli
     started = threading.Event()
     release = threading.Event()
     displayed = []
-    second_path = Path("C:/photocoach-tests/synthetic-b.ARW")
+    second_path = Path("synthetic-b.ARW")
 
     def old_render(state):
         started.set()
@@ -370,7 +374,7 @@ def test_export_uses_latest_parameters_and_restores_dropped_preview(window, appl
     exports = []
     displayed = []
     linear = np.full((8, 12, 3), 0.08, dtype=np.float32)
-    destination = Path("C:/photocoach-tests/synthetic-never-written.tif")
+    destination = Path("synthetic-never-written.tif")
 
     def slow_first_render(state):
         renders.append(state.revision)
@@ -464,7 +468,7 @@ def test_coach_late_result_and_failure_never_block_editing(window, application, 
         elif action == "switch":
             monkeypatch.setattr(window.engine, "load", lambda path: (
                 SimpleNamespace(source_path=path, metadata={"photo_id": "photo-b", "visible_size": [6, 4]}), image))
-            window.open_raw(Path("C:/photocoach-tests/synthetic-b.ARW"))
+            window.open_raw(Path("synthetic-b.ARW"))
     finally:
         release.set()
     spin_until(application, lambda: window._active is None and window._pending is None and not window._render_timer.isActive())
@@ -488,6 +492,7 @@ def test_curve_hover_readout_is_passive_and_drag_uses_actual_point(application):
     changes = []
     curve.pointsChanged.connect(changes.append)
     curve.show()
+    application.processEvents()
     QTest.mouseMove(curve, curve._screen((.4, .6)).toPoint())
     assert curve.readout.text() == "Point · Input 0.400 / Output 0.600"
     assert curve.readout.width() <= curve.width() - 12
@@ -563,7 +568,7 @@ def test_api_review_never_sends_without_current_confirmed_context(window, applic
         assert window._review_settings is None
 
 
-@pytest.mark.parametrize("outcome", ["success", "edit", "question", "switch", "pause", "failure", "timeout_connecting", "timeout_waiting"])
+@pytest.mark.parametrize("outcome", ["success", "edit", "question", "switch", "pause", "failure", "timeout_connecting", "timeout_waiting", "timeout_no_metadata"])
 def test_api_uses_separate_worker_and_stale_results_are_discarded(window, application, monkeypatch, outcome):
     from photocoach.api_coach import ApiConfig, ApiCoach, ApiError, FEEDBACK_FIELDS
     from photocoach.coach_ui import ApiSettings
@@ -593,6 +598,8 @@ def test_api_uses_separate_worker_and_stale_results_are_discarded(window, applic
             raise TimeoutError("test")
         if outcome == "failure":
             raise OSError("never-display-secret-key")
+        if outcome == "timeout_no_metadata":
+            raise ApiError("timeout")
         if outcome.startswith("timeout_"):
             raise ApiError("timeout", transport_stage=outcome.removeprefix("timeout_"),
                            elapsed_seconds=30, timeout_seconds=30)
@@ -607,13 +614,13 @@ def test_api_uses_separate_worker_and_stale_results_are_discarded(window, applic
     try:
         window.analyze()
         spin_until(application, started.is_set)
-        assert not window.analyze_button.isEnabled()
+        assert window.analyze_button.isEnabled() and window.analyze_button.text() == "Cancel analysis"
         assert window.exposure_slider.isEnabled()
         assert window.api_budget.attempts == 1
         window._network_progress[0].advance("waiting")
         window._update_network_progress()
-        assert "Waiting for response headers" in window.coach_text.toPlainText()
-        assert "30s total connection limit" in window.coach_text.toPlainText()
+        assert "Waiting for response headers" in window.coach_hint.text()
+        assert "30s total connection limit" in window.coach_hint.text()
         if outcome == "edit":
             window.exposure_slider.setValue(40)
             # This completes while the network worker is still blocked.
@@ -629,7 +636,7 @@ def test_api_uses_separate_worker_and_stale_results_are_discarded(window, applic
         elif outcome == "switch":
             monkeypatch.setattr(window.engine, "load", lambda path: (
                 SimpleNamespace(source_path=path, metadata={"photo_id": "photo-b", "visible_size": [6, 4]}), image))
-            window.open_raw(Path("C:/photocoach-tests/synthetic-b.ARW"))
+            window.open_raw(Path("synthetic-b.ARW"))
             spin_until(application, lambda: window.store.current.photo_id == "photo-b")
             assert window._network_active is not None
         if outcome in ("edit", "question", "pause", "switch"):
@@ -639,7 +646,7 @@ def test_api_uses_separate_worker_and_stale_results_are_discarded(window, applic
     finally:
         release.set()
     spin_until(application, lambda: window._network_active is None and window._active is None and window._pending is None)
-    text = window.coach_text.toPlainText()
+    text = window.coach_text.response_text()
     assert ("AI · test-model" in text) == (outcome == "success")
     assert "never-display-secret-key" not in text
     assert window.api_budget.attempts == 1 and window.api_budget.in_flight == 0
@@ -647,6 +654,8 @@ def test_api_uses_separate_worker_and_stale_results_are_discarded(window, applic
     assert window.exposure_slider.isEnabled()
     if outcome == "failure":
         assert "Editing remains available" in text
+    if outcome == "timeout_no_metadata":
+        assert "timed out" in text.lower() and "None" not in text
     if outcome == "timeout_connecting":
         assert "No analysis request was sent" in text and "charges may still apply" not in text
     if outcome == "timeout_waiting":
@@ -805,7 +814,8 @@ def test_text_probe_uses_shared_budget_worker_and_stale_result_rules(window, app
         spin_until(application, started.is_set)
         window._update_network_progress()
         assert "Text-only test" in window.coach_text.toPlainText()
-        assert not window.text_probe_button.isEnabled() and not window.analyze_button.isEnabled()
+        assert not window.text_probe_button.isEnabled()
+        assert window.analyze_button.isEnabled() and window.analyze_button.text() == "Cancel analysis"
         window.test_text_only()
         assert len(calls) == 1 and window.api_budget.attempts == 1 and window.api_budget.in_flight == 1
         if outcome == "edit":
@@ -818,7 +828,7 @@ def test_text_probe_uses_shared_budget_worker_and_stale_result_rules(window, app
             image = np.zeros((4, 6, 3), dtype=np.uint8)
             monkeypatch.setattr(window.engine, "load", lambda path: (
                 SimpleNamespace(source_path=path, metadata={"photo_id": "photo-b", "visible_size": [6, 4]}), image))
-            window.open_raw(Path("C:/photocoach-tests/synthetic-b.ARW"))
+            window.open_raw(Path("synthetic-b.ARW"))
             spin_until(application, lambda: window.store.current.photo_id == "photo-b")
         if outcome in ("edit", "pause", "switch"):
             old_text = window.coach_text.toPlainText()

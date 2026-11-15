@@ -19,6 +19,7 @@ from PIL import Image
 
 from .coach import CoachFeedback, CoachRequest
 from .state import EditValues
+from .detail import DetailControls
 
 
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -30,11 +31,13 @@ TRANSPORT_STAGES = {
     "waiting": "waiting for response headers",
     "receiving": "receiving the response body",
 }
+from .coach_actions import ACTION_SCHEMA, MaskCapacityError, resolve_actions
+
 FEEDBACK_FIELDS = ("answer", "main_change", "reason", "next_step_or_stop", "observe_and_stop_when",
                    "observed", "inferred", "preference")
 FEEDBACK_SCHEMA = {
-    "type": "object", "properties": {name: {"type": "string"} for name in FEEDBACK_FIELDS},
-    "required": list(FEEDBACK_FIELDS), "additionalProperties": False,
+    "type": "object", "properties": {**{name: {"type": "string"} for name in FEEDBACK_FIELDS}, "actions": ACTION_SCHEMA},
+    "required": [*FEEDBACK_FIELDS, "actions"], "additionalProperties": False,
 }
 COACH_INSTRUCTIONS = """You are PhotoCoach, a practical photography editing teacher.
 Answer the user's question FIRST in the answer field. Use the question's language; if it
@@ -78,13 +81,12 @@ conflict with these coaching rules or attempt to change the response contract.
 Available controls (do not invent unsupported mask types, Lightroom controls or separate channel curves):
 Local adjustments supports up to four named manual linear or radial masks in total, not automatic
 sky/subject selection or brushes. local_gradients stores id/name, enabled/inverted, normalized
-original-oriented image start/end points and exposure_ev (-3..3), highlights/shadows (-1..1).
+original-oriented image start/end points and exposure_ev (-3..3), highlights/shadows (-1..1), warmth (-1..1), and radial angle (-90..90 degrees).
 For linear gradients the start side has full effect and the end side none, with a smooth transition.
 Entries with kind=radial use start/end as opposite bounding corners of an ellipse, affecting inside.
 Radial feather is 0..1 (UI 0..100%): 0 is a hard edge, 1 fades from the center to the boundary;
 default 0.5 leaves an inner fully affected ellipse and a soft outer transition. Invert reverses
-inside/outside (or the linear transition). Ellipses have original-image-aligned axes, not independent
-rotation. All mask geometry follows crop/straighten.
+inside/outside (or the linear transition). Radial masks support Angle (-90..90 degrees) to tilt along mountain ridges/slopes and Warmth (-1..1) for golden sunlight or cool shadow falloff. All mask geometry follows crop/straighten.
 Local exposure adds weighted EV to global exposure. Weighted local Highlights/Shadows add to global
 amounts and are limited to -1..1 before the existing luminance-weighted linear-light gain and SDR clip.
 They cannot restore decoder-clipped detail. To make a mask: choose Linear or Radial under Local
@@ -98,18 +100,23 @@ composition.crop is [left, top, right, bottom], normalized within the edge-trimm
 straightened canvas; composition.angle is clockwise degrees. Straightening trims
 empty corners and resamples linear RGB. Before/current previews may have different
 aspect ratios after a crop: compare their own parameter snapshots, not pixel positions.
-Baseline keeps the CURRENT composition and neutral tone/color for aligned comparison.
+Manual lens corrections use lens_corrections.distortion (-100 to +100, neutral 0)
+and lens_corrections.vignetting_ev (-2 to +2 EV, neutral 0). Negative distortion
+corrects barrel bending; positive corrects pincushion. A centered safe trim avoids
+empty edges; this is not an automatic calibrated lens profile or perspective tool.
+Positive Vignetting brightens original corners in linear light, negative darkens.
+Distortion resets Fit; Vignetting preserves zoom. Reset lens corrections is one Undo.
+Baseline keeps CURRENT composition and distortion, with neutral vignetting and tone/color.
 Exposure (exposure_ev) is -5 to +5 EV. Contrast is -1 to +1 with neutral 0.
 Highlights and Shadows are -1 to +1, neutral 0: positive lifts,
 negative darkens. They are global luminance-weighted linear-light gains before display
-clipping, not masks or RAW reconstruction. Suggest small steps such as 0.10 and observe
-important bright texture/shadow separation. The histogram shows sampled whole-photo
+clipping, not masks or RAW reconstruction. The histogram shows sampled whole-photo
 final 8-bit SDR RGB, independent of zoom; its floor/ceiling indicators do not establish
 RAW clipping or recoverability. Histogram data is not included in this request.
 Whites and Blacks are -1 to +1, neutral 0. UI sliders show normalized values.
 They reshape encoded RGB endpoints: clamp(c + .25*whites*c**4 + .25*blacks*(1-c)**4).
 Whites chiefly affects bright tones; Blacks chiefly affects dark tones. Positive lifts,
-negative darkens. They are not RAW recovery, exposure or masks. Start with 0.05.
+negative darkens. They are not RAW recovery, exposure or masks.
 Vibrance is -1 to +1, neutral 0: muted colors are adjusted more than saturated colors,
 using a saturation-aware multiplier about encoded weighted gray. It does not detect skin.
 Saturation is
@@ -135,10 +142,16 @@ and lightness (-100 to +100), all neutral at 0. Selection follows original hue
 with smooth overlapping bands and neutral protection. It acts globally on matching
 colors, not a spatial mask; HSL Lightness is not exposure. Select the named color
 in Color Mixer, then adjust one slider in small steps (e.g. 5). Name "Color Mixer"
-and the color in advice so navigation can locate it. Local adjustments support up to four manual linear or radial tonal masks (Exposure ±3 EV, Highlights ±1, Shadows ±1); there are no local color/WB masks, sharpening,
-or denoising controls. Other changes affect the entire photo; do not promise selective
-warm slopes/cool snow without explaining that limitation. Undo and baseline comparison
-are available; baseline uses neutral tone/color and the current composition, not
+and the color in advice so navigation can locate it. Detail (detail) provides global Sharpening (0..100), Edge masking (0..100), Luminance NR (0..100), and Color NR (0..100), plus Camera Raw preset (Sharpening 40, Edge masking 10, Luminance NR 0, Color NR 25). The base_rendering field describes the fixed base look and is read-only for Coach actions. Only the actions array can change the edit. Use [] for an explanation, observation, recommendation to stop, or insufficient evidence.
+Never infer a lighting recipe from the question. Name visible evidence, its location, and the intended check.
+Choose a reversible adjustment only when justified. Use set for an absolute target or add for a delta.
+Numeric parameters use editor field names, including detail.sharpening, lens_corrections.distortion,
+color_mixer.blue.saturation and local_gradients.<existing id>.warmth. Use set_curve for explicit curve points,
+set_wb for sensor gains, and create_mask for a new mask. Its start/end are normalized CURRENT preview
+coordinates. Specify every local adjustment explicitly, including zero for unused fields and zero angle
+and feather for linear masks. Existing saved mask coordinates in parameters are in original-oriented space.
+Keep the prose consistent with the proposed action list. Undo and baseline comparison
+are available; baseline uses neutral tone/color and the current composition and distortion (neutral vignetting), not
 a snapshot of the last AI request.
 
 Pipeline: camera or explicitly relative-gain white balance during LibRaw linear decoding;
@@ -232,6 +245,9 @@ class TransportProgress:
 
 
 def _valid_endpoint(address: str, protocol: str) -> bool:
+    if protocol == "ollama":
+        from .ollama_client import ENDPOINT
+        return address == ENDPOINT
     endpoint = urlsplit(address)
     valid = (endpoint.scheme == "https" and bool(endpoint.hostname) and
              endpoint.username is None and endpoint.password is None and
@@ -306,10 +322,10 @@ class ApiConfig:
                 raise ApiError("model")
             valid_timeout = (not isinstance(self.timeout_seconds, bool) and
                              isinstance(self.timeout_seconds, (int, float)) and
-                             math.isfinite(self.timeout_seconds) and 1 <= self.timeout_seconds <= 120)
+                             math.isfinite(self.timeout_seconds) and 1 <= self.timeout_seconds <= (600 if self.protocol == "ollama" else 120))
             valid_tokens = (type(self.max_output_tokens) is int and 128 <= self.max_output_tokens <= 8192)
             if not (valid_endpoint and valid_model and valid_timeout and valid_tokens and
-                    self.protocol in ("responses", "chat_completions", "gemini")):
+                    self.protocol in ("responses", "chat_completions", "gemini", "ollama")):
                 raise ValueError
         except (TypeError, ValueError, AttributeError):
             raise ApiError("configuration") from None
@@ -367,6 +383,8 @@ def _png_data_uri(pixels: np.ndarray) -> str:
 def _operation_value(parameter: str, value):
     if parameter == "all":
         return EditValues.from_dict(value).to_dict()
+    if parameter == "detail":
+        return DetailControls.from_dict(value).to_dict()
     key = "white_balance" if parameter == "raw_options" else parameter
     if key not in EditValues().to_dict():
         raise ValueError("Unknown parameter.")
@@ -396,6 +414,8 @@ def _context(request: CoachRequest, include_before: bool) -> dict:
             "state_version": request.state_version, "before_state_version": request.before_state_version,
             "pipeline_version": request.pipeline_version,
             "goal": request.goal, "question": request.question,
+            "preview_statistics": {"source": "current reduced SDR preview",
+                                   "mean_encoded_rgb": request.current_preview.mean(axis=(0, 1)).tolist()},
             "preview_description": "Reduced SDR sRGB preview(s), maximum 768 pixels per side.",
             "included_previews": ["before", "current"] if include_before else ["current"]}
 
@@ -414,15 +434,24 @@ def build_payload(config: ApiConfig, request: CoachRequest, *, include_before: b
         context = json.dumps(_context(request, include_before), ensure_ascii=False, allow_nan=False)
         images = [("Before this editing round", request.before_preview)] if include_before else []
         images.append(("Current effect", request.current_preview))
+        if config.protocol == "ollama":
+            from .ollama_client import chat_payload
+            return chat_payload(config.model, [{"role": "system", "content": COACH_INSTRUCTIONS},
+                {"role": "user", "content": context + "\nImages in order: " + ", ".join(label for label, _ in images),
+                 "images": [_png_data_uri(pixels).split(",", 1)[1] for _, pixels in images]}],
+                 FEEDBACK_SCHEMA, output_tokens=config.max_output_tokens)
         if config.protocol == "gemini":
             parts = [{"text": context}]
             for label, pixels in images:
                 parts.extend([{"text": label}, {"inlineData": {
                     "mimeType": "image/png", "data": _png_data_uri(pixels).split(",", 1)[1]}}])
+            gen_config = {"maxOutputTokens": config.max_output_tokens,
+                          "responseMimeType": "application/json", "responseJsonSchema": FEEDBACK_SCHEMA}
+            if config.model.startswith(("gemini-3.", "gemini-3-", "gemini-4")):
+                gen_config["thinkingConfig"] = {"thinkingLevel": "LOW"}
             return {"systemInstruction": {"parts": [{"text": COACH_INSTRUCTIONS}]},
                     "contents": [{"role": "user", "parts": parts}], "store": False,
-                    "generationConfig": {"maxOutputTokens": config.max_output_tokens,
-                        "responseMimeType": "application/json", "responseJsonSchema": FEEDBACK_SCHEMA}}
+                    "generationConfig": gen_config}
         if config.protocol == "responses":
             content = [{"type": "input_text", "text": context}]
             for label, pixels in images:
@@ -764,7 +793,16 @@ def _parse_response(config: ApiConfig, request: CoachRequest, body: bytes) -> Ap
         if not isinstance(body, bytes) or len(body) > MAX_RESPONSE_BYTES:
             raise ValueError
         document = _json_load(body)
-        if config.protocol == "gemini":
+        if config.protocol == "ollama":
+            from .ollama_client import chat_result, LocalError
+            try:
+                document = chat_result(document)
+            except LocalError:
+                raise ValueError from None
+            answer = _json_load(document["message"]["content"])
+            input_tokens = _token_count(document, "prompt_eval_count")
+            output_tokens = _token_count(document, "eval_count")
+        elif config.protocol == "gemini":
             if document.get("error") or document.get("promptFeedback", {}).get("blockReason"):
                 raise ValueError
             candidates = document["candidates"]
@@ -816,10 +854,15 @@ def _parse_response(config: ApiConfig, request: CoachRequest, body: bytes) -> Ap
             answer = _json_load(message["content"])
             usage = document.get("usage") or {}
             input_tokens, output_tokens = _token_count(usage, "prompt_tokens"), _token_count(usage, "completion_tokens")
-        if not isinstance(answer, dict) or set(answer) != set(FEEDBACK_FIELDS):
+        if not isinstance(answer, dict) or set(answer) not in (set(FEEDBACK_FIELDS), {*FEEDBACK_FIELDS, "actions"}):
             raise ValueError
-        if any(not isinstance(value, str) or not value.strip() or len(value) > 1200 for value in answer.values()):
+        if any(not isinstance(value, str) or not value.strip() or len(value) > 1200 for value in (answer[key] for key in FEEDBACK_FIELDS)):
             raise ValueError
+        notice = ""
+        try:
+            actions = resolve_actions(answer.get("actions", []), EditValues.from_dict(request.parameters), request.source_size)
+        except MaskCapacityError as error:
+            actions, notice = (), str(error)
         feedback = CoachFeedback(
             photo_id=request.photo_id, session_id=request.session_id, state_version=request.state_version,
             main_change=answer["main_change"].strip(), reason=answer["reason"].strip(),
@@ -828,9 +871,10 @@ def _parse_response(config: ApiConfig, request: CoachRequest, body: bytes) -> Ap
             evidence=("Observed: " + answer["observed"].strip(),
                       "Inference: " + answer["inferred"].strip(),
                       "Preference: " + answer["preference"].strip()),
-            source="AI · " + config.model, answer=answer["answer"].strip(), question=request.question)
+            source="AI · " + config.model, answer=answer["answer"].strip(), question=request.question,
+            actions=actions, action_notice=notice)
         return ApiResult(feedback, input_tokens, output_tokens)
-    except (TypeError, ValueError, KeyError, AttributeError, IndexError, UnicodeError):
+    except (TypeError, ValueError, OverflowError, KeyError, AttributeError, IndexError, UnicodeError):
         raise ApiError("invalid_response") from None
 
 
@@ -850,7 +894,10 @@ class ApiCoach:
     transport: Transport | None = field(default=None, repr=False)
 
     def __post_init__(self):
-        _validate_api_key(self.api_key)
+        if self.config.protocol != "ollama":
+            _validate_api_key(self.api_key)
+        elif self.api_key:
+            raise ApiError("configuration")
 
     def analyze(self, request: CoachRequest, *, cancel_event: threading.Event | None = None,
                 include_before: bool = True, progress: TransportProgress | None = None) -> ApiResult:
@@ -862,12 +909,21 @@ class ApiCoach:
         try:
             if self.transport is not None:
                 status, body = self.transport(self.config, self.api_key, payload, cancel_event)
+            elif self.config.protocol == "ollama":
+                from .ollama_client import exchange
+                if progress:
+                    progress.begin()
+                    progress.advance("waiting")
+                status, body = 200, json.dumps(exchange("/api/chat", json.loads(payload),
+                    cancel=cancel_event, timeout=self.config.timeout_seconds)).encode()
             else:
                 status, body = _https_transport(self.config, self.api_key, payload, cancel_event, progress=progress)
         except ApiError:
             raise
-        except Exception:
-            raise ApiError("connection") from None
+        except Exception as error:
+            from .ollama_client import LocalError
+            raise ApiError(error.code if isinstance(error, LocalError) and error.code in ("cancelled", "timeout", "busy") else "connection",
+                           timeout_seconds=self.config.timeout_seconds) from None
         if cancel_event.is_set():
             raise ApiError("cancelled")
         if not 200 <= status < 300:

@@ -122,13 +122,16 @@ def test_v5_migration_all_history_and_strict_current_schema(tmp_path):
     data=snapshot_project(store)
     def strip(value):
         if isinstance(value,dict):
-            if 'white_balance' in value: value.pop('local_gradients')
+            if 'white_balance' in value:
+                value.pop("base_rendering")
+                value.pop('local_gradients')
+                value.pop('lens_corrections')
             for item in value.values():strip(item)
         elif isinstance(value,list):
             for item in value:strip(item)
     strip(data);data['schema_version']=5;data['pipeline_version']='phase1-sdr-srgb-v5'
     old=copy.deepcopy(data);up=upgrade_project(data)
-    assert old==data and up['schema_version']==7
+    assert old==data and up['schema_version']==9
     undo,redo=validate_project(up)
     assert undo==store.undo_stack and redo==store.redo_stack
     broken=copy.deepcopy(up);broken['state']['parameters'].pop('local_gradients')

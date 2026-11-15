@@ -1,4 +1,4 @@
-"""RAW decoding pipeline: sensor WB -> linear sRGB -> exposure -> SDR sRGB.
+"""Phase 0 RAW pipeline: sensor WB -> linear sRGB -> exposure -> SDR sRGB.
 
 This is a bounded SDR development experiment, not an unclipped scene-linear
 RAW engine. LibRaw's uint16 output may already clip highlights / out-of-gamut
@@ -30,10 +30,56 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .safe_io import atomic_write, sha256_file, validate_destination
+from .safe_io import atomic_write, is_supported_raw_suffix, sha256_file, validate_destination
 from .scratch import Scratch
 
 PIPELINE_VERSION = "phase0-linear-srgb-v1"
+BASE_RENDERINGS = ("natural_v1", "neutral_v1", "legacy_v1")
+NATURAL_STRENGTH = np.float32(2.5)
+
+
+def apply_base_rendering(block, mode, scratch):
+    """Fixed luminance shoulder, with radial chroma compression into SDR sRGB.
+
+    Natural v1 maps Y to 2.5*Y/(1+1.5*Y). It preserves black and unit white,
+    lifts lower tones and approaches white smoothly. This is a display look,
+    not an exposure calibration or a camera JPEG profile. Chroma is reduced
+    only when the mapped RGB would exceed the destination gamut.
+    """
+    if mode not in BASE_RENDERINGS:
+        raise ValueError("Unknown base rendering version.")
+    if mode != "natural_v1":
+        return
+    np.maximum(block, 0, out=block)
+    shape = block.shape[:2]
+    y = scratch.get("base_y", shape, np.float32)
+    gain = scratch.get("base_gain", shape, np.float32)
+    np.einsum("ijk,k->ij", block, np.array([.2126, .7152, .0722], np.float32), out=y)
+    np.multiply(y, NATURAL_STRENGTH - 1, out=gain)
+    gain += 1
+    np.divide(NATURAL_STRENGTH, gain, out=gain)
+    y *= gain
+    np.minimum(y, 1, out=y)
+    peak = scratch.get("base_peak", shape, np.float32)
+    np.maximum(block[..., 0], block[..., 1], out=peak)
+    np.maximum(peak, block[..., 2], out=peak)
+    peak *= gain
+    if np.any(peak > 1):
+        # RGB' = RGB * (gain * scale) + Y' * (1-scale).
+        # Fuse chroma subtraction/addition into a scalar gain and offset.
+        weight = scratch.get("base_weight", shape, np.float32)
+        peak -= y
+        np.maximum(peak, np.float32(1e-20), out=peak)
+        np.subtract(np.float32(1), y, out=weight)
+        np.divide(weight, peak, out=weight)
+        np.clip(weight, 0, 1, out=weight)
+        gain *= weight
+        np.subtract(np.float32(1), weight, out=weight)
+        y *= weight
+        block *= gain[..., None]
+        block += y[..., None]
+    else:
+        block *= gain[..., None]
 
 
 @dataclass(frozen=True)
@@ -101,7 +147,7 @@ def effective_whitebalance(
 ) -> tuple[float, float, float, float]:
     """Validate as-shot RGBG coefficients and derive reproducible user WB."""
     if color_desc.rstrip("\x00") != "RGBG" or num_colors not in (3, 4):
-        raise ValueError("Only RGBG sensor layouts are supported.")
+        raise ValueError("Phase 0 supports only RGBG sensor layouts.")
     values = [float(value) for value in camera_wb]
     if len(values) != 4 or any(not math.isfinite(value) or value <= 0 for value in values[:3]):
         raise ValueError("This RAW has no valid camera white balance. Processing stopped to avoid an automatic fallback.")
@@ -149,6 +195,13 @@ def _shooting_metadata(path: Path) -> dict[str, Any]:
                             pass
                 if "LensModel" in exif:
                     result["lens"] = str(exif["LensModel"]).strip("\x00 ")
+                if "ExposureBiasValue" in exif:
+                    try:
+                        bias = _rational(exif["ExposureBiasValue"])
+                        if math.isfinite(bias):
+                            result["exposure_bias_ev"] = bias
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
     except (OSError, ValueError, KeyError, IndexError):
         result["metadata_warning"] = "Some shooting information could not be read; RAW decoding is unaffected."
     return result
@@ -173,60 +226,68 @@ def decode_raw(
     import rawpy
 
     source = Path(path).expanduser().resolve(strict=True)
-    if source.suffix.lower() != ".arw" or not source.is_file():
-        raise ValueError("Choose an existing Sony .ARW file.")
+    if not is_supported_raw_suffix(source) or not source.is_file():
+        raise ValueError("Choose an existing Sony .ARW or Nikon .NEF file.")
     before = _fingerprint(source)
     digest = sha256_file(source)
+    libraw_error = getattr(rawpy, "LibRawError", ())
+    if not (isinstance(libraw_error, type) and issubclass(libraw_error, BaseException)):
+        libraw_error = ()
     # File-like input guarantees our source handle is opened read-only.
-    with source.open("rb") as stream, rawpy.imread(stream) as raw:
-        sizes = raw.sizes
-        camera_wb = list(raw.camera_whitebalance)
-        color_desc = raw.color_desc.decode("ascii", errors="replace")
-        wb = effective_whitebalance(camera_wb, options, color_desc=color_desc, num_colors=raw.num_colors)
-        metadata: dict[str, Any] = {
-            "photo_id": digest,
-            "sha256": digest,
-            "file_size": before[0],
-            "pipeline_version": PIPELINE_VERSION,
-            "versions": dependency_versions(),
-            "raw_size": [int(sizes.raw_width), int(sizes.raw_height)],
-            "visible_size": [int(sizes.width), int(sizes.height)],
-            "orientation_flip": int(sizes.flip),
-            "camera_whitebalance": camera_wb,
-            "effective_whitebalance": list(wb),
-            "black_levels": [int(value) for value in raw.black_level_per_channel],
-            "white_level": int(raw.white_level),
-            "half_size": bool(half_size),
-            "color_space": "linear sRGB (D65), bounded LibRaw uint16 -> float32",
-            "warnings": [
-                "LibRaw may clip highlights or out-of-gamut colors before output. Lowering exposure does not recover clipped RAW highlights.",
-                "Half-size previews cannot establish final detail, noise, or sharpness." if half_size else "Full-size AHD reconstruction has different detail from the half-size preview.",
-            ],
-        }
-        crop_fields = ("crop_left_margin", "crop_top_margin", "crop_width", "crop_height")
-        if all(hasattr(sizes, name) for name in crop_fields):
-            metadata["recommended_crop"] = [int(getattr(sizes, name)) for name in crop_fields]
-        decoded = raw.postprocess(
-            demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
-            half_size=bool(half_size),
-            four_color_rgb=False,
-            use_camera_wb=False,
-            use_auto_wb=False,
-            user_wb=list(wb),
-            output_color=rawpy.ColorSpace.sRGB,
-            output_bps=16,
-            gamma=(1.0, 1.0),
-            no_auto_bright=True,
-            no_auto_scale=False,
-            adjust_maximum_thr=0.0,
-            bright=1.0,
-            highlight_mode=rawpy.HighlightMode.Clip,
-            exp_shift=1.0,
-            exp_preserve_highlights=0.0,
-            median_filter_passes=0,
-            fbdd_noise_reduction=rawpy.FBDDNoiseReductionMode.Off,
-            # user_flip=None uses RAW orientation; no second EXIF rotation.
-        )
+    try:
+        with source.open("rb") as stream, rawpy.imread(stream) as raw:
+            sizes = raw.sizes
+            camera_wb = list(raw.camera_whitebalance)
+            color_desc = raw.color_desc.decode("ascii", errors="replace")
+            wb = effective_whitebalance(camera_wb, options, color_desc=color_desc, num_colors=raw.num_colors)
+            metadata: dict[str, Any] = {
+                "photo_id": digest,
+                "sha256": digest,
+                "file_size": before[0],
+                "pipeline_version": PIPELINE_VERSION,
+                "versions": dependency_versions(),
+                "raw_size": [int(sizes.raw_width), int(sizes.raw_height)],
+                "visible_size": [int(sizes.width), int(sizes.height)],
+                "orientation_flip": int(sizes.flip),
+                "camera_whitebalance": camera_wb,
+                "effective_whitebalance": list(wb),
+                "black_levels": [int(value) for value in raw.black_level_per_channel],
+                "white_level": int(raw.white_level),
+                "half_size": bool(half_size),
+                "color_space": "linear sRGB (D65), bounded LibRaw uint16 -> float32",
+                "warnings": [
+                    "LibRaw may clip highlights or out-of-gamut colors before output. Lowering exposure does not recover clipped RAW highlights.",
+                    "Half-size previews cannot establish final detail, noise, or sharpness." if half_size else "Full-size AHD reconstruction has different detail from the half-size preview.",
+                ],
+            }
+            crop_fields = ("crop_left_margin", "crop_top_margin", "crop_width", "crop_height")
+            if all(hasattr(sizes, name) for name in crop_fields):
+                metadata["recommended_crop"] = [int(getattr(sizes, name)) for name in crop_fields]
+            decoded = raw.postprocess(
+                demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+                half_size=bool(half_size),
+                four_color_rgb=False,
+                use_camera_wb=False,
+                use_auto_wb=False,
+                user_wb=list(wb),
+                output_color=rawpy.ColorSpace.sRGB,
+                output_bps=16,
+                gamma=(1.0, 1.0),
+                no_auto_bright=True,
+                no_auto_scale=False,
+                adjust_maximum_thr=0.0,
+                bright=1.0,
+                highlight_mode=rawpy.HighlightMode.Clip,
+                exp_shift=1.0,
+                exp_preserve_highlights=0.0,
+                median_filter_passes=0,
+                fbdd_noise_reduction=rawpy.FBDDNoiseReductionMode.Off,
+                # user_flip=None uses RAW orientation; no second EXIF rotation.
+            )
+    except libraw_error as exc:
+        raise ValueError(
+            "This RAW format or compression mode (for example Nikon High-Efficiency HE/HE*) is not supported by the local LibRaw decoder."
+        ) from exc
     if _fingerprint(source) != before:
         raise RuntimeError("Another program changed the source file during reading. Reopen the photo.")
     if decoded.dtype != np.uint16 or decoded.ndim != 3 or decoded.shape[2] != 3:
@@ -250,13 +311,14 @@ def _validate_rgb(image: np.ndarray) -> np.ndarray:
 
 def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
                 highlights: float = 0.0, shadows: float = 0.0, cancel=None,
-                scratch: Scratch | None = None, local_fields=None) -> np.ndarray:
-    """Same exposure and display transfer for preview and export, no auto tone.
+                scratch: Scratch | None = None, local_fields=None,
+                local_warmth: np.ndarray | None = None, base_rendering: str = "legacy_v1") -> np.ndarray:
+    """Shared exposure, optional fixed base look and display transfer.
 
     Exposure is 2**EV in linear light. Optional luminance-weighted zone gains
     follow exposure, before SDR clipping. With Y=max(0, dot(RGB, sRGB weights)),
     gain=2**(shadows*.18**2/(Y**2+.18**2) + highlights*Y**2/(Y**2+.5**2)).
-    Amounts are [-1,1]; both zero is exactly the original pipeline. Positive
+    Amounts are [-1,1]; both zero retain the selected base look. Positive
     lifts, negative darkens. This pointwise mapping preserves RGB ratios before
     clipping and has monotone luminance (minimum log slope > 1-ln(2)). It cannot
     reconstruct information clipped by LibRaw. SDR clips to [0,1], then applies the
@@ -264,6 +326,8 @@ def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
     The input (including cached read-only arrays) is never modified.
     """
     source = _validate_rgb(linear_rgb)
+    if base_rendering not in BASE_RENDERINGS:
+        raise ValueError("Unknown base rendering version.")
     ev = float(exposure_ev)
     if not math.isfinite(ev) or not -5 <= ev <= 5:
         raise ValueError("Exposure must be a finite value from -5 to +5 EV.")
@@ -276,6 +340,8 @@ def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
     if local_fields is not None and (len(local_fields)!=3 or any(
             field.shape!=source.shape[:2] or not np.isfinite(field).all() for field in local_fields)):
         raise ValueError("Local tonal fields must match the sample grid.")
+    if local_warmth is not None and (local_warmth.shape != source.shape[:2] or not np.isfinite(local_warmth).all()):
+        raise ValueError("Local warmth field must match the sample grid.")
     multiplier = np.float32(2.0 ** ev)
     sh_c = np.float32(shadows) * np.float32(.18**2)
     sh_d = np.float32(.18**2)
@@ -291,7 +357,44 @@ def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
         np.multiply(block, multiplier, out=out)
         if local_fields is not None:
             ev_field,hl_field,sh_field=(field[start:start+128] for field in local_fields)
-            out *= np.exp2(ev_field)[...,None]
+            w_block = local_warmth[start:start+128] if local_warmth is not None else None
+            if w_block is not None and np.any(w_block != 0):
+                lum0 = 0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2]
+                # 1. Aerial-perspective & sky gate: shadowed/hazed/sky surfaces illuminated by the blue sky dome (B > 0.94*R)
+                #    stay cool and receding, while direct-sunlit & neutral surfaces (R >= 0.94*B) receive full golden light
+                blue_ratio = np.clip((out[..., 2] - out[..., 0] * np.float32(0.94)) / (lum0 + np.float32(0.012)), 0.0, 1.0)
+                sky_gate = np.clip(np.float32(1.0) - np.float32(1.45) * blue_ratio, 0.10, 1.0).astype(np.float32)
+                # 2. Highlight rolloff guard: prevent SDR ceiling clipping on already-bright snow/specular highlights
+                hl_guard = (np.float32(1.0) / (np.float32(1.0) + np.power(np.maximum(lum0, 0.0) / np.float32(0.52), 3.0))).astype(np.float32)
+                # 3. 3D surface-reflectance range mask: sun-facing ridges, snow saddles, rock faces, and road/car surfaces
+                #    catch golden light while deep occluded shadow crevices stay dark and three-dimensional
+                surf_norm = np.clip((np.sqrt(np.maximum(lum0, 0.0)) - np.float32(0.075)) / np.float32(0.19), 0.0, 1.0)
+                surf_s = surf_norm * surf_norm * (np.float32(3.0) - np.float32(2.0) * surf_norm)
+                warm_surf = np.clip((out[..., 0] - out[..., 2] * np.float32(0.90)) / (lum0 + np.float32(0.012)), -0.15, 0.65)
+                surf_gate = np.clip(
+                    np.float32(0.16) + np.float32(1.16) * surf_s * (np.float32(1.0) + np.float32(0.45) * warm_surf),
+                    0.14,
+                    1.42,
+                ).astype(np.float32)
+                light_mask = (sky_gate * hl_guard * surf_gate).astype(np.float32)
+                eff_ev = np.where((ev_field > 0) & (w_block > 0), ev_field * light_mask, ev_field).astype(np.float32)
+                eff_w = np.where(
+                    w_block > 0,
+                    w_block * sky_gate * hl_guard * (np.float32(0.22) + np.float32(0.92) * surf_gate),
+                    w_block * hl_guard,
+                ).astype(np.float32)
+                # Pure multiplicative linear-light Planckian chromaticity gain (preserves 100% micro-texture, no fog sticker)
+                out[..., 0] *= np.exp2(eff_ev + np.float32(0.74) * eff_w)
+                out[..., 1] *= np.exp2(eff_ev + np.float32(0.18) * eff_w)
+                out[..., 2] *= np.exp2(eff_ev - np.float32(0.70) * eff_w)
+            else:
+                out *= np.exp2(ev_field)[...,None]
+        elif local_warmth is not None:
+            w_block = local_warmth[start:start+128]
+            if np.any(w_block != 0):
+                out[..., 0] *= np.exp2(np.float32(0.52) * w_block)
+                out[..., 1] *= np.exp2(np.float32(0.14) * w_block)
+                out[..., 2] *= np.exp2(np.float32(-0.55) * w_block)
         if highlights or shadows or local_fields is not None:
             shape2 = out.shape[:2]
             luminance = scratch.get("srgb_lum", shape2, np.float32)
@@ -312,6 +415,7 @@ def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
             shift += luminance
             np.exp2(shift, out=shift)
             out *= shift[..., None]
+        apply_base_rendering(out, base_rendering, scratch)
         np.clip(out, 0.0, 1.0, out=out)
         low = scratch.get("srgb_low", out.shape, np.bool_)
         buf = scratch.get("comp_s0", out.shape, np.float32)

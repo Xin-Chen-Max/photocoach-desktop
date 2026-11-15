@@ -1,6 +1,6 @@
 """Compact Color Mixer; selection and expansion are window-local view choices."""
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QLabel, QSlider, QPushButton, QToolButton
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QLabel, QSlider, QPushButton, QToolButton, QSizePolicy
 
 from .color_mixer import ColorMixer, COLOR_NAMES, AXES
 from .edit_controls import EditSlider
@@ -19,9 +19,11 @@ class ColorMixerEditor(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.toggle = QToolButton()
+        self.toggle.setObjectName("subsectionToggle")
         self.toggle.setText("Color Mixer")
         self.toggle.setCheckable(True)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.toggle.setArrowType(Qt.ArrowType.RightArrow)
         layout.addWidget(self.toggle)
         self.body = QWidget()

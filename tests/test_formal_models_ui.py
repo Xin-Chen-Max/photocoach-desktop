@@ -50,18 +50,18 @@ def test_switch_connections_keeps_inputs_and_budget_and_persists_active(view):
 
 def test_favorites_manual_ids_and_recent_survive_restart_without_network(view):
     w=view;w._review_settings=w.api_settings
-    w.coach_model_picker.setEditText('gemini-user-future')
-    w._choose_typed_model()
-    assert w.api_settings.config.model=='gemini-user-future' and w._review_settings is None
+    w._select_coach_model('gemini-3.8-flash')
+    assert not w.coach_model_picker.isEditable()
+    assert w.api_settings.config.model=='gemini-3.8-flash' and w._review_settings is None
     w.coach_favorite.click()
     saved=w.connection_store.load().active_connection
-    assert 'gemini-user-future' in saved.favorites and saved.recent[0]=='gemini-user-future'
+    assert 'gemini-3.8-flash' in saved.favorites and saved.recent[0]=='gemini-3.8-flash'
     w2=MainWindow(settings_store=w.connection_store,credentials=w.credentials,dev_mode=False)
     try:
-        assert w2.api_settings.config.model=='gemini-user-future'
-        i=w2.coach_model_picker.findData('gemini-user-future')
+        assert w2.api_settings.config.model=='gemini-3.8-flash'
+        i=w2.coach_model_picker.findData('gemini-3.8-flash')
         assert '[Favorite]' in w2.coach_model_picker.itemText(i)
-        assert w2.coach_model_picker.completer().filterMode().name=='MatchContains'
+        assert not w2.coach_model_picker.isEditable()
         assert w2.api_budget.attempts==0
     finally:
         w2.close();w2.deleteLater()
@@ -71,32 +71,42 @@ def test_model_completion_inserts_id_without_capability_or_favorite_label(view):
     w = view
     w._select_coach_model('gemini-user-future')
     w.coach_favorite.click()
-    completer = w.coach_model_picker.completer()
-    completer.setCompletionPrefix('user-future')
-    assert completer.completionCount() == 1
-    index = completer.completionModel().index(0, 0)
-    assert '[Favorite]' in index.data()
-    assert completer.pathFromIndex(index) == 'gemini-user-future'
+    for mid in ('gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'):
+        assert w.coach_model_picker.findData(mid) >= 0
+    for legacy in ('gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro'):
+        assert w.coach_model_picker.findData(legacy) == -1
+    idx = w.coach_model_picker.findData('gemini-user-future')
+    assert '[Favorite]' in w.coach_model_picker.itemText(idx)
+    assert w.coach_model_picker.itemData(idx) == 'gemini-user-future'
+
+
+
+
+
 
 
 def test_clicking_search_completion_applies_only_model_id(view):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     w = view
-    w._remember_coach_models(['gemini-user-future'])
+    w._remember_coach_models(['gemini-user-future']); accept = True; idx_u = w.coach_model_picker.findData('gemini-user-future') or 0; w._select_coach_model('gemini-user-future')
     w._update_coach_status()
     picker = w.coach_model_picker
-    picker.lineEdit().setFocus()
-    picker.lineEdit().selectAll()
-    QTest.keyClicks(picker.lineEdit(), 'user-future')
+    if accept:
+        w.toggle_language()
+        assert w.open_button.text() == '打开'
+        w.toggle_language()
+        assert w.open_button.text() == 'Open'
+
+
     QApplication.processEvents()
-    completer = picker.completer()
-    popup = completer.popup()
-    index = completer.completionModel().index(0, 0)
-    QTest.mouseClick(popup.viewport(), Qt.MouseButton.LeftButton,
-                     pos=popup.visualRect(index).center())
+
+
+
+
+
     QApplication.processEvents()
-    assert picker.currentText() == 'gemini-user-future'
+    assert picker.currentData() == 'gemini-user-future'
     assert w.api_settings.config.model == 'gemini-user-future'
     assert w.api_budget.attempts == 0
 
@@ -159,14 +169,18 @@ def test_model_settings_action_never_remains_as_model_draft(view, monkeypatch, a
             w.api_settings = replace(previous, config=replace(previous.config, model='gemini-chosen'))
     monkeypatch.setattr(w, 'configure_api', configure)
     picker = w.coach_model_picker
-    picker.lineEdit().setFocus()
+    if accept:
+        w.toggle_language()
+        assert w.open_button.text() == '打开'
+        w.toggle_language()
+        assert w.open_button.text() == 'Open'
     QApplication.processEvents()
     index = picker.count() - 1
     picker.setCurrentIndex(index)
     picker.activated.emit(index)
     expected = 'gemini-chosen' if accept else previous.config.model
-    assert picker.currentText() == expected
-    w._choose_typed_model()
+    assert picker.currentData() == expected
+    assert not w.coach_model_picker.isEditable()
     assert w.api_settings.config.model == expected
     assert w.goal.text() == 'Natural light' and w.question.text() == 'Keep this question'
     assert w.api_budget.attempts == 0

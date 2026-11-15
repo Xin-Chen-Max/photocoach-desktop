@@ -1,0 +1,27 @@
+PhotoCoach source is Copyright (c) 2026 Xin Chen, distributed under the MIT license included as LICENSE.
+
+PhotoCoach Windows distribution - third-party components
+
+This folder includes a Python runtime, PySide6/Qt and shiboken6, NumPy, rawpy
+and LibRaw, Pillow and its imaging libraries, tifffile, and the PyInstaller
+bootloader. Upstream license and copyright texts are copied under licenses/;
+installed package metadata can also contain licenses in _internal/.
+
+PySide6 and Qt are available under LGPLv3/GPL/commercial terms as described in
+their included licenses. The LGPL libraries remain separate dynamic libraries
+in this folder so they can be replaced with compatible modified versions.
+Upstream Qt and PySide sources and build instructions:
+https://code.qt.io/cgit/qt/
+https://code.qt.io/cgit/pyside/pyside-setup.git/
+https://doc.qt.io/qtforpython-6/licenses.html
+
+rawpy: https://github.com/letmaik/rawpy
+LibRaw sources: https://www.libraw.org/download
+NumPy: https://github.com/numpy/numpy
+Pillow: https://github.com/python-pillow/Pillow
+tifffile: https://github.com/cgohlke/tifffile
+Python: https://www.python.org/downloads/source/
+PyInstaller bootloader: https://github.com/pyinstaller/pyinstaller
+
+No Adobe binaries, camera profiles, user photos, credentials, Ollama engine,
+or AI model weights are included.

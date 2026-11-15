@@ -1,66 +1,69 @@
 # Architecture
 
-PhotoCoach is a single-process desktop application. It has no web server, database, or hosted photo storage.
+PhotoCoach is a single-process Windows desktop application. It has no hosted photo storage or database. Optional cloud requests and the separately managed local Ollama process sit outside the image-rendering worker.
 
 ```mermaid
 flowchart LR
-    UI[PySide6 interface] --> State[Editing state and history]
-    State --> Snapshot[Immutable snapshot]
-    Snapshot --> Render[Background image processing]
-    Render --> Guard[Source, revision and viewport checks]
+    UI[PySide6 controls] --> State[Validated immutable snapshots]
+    State --> Render[Coalesced image worker]
+    Render --> Guard[Photo, revision and viewport checks]
     Guard --> View[Preview]
-    Snapshot --> Export[Full-resolution export]
-    State --> Project[Local project file]
-    Snapshot --> Review[Thumbnail and request review]
-    Review --> Provider[Manual model request]
-    Provider --> Feedback[State-bound coach feedback]
+    State --> Export[Formal export]
+    State --> Project[Local project and history]
+    State --> Review[Matching previews and request review]
+    Review --> Provider[Manual cloud or local request]
+    Provider --> Feedback[Validated feedback and fixed targets]
+    Feedback --> Apply[Explicit one-step application]
+    Apply --> State
 ```
 
 ## Module boundaries
 
 | Area | Modules | Responsibility |
 | --- | --- | --- |
-| Desktop coordination | `app.py`, `workspace_ui.py`, `workspace_widgets.py` | Window layout, event wiring, worker scheduling, and workflow coordination |
-| Editing state | `state.py`, `composition.py`, `color_mixer.py`, `gradients.py` | Validated values, snapshots, grouped transactions, undo, and redo |
-| Image processing | `imaging.py`, `adjustments.py`, `preview.py`, `detail_cache.py`, `scratch.py` | RAW decoding, shared processing, visible-region rendering, and bounded retained buffers |
-| Editing controls | `curve.py`, `composition_ui.py`, `color_mixer_ui.py`, `gradient_ui.py`, `gradient_view.py`, `white_balance.py` | Curve, crop, color, masks, and white balance interaction |
-| Persistence | `project.py`, `safe_io.py` | Project validation and migration, source verification, and atomic writes |
-| Coaching | `coach.py`, `api_coach.py`, `auto_coach.py`, `coach_view.py`, `coach_ui.py` | Context construction, provider adapters, feedback display, and developer mock mode |
-| Connections | `connections.py`, `settings.py`, `credentials.py`, `model_catalog.py`, `budget.py` | Saved nonsecret configuration, credential references, model metadata, and session limits |
+| Desktop | `app.py`, `cli.py`, `workspace_ui.py`, `workspace_widgets.py`, `preview_view.py`, `histogram.py`, `theme.py`, `i18n.py` | Layout, bilingual controls, scheduling and result presentation |
+| State | `state.py`, `composition.py`, `lens.py`, `detail.py`, `color_mixer.py`, `gradients.py` | Validated parameters, geometry and grouped undo/redo |
+| Rendering | `imaging.py`, `adjustments.py`, `preview.py`, `detail_cache.py`, `scratch.py`, `render_timing.py` | RAW decoding, tone/spatial processing, strips, cache reuse and timings |
+| Controls | `curve.py`, `composition_ui.py`, `lens_ui.py`, `detail_ui.py`, `color_mixer_ui.py`, `gradient_ui.py`, `gradient_view.py`, `white_balance.py`, `edit_controls.py` | Parameter interaction and source-coordinate handles/picking |
+| Persistence | `project.py`, `safe_io.py` | Versioned projects, migration/replay, hashing and atomic protected writes |
+| Coach | `coach.py`, `api_coach.py`, `coach_actions.py`, `coach_view.py`, `coach_ui.py`, `auto_coach.py`, `devmode.py` | Context, provider protocols, action validation, display and developer mock |
+| Connections | `connections.py`, `settings.py`, `credentials.py`, `model_catalog.py`, `budget.py`, `text_probe.py`, `models.py` | Nonsecret settings, explicit credential sources, catalogs, budgets and compatibility names |
+| Local AI | `ollama_client.py`, `local_runtime.py`, `local_models_ui.py` | Fixed loopback protocol, owned process, model preparation and cancellation |
 
-## Processing order
+## Rendering order
 
-RAW files are opened read-only. rawpy/LibRaw applies the selected sensor white balance and produces uint16 linear sRGB. Subsequent processing uses float32 arrays:
+RAW is opened read-only. LibRaw handles sensor black/white levels, camera/custom sensor white balance, demosaicing and camera-to-linear-sRGB conversion. Its uint16 output becomes float32. Gamma is linear at decode and sRGB encoding occurs once downstream.
 
-1. Crop and straighten in linear light.
-2. Global exposure and luminance-weighted highlights/shadows, including enabled local masks.
-3. SDR clipping and sRGB encoding.
-4. Whites/blacks, contrast, saturation, and vibrance.
-5. HSL color mixing and the shared RGB curve.
-6. One quantization step at the preview or export boundary.
+1. Crop, straighten and manual distortion sampling in linear light.
+2. Linear vignetting and exposure; luminance-weighted global/local highlights and shadows and local warmth.
+3. Versioned base rendering, SDR clipping and sRGB encoding.
+4. Whites/blacks, contrast, saturation and vibrance.
+5. HSL mixing and shared RGB curve.
+6. Encoded luminance/chroma detail filters.
+7. Display reduction where needed and one output quantization.
 
-The same formal editing functions serve settled previews and full-resolution exports. During a gesture, a separate reduced visible-region preview favors interaction speed. It is labeled **Adjusting**, retained during **Refining**, and replaced by **Full detail** when formal rendering finishes.
+Natural is a fixed, monotonic luminance shoulder with gamut handling. Neutral and Legacy preserve the compatible flatter base. Creative slider values remain independent. No per-photo automatic exposure or black-point fitting is added.
 
-At 100% zoom, one source pixel maps to one physical display pixel. Retained linear buffers have a combined 512 MiB budget; display buffers have a separate budget. These budgets do not cap total process peak memory.
+Formal 100% regions and full exports share operators. Spatial filters use six-pixel halo padding around 128-row strips. Applying sharpening after a reduced preview would enlarge its source-pixel radius, so active detail gestures filter natively first. A display-only request flag keeps the same path through zero. Plain tone gestures retain pre-tone reduction as a speed approximation.
 
-## State and background work
+Retained linear buffers share a 512 MiB limit and display buffers a 64 MiB limit. Large views use at most four strip workers inside the single active image job. These limits do not bound peak process memory.
 
-The UI changes validated state through `StateStore`. A drag groups intermediate values into one undo step while preserving the operation audit. Workers receive snapshots instead of reading mutable controls.
+## State and concurrency
 
-Image results are checked against the source, revision, viewport generation, and quality. Rendering keeps a latest pending intent rather than an unlimited queue. Cancelling a stale job prevents it from publishing pixels or feedback into a newer session.
+`StateStore` is the mutation boundary. A gesture keeps intermediate audit events and creates at most one history item. Workers receive snapshots. Rendering coalesces pending intents and checks photo/session/revision, viewport generation and quality before accepting results. Cancellation is checked between bounded work units.
 
-Project schema 7 stores the source path and hash, parameters, undo/redo history, and dependency provenance. Known older schemas migrate in memory and are validated by replaying their histories. Opening a project does not rewrite the original file.
+Schema 9 stores source identity, base rendering, parameters, dependency provenance and complete undo/redo history. Older projects migrate in memory and replay their histories. Schema 1-8 base modes become Legacy so opening does not change their appearance. Opening never writes over an old project.
 
-## External requests
+Coaching has separate request ownership and generation checks. Provider prose is escaped. Supported actions are validated against explicit target types/ranges and converted to immutable fixed targets from the analyzed revision. Text alone does not enable application. Applying verifies the whole result and uses one undo step. Photo, question, edit, connection or model changes make earlier replies reference-only.
 
-`build_request` constructs state-matched reduced images and editing context. `api_coach.py` adapts this request to each provider protocol and validates structured feedback. The review dialog exposes the destination, model, images, context, and budget before dispatch.
+## Network and local runtime
 
-Keys are resolved from the selected source only: a session value, a Windows credential, or a named environment variable. Connection JSON and project files do not store key values. HTTPS requests have bounded deadlines and response sizes, with no automatic retries.
+Cloud requests use HTTPS, bounded size/deadlines and no automatic retry or redirect. Review precedes sending unless the user explicitly enables session-only direct sending. Key values are resolved only from the chosen source and never serialized to projects/settings. Local cancellation cannot undo an external charge.
 
-An edit or cancellation cannot retract a request already received by a provider. The application discards stale results locally, while any provider charge remains outside its control.
+The Ollama client is separate: plain HTTP only to PhotoCoach's fixed `127.0.0.1:11435`, with no proxy, redirect or cloud credential access. The managed process has an independent model directory and cloud disabled; only its own process tree is stopped. Downloads use streaming progress and explicit success/install checks. Vision-probe validity is bound to directory, model digest and engine version.
 
-## Trade-offs
+## Distribution and trade-offs
 
-Qt Widgets provides a native desktop workflow without a separate frontend service. NumPy keeps the processing path inspectable and testable, but large final previews can take noticeable time. The cache limits retained data rather than making a promise about all transient allocations.
+PyInstaller builds an unsigned AMD64 folder ZIP from explicit application assets. It includes runtime licenses, dependency versions and LF-normalized source hashes. Build PATH isolation prevents unrelated tools from supplying same-named native libraries. The extracted bundle is tested with the checkout and Python removed from PATH.
 
-The pipeline is deliberately limited to SDR sRGB output. It does not implement camera profiles, scene-linear highlight recovery, monitor ICC conversion, or parity with commercial RAW processors.
+NumPy keeps operators inspectable and deterministic, while large native Fit previews remain expensive. SDR clipping, camera-profile coverage and monitor color management remain limits. The application does not claim Lightroom/camera-JPEG equivalence or aesthetic validation of a model.

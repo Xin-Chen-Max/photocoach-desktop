@@ -82,6 +82,10 @@ class CurveEditor(QWidget):
         for index, point in enumerate(self.points):
             painter.setBrush(QColor("#ffffff" if index == self.selected else "#79afff"))
             painter.drawEllipse(self._screen(point), 4, 4)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QColor("#3b3b3b"))
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
     def _nearest(self, position):
         distances = [((self._screen(p).x() - position.x()) ** 2 +

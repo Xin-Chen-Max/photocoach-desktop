@@ -34,10 +34,13 @@ def build_text_probe_payload(config: ApiConfig) -> dict:
     """The exact request disclosed by the review UI; no user or photo context."""
     if not isinstance(config, ApiConfig) or config.protocol != "gemini":
         raise ApiError("configuration")
+    gen_config = {"maxOutputTokens": config.max_output_tokens}
+    if config.model.startswith(("gemini-3.", "gemini-3-", "gemini-4")):
+        gen_config["thinkingConfig"] = {"thinkingLevel": "LOW"}
     return {
         "contents": [{"role": "user", "parts": [{"text": TEXT_PROBE_PROMPT}]}],
         "store": False,
-        "generationConfig": {"maxOutputTokens": config.max_output_tokens},
+        "generationConfig": gen_config,
     }
 
 

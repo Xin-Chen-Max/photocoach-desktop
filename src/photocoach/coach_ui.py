@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QColorSpace, QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QScrollArea,
-    QSpinBox, QTextEdit, QVBoxLayout, QWidget, QPushButton, QCompleter)
+    QSpinBox, QTextEdit, QVBoxLayout, QWidget, QPushButton)
 
 from .api_coach import (ApiConfig, ApiCoach, ApiError, request_context, request_endpoint, COACH_INSTRUCTIONS,
                         GEMINI_ENDPOINT, check_gemini_model, ModelCheckError, ModelCheckResult,
@@ -142,10 +142,10 @@ class ApiSettingsDialog(QDialog):
         catalog_actions.addWidget(self.more_models_button)
         catalog_layout.addLayout(catalog_actions)
         self.model_choices = QComboBox()
-        self.model_choices.setEditable(True)
-        self.model_choices.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.model_choices.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        self.model_choices.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self.model_choices.setEditable(False)
+        self.model_choices.setMaxVisibleItems(14)
+
+
         self.model_choices.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.model_choices.setMinimumContentsLength(15)
         self.model_choices.addItem("Choose a listed model…", None)
@@ -220,7 +220,7 @@ class ApiSettingsDialog(QDialog):
         self.timeout.setToolTip("Total connection, upload and response deadline. Increasing it only affects future manually sent requests; it never retries a failed request.")
         connection_form.addRow("Timeout · seconds", self.timeout)
         self.output_tokens = QSpinBox()
-        self.output_tokens.setRange(256, 8000)
+        self.output_tokens.setRange(256, 8192)
         self.output_tokens.setValue(config.max_output_tokens)
         connection_form.addRow("Maximum output tokens", self.output_tokens)
         connection_form.addRow(self.model_check_button)
@@ -405,6 +405,8 @@ class ApiSettingsDialog(QDialog):
                 self.endpoint.setText(GEMINI_ENDPOINT)
                 self.environment.setText("GEMINI_API_KEY")
                 self.timeout.setValue(max(60, self.timeout.value()))
+                if self.output_tokens.value() <= 1500:
+                    self.output_tokens.setValue(8192)
                 self.model.setPlaceholderText("Exact Gemini model code from Google AI Studio")
             elif self.endpoint.text().rstrip("/") in (GEMINI_ENDPOINT,
                     "https://api.openai.com/v1/responses", "https://api.openai.com/v1/chat/completions"):
@@ -506,7 +508,7 @@ class ApiSettingsDialog(QDialog):
                 else ProviderModelsConfig(self.endpoint.text().strip(), self.protocol.currentData()))
 
     def _populate_catalog(self):
-        from .model_catalog import classify_model
+        from .model_catalog import classify_model, is_ui_selectable_model
         selected = self.model_choices.currentData()
         self.model_choices.clear()
         self.model_choices.addItem('Choose a listed model…', None)
@@ -516,7 +518,7 @@ class ApiSettingsDialog(QDialog):
             provider = 'custom'
         for mid, model in sorted(self._catalog.items()):
             cap = classify_model(provider, mid)
-            if cap == 'unsupported':
+            if not is_ui_selectable_model(provider, mid):
                 continue
             tag = 'Image analysis supported' if cap == 'supported' else 'Needs verification'
             label = f'{mid} · {tag}'
@@ -532,7 +534,10 @@ class ApiSettingsDialog(QDialog):
             config = self._metadata_config()
             provider, scope = infer_provider(config), credential_target(config)
             rows = self.catalog_store.get_models(provider, scope)
+            from .model_catalog import DEFAULT_CURATED, KNOWN_VISION_MODELS
             self._catalog = {m.id: SimpleNamespace(model_id=m.id, display_name=m.display_name) for m in rows}
+            for mid in (*DEFAULT_CURATED.get(provider, ()), *KNOWN_VISION_MODELS.get(provider, ())):
+                self._catalog.setdefault(mid, SimpleNamespace(model_id=mid, display_name=mid))
             self._populate_catalog()
             stamp = self.catalog_store.get_last_updated(provider, scope)
             self.models_status.setText(('Cached model list · Updated '+stamp[:19] if stamp else
@@ -758,7 +763,9 @@ class SendReviewDialog(QDialog):
         self.include_before = QCheckBox("Also send the before preview")
         self.include_before.setChecked(True)
         layout.addWidget(self.include_before)
-        summary = QLabel(f"{config.model} · {urlsplit(config.endpoint).hostname}\nMay incur charges. Session attempts: {budget.attempts}.")
+        summary = QLabel(f"{config.model} · {urlsplit(config.endpoint).hostname}\n" +
+                        (f"Local analysis on this PC · No API charges. Local attempts: {budget.attempts}."
+                         if config.protocol == "ollama" else f"May incur charges. Session attempts: {budget.attempts}."))
         summary.setTextFormat(Qt.TextFormat.PlainText)
         summary.setWordWrap(True)
         outer.addWidget(summary)
@@ -806,7 +813,7 @@ class SendReviewDialog(QDialog):
         self.request = request
         self.include_before.toggled.connect(self.update_context)
         self.update_context()
-        disclosure = QLabel("Only selected reduced sRGB previews and the editing information shown above are sent, with photography-coach instructions. No ARW, source path or source EXIF/GPS is attached. Review your own goal/question text for private details. Small previews cannot establish noise, sharpness or RAW highlight recoverability. Provider retention rules still apply; store=false is requested where supported.")
+        disclosure = QLabel("Only selected reduced sRGB previews and the editing information shown above are sent, with photography-coach instructions. No RAW file (.ARW / .NEF), source path or source EXIF/GPS is attached. Review your own goal/question text for private details. Small previews cannot establish noise, sharpness or RAW highlight recoverability. Provider retention rules still apply; store=false is requested where supported.")
         disclosure.setWordWrap(True)
         detail_layout.addWidget(disclosure)
         costs = QLabel(budget_text(budget))

@@ -489,15 +489,16 @@ def test_visible_coach_mode_and_model_switch_are_passive(application, storage):
         window.show()
         window.coach_collapse.setChecked(False)
         application.processEvents()
-        assert window.coach_mode_picker.isVisible()
-        assert window.coach_mode_picker.currentIndex() == 0
-        assert window.analyze_button.text() == 'Try local demo'
+        window._show_coach_selection()
+        assert window.coach_mode.isVisible()
+        assert window.coach_mode.currentIndex() == 0
+        assert window.analyze_button.text() == 'Analyze photo'
         window.goal.setText('Natural light')
         window.question.setText('How should I lift the hillside?')
         window._remember_coach_models(['gemini-first', 'gemini-second'])
-        window.coach_mode_picker.setCurrentIndex(1)
+        window.coach_mode.setCurrentIndex(1)
         assert window.coach_mode.currentIndex() == 1
-        assert window.analyze_button.text() == 'Review and ask coach…'
+        assert window.analyze_button.text() == 'Analyze photo'
         assert window.coach_model_picker.findData('gemini-second') >= 0
         window._review_settings = window.api_settings
         attempts = window.api_budget.attempts
@@ -512,7 +513,7 @@ def test_visible_coach_mode_and_model_switch_are_passive(application, storage):
         assert window.goal.text() == 'Natural light'
         assert window.question.text() == 'How should I lift the hillside?'
         window.coach_mode.setCurrentIndex(0)
-        assert window.coach_mode_picker.currentIndex() == 0
+        assert window.coach_mode.currentIndex() == 0
         assert not window.coach_model_picker.isEnabled()
         window.api_settings = replace(original, config=ApiConfig('https://example.com/v1/chat/completions', 'other-model', 'chat_completions'))
         window._update_coach_status()
@@ -529,7 +530,7 @@ def test_model_picker_open_connection_and_cancel_preserves_settings(application,
     save_key(application, storage)
     window = desktop.MainWindow(settings_store=store, credentials=vault)
     try:
-        window.coach_mode_picker.setCurrentIndex(1)
+        window.coach_mode.setCurrentIndex(1)
         previous = window.api_settings
         monkeypatch.setattr(ApiSettingsDialog, 'exec', lambda self: QDialog.DialogCode.Rejected)
         window.coach_model_picker.activated.emit(window.coach_model_picker.count()-1)
@@ -555,7 +556,7 @@ def test_loaded_catalog_reaches_main_model_dropdown(application, storage, monkey
         assert window.coach_model_picker.findData('gemini-option-a') >= 0
         assert window.coach_model_picker.findData('gemini-option-b') >= 0
         assert window.coach_model_picker.currentData() == original.config.model
-        assert window.coach_mode_picker.currentIndex() == 0
+        assert window.coach_mode.currentIndex() == 0
         assert window.api_budget.attempts == 0
     finally:
         window.close()

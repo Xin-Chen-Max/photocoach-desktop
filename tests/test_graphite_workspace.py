@@ -67,15 +67,14 @@ def test_topbar_info_and_sidebar_width(window):
 @pytest.mark.parametrize("requested_height", [180, 250])
 def test_coach_menu_and_height_inputs_survive_navigation(window, requested_height):
     app = QApplication.instance()
-    assert not window.pause_coach.isVisible() and not window.coach_menu_button.isVisible()
+    assert not window.pause_coach.isVisible() and window.coach_menu_button.isVisible()
     window.coach_collapse.click()
     app.processEvents()
-    assert window.pause_coach.isVisible() and window.coach_menu_button.isVisible()
-    rectangles = [widget.geometry() for widget in (window.coach_summary, window.pause_coach,
-        window.coach_model_status, window.coach_menu_button, window.coach_collapse)]
+    assert not window.pause_coach.isVisible() and window.coach_menu_button.isVisible()
+    rectangles = [widget.geometry() for widget in (window.coach_summary, window.coach_selector, window.coach_menu_button, window.coach_collapse)]
     assert all(not a.intersects(b) for i, a in enumerate(rectangles) for b in rectangles[i+1:])
     assert [a.text() for a in window.coach_menu_button.menu().actions()] == [
-        "Connection…", "Usage and send confirmation…"]
+        "Edit goal", "Usage and diagnostics"]
     window.goal.setText("Natural light")
     window.question.setText("How does the curve work?")
     window.workspace_splitter.setSizes([700-requested_height, requested_height])
@@ -92,4 +91,30 @@ def test_coach_menu_and_height_inputs_survive_navigation(window, requested_heigh
     assert window.question.text() == "How does the curve work?"
     window.coach_menu_button.menu().actions()[1].trigger()
     assert window.coach_details.isVisible() and (window.coach_mode.isVisible() if window.dev_mode else not window.coach_mode.isVisible())
+    assert window.api_budget.attempts == window.coach.calls == 0
+
+
+def test_crop_straighten_entry_points_summary_and_undoable_reset(window):
+    from photocoach.composition import Composition
+    assert window.composition_button.text() == "Crop / Straighten"
+    assert window.crop_section.toggle.text() == "Crop and straighten"
+    assert window.crop_open_button.text() == "Crop and straighten…"
+    assert not window.crop_section.toggle.isChecked() and window.crop_section.body.isHidden()
+    assert window.crop_summary.text() == "Full frame · Angle +0.00°"
+    assert window.crop_open_button.isEnabled() and not window.crop_reset_button.isEnabled()
+    depth = len(window.store.undo_stack)
+    window.crop_reset_button.click()  # Neutral: no history entry.
+    assert len(window.store.undo_stack) == depth
+    window.change_parameter("composition", Composition((.1, .2, .9, .8), -3.5), sync=True)
+    assert window.crop_summary.text() == "Cropped 80% × 60% · Angle -3.50°"
+    assert window.crop_reset_button.isEnabled()
+    edited = window.store.current.composition
+    window.reset_composition()
+    assert window.store.current.composition == Composition()
+    assert len(window.store.undo_stack) == depth + 2
+    assert window.crop_summary.text() == "Full frame · Angle +0.00°" and not window.crop_reset_button.isEnabled()
+    window.undo()
+    assert window.store.current.composition == edited and window.crop_reset_button.isEnabled()
+    window._set_controls(False)
+    assert not window.crop_open_button.isEnabled() and not window.crop_reset_button.isEnabled()
     assert window.api_budget.attempts == window.coach.calls == 0

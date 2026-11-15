@@ -1,4 +1,4 @@
-"""Local RAW verification, processing diagnostics, and sample export.
+"""Reproducible, local-only Phase 0 RAW verification and sample export.
 
 Examples::
 
@@ -35,7 +35,7 @@ from .imaging import (
     render_srgb,
     srgb_icc_profile,
 )
-from .safe_io import atomic_write, sha256_file
+from .safe_io import atomic_write, is_supported_raw_suffix, sha256_file
 
 
 def _utc_now() -> str:
@@ -175,8 +175,8 @@ def verify(source: Path, output: Path, *, exposure: float, tiff: bool, wb_checks
     from .preview import reduce_linear
 
     source = source.expanduser().resolve(strict=True)
-    if source.suffix.lower() != ".arw" or not source.is_file():
-        raise ValueError("Select an existing Sony .ARW file.")
+    if not is_supported_raw_suffix(source) or not source.is_file():
+        raise ValueError("Select an existing Sony .ARW or Nikon .NEF file.")
     if not math.isfinite(exposure) or not -5 <= exposure <= 5:
         raise ValueError("Exposure must be a finite value between -5 and +5 EV.")
     report: dict[str, Any] = {
@@ -333,13 +333,13 @@ def verify(source: Path, output: Path, *, exposure: float, tiff: bool, wb_checks
         print(f"Failure report saved: {destination / report_name}", file=sys.stderr)
         return 1
     print(f"Technical checks and sample exports completed: {destination / report_name}")
-    print("Orientation, color, highlights, and desktop responsiveness require visual review.")
+    print("Phase 0 is not yet accepted: orientation, color, highlights, and GUI responsiveness still require manual review.")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="PhotoCoach: local RAW verification and sample export, with no network requests.")
-    parser.add_argument("source", nargs="?", type=Path, help="A real Sony .ARW source file (read-only)")
+    parser = argparse.ArgumentParser(description="PhotoCoach Phase 0: local RAW verification and sample export, with no AI calls.")
+    parser.add_argument("source", nargs="?", type=Path, help="A real Sony .ARW or Nikon .NEF source file (read-only)")
     parser.add_argument("--output", type=Path, help="A new output directory; its parent must already exist")
     parser.add_argument("--exposure", type=float, default=0.0, help="Linear exposure in EV, from -5 to +5; default: 0")
     parser.add_argument("--tiff", action="store_true", help="Also export a 16-bit RGB sRGB TIFF")

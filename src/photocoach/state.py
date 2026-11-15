@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .imaging import RawOptions
+from .imaging import RawOptions, BASE_RENDERINGS
 from .composition import Composition
+from .lens import LensCorrections
+from .detail import DetailControls
 from .color_mixer import ColorMixer
 from .gradients import LinearGradient, validate_gradients, gradient_from_dict
 
-EDIT_PIPELINE_VERSION = "phase1-sdr-srgb-v7"
+EDIT_PIPELINE_VERSION = "phase1-sdr-srgb-v9"
 IDENTITY_CURVE = ((0.0, 0.0), (1.0, 1.0))
 
 
@@ -56,9 +58,18 @@ class EditValues:
     blacks: float = 0.0
     vibrance: float = 0.0
     local_gradients: tuple[LinearGradient, ...] = ()
+    lens_corrections: LensCorrections = LensCorrections()
+    detail: DetailControls = DetailControls()
+    base_rendering: str = "legacy_v1"
 
     def __post_init__(self):
+        if self.base_rendering not in BASE_RENDERINGS:
+            raise ValueError("Unknown base rendering version.")
         validate_gradients(self.local_gradients)
+        if not isinstance(self.lens_corrections, LensCorrections):
+            raise ValueError("Invalid manual lens correction parameters.")
+        if not isinstance(self.detail, DetailControls):
+            raise ValueError("Invalid detail parameters.")
         object.__setattr__(self, "exposure_ev", finite_number(self.exposure_ev, -5, 5, "Exposure"))
         object.__setattr__(self, "contrast", finite_number(self.contrast, -1, 1, "Contrast"))
         object.__setattr__(self, "saturation", finite_number(self.saturation, 0, 2, "Saturation"))
@@ -80,19 +91,22 @@ class EditValues:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
     def to_dict(self) -> dict:
-        return {"exposure_ev": self.exposure_ev, "white_balance": {
+        return {"base_rendering": self.base_rendering, "exposure_ev": self.exposure_ev, "white_balance": {
             "mode": self.raw_options.wb_mode, "relative_rgb_gain": list(self.raw_options.wb_gains)},
             "contrast": self.contrast, "saturation": self.saturation,
             "whites": self.whites, "blacks": self.blacks, "vibrance": self.vibrance,
             "highlights": self.highlights, "shadows": self.shadows,
             "composition": self.composition.to_dict(),
+            "lens_corrections": self.lens_corrections.to_dict(),
             "color_mixer": self.color_mixer.to_dict(),
             "local_gradients": [g.to_dict() for g in self.local_gradients],
-            "rgb_curve": [list(point) for point in self.rgb_curve], "goal": self.goal}
+            "rgb_curve": [list(point) for point in self.rgb_curve], "goal": self.goal,
+            **({"detail": self.detail.to_dict()} if self.detail != DetailControls() else {})}
 
     @classmethod
     def from_dict(cls, value: dict) -> EditValues:
-        if not isinstance(value, dict) or set(value) != set(cls().to_dict()):
+        base_keys = set(cls().to_dict())
+        if not isinstance(value, dict) or not (base_keys <= set(value) <= (base_keys | {"detail"})):
             raise ValueError("Unknown or missing editing parameters.")
         wb = value["white_balance"]
         if not isinstance(wb, dict) or set(wb) != {"mode", "relative_rgb_gain"}:
@@ -107,7 +121,10 @@ class EditValues:
                    value["saturation"], validate_curve(value["rgb_curve"]), value["goal"],
                    value["highlights"], value["shadows"], Composition.from_dict(value["composition"]),
                    ColorMixer.from_dict(value["color_mixer"]), value["whites"], value["blacks"], value["vibrance"],
-                   tuple(gradient_from_dict(g) for g in value["local_gradients"]))
+                   tuple(gradient_from_dict(g) for g in value["local_gradients"]),
+                   LensCorrections.from_dict(value["lens_corrections"]),
+                   DetailControls.from_dict(value["detail"]) if "detail" in value else DetailControls(),
+                   value["base_rendering"])
 
 
 @dataclass(frozen=True)
@@ -131,12 +148,15 @@ class EditState:
     blacks: float = 0.0
     vibrance: float = 0.0
     local_gradients: tuple[LinearGradient, ...] = ()
+    lens_corrections: LensCorrections = LensCorrections()
+    detail: DetailControls = DetailControls()
+    base_rendering: str = "legacy_v1"
 
     @property
     def values(self) -> EditValues:
         return EditValues(self.exposure_ev, self.raw_options, self.contrast, self.saturation, self.rgb_curve,
                           self.goal, self.highlights, self.shadows, self.composition, self.color_mixer,
-                          self.whites, self.blacks, self.vibrance, self.local_gradients)
+                          self.whites, self.blacks, self.vibrance, self.local_gradients, self.lens_corrections, self.detail, self.base_rendering)
 
     def with_values(self, values: EditValues) -> EditState:
         return replace(self, **values.fields())
@@ -204,10 +224,12 @@ class StateStore:
         self.events.append(event)
         return event
 
-    def activate(self, path: Path, photo_id: str) -> EditState:
+    def activate(self, path: Path, photo_id: str, *, base_rendering: str = "legacy_v1") -> EditState:
         self.end_drag()
         previous = self.current.photo_id if self.current else None
-        self.current = EditState(photo_id, Path(path), str(uuid4()))
+        if base_rendering not in BASE_RENDERINGS:
+            raise ValueError("Unknown base rendering version.")
+        self.current = EditState(photo_id, Path(path), str(uuid4()), base_rendering=base_rendering)
         self.preview_revision = None
         self.undo_stack.clear()
         self.redo_stack.clear()
@@ -221,7 +243,7 @@ class StateStore:
     def begin_drag(self, parameter: str = "exposure_ev") -> None:
         if self.current is not None:
             self.end_drag()
-            if parameter not in ("exposure_ev", "contrast", "saturation", "rgb_curve", "highlights", "shadows", "color_mixer", "whites", "blacks", "vibrance", "local_gradients"):
+            if parameter not in ("exposure_ev", "contrast", "saturation", "rgb_curve", "highlights", "shadows", "color_mixer", "whites", "blacks", "vibrance", "local_gradients", "lens_corrections", "detail", "raw_options"):
                 raise ValueError("This parameter cannot be dragged.")
             self._transaction = str(uuid4())
             self._transaction_before = self.current.values
@@ -255,6 +277,8 @@ class StateStore:
 
     @staticmethod
     def _parameter_value(values: EditValues, parameter: str):
+        if parameter == "detail":
+            return values.detail.to_dict()
         key = "white_balance" if parameter == "raw_options" else parameter
         return values.to_dict().get(key)
 
@@ -284,6 +308,34 @@ class StateStore:
             self.end_drag()
         self._apply_values(values, "parameter", parameter)
 
+    def apply_changes(self, changes, primary_parameter: str | None = None) -> bool:
+        """Apply one or more (parameter, value) updates atomically as a single Undo HistoryEntry."""
+        if self.current is None:
+            raise RuntimeError("Open a photo first.")
+        self.end_drag()
+        effective: list[tuple[str, object]] = []
+        temp_values = self.current.values
+        for param, val in changes:
+            if param not in EditValues.__dataclass_fields__:
+                raise ValueError(f"Unknown editing parameter: {param}")
+            if getattr(temp_values, param) != val:
+                effective.append((param, val))
+                temp_values = replace(temp_values, **{param: val})
+        if not effective:
+            return False
+        if len(effective) == 1:
+            self.set_parameter(effective[0][0], effective[0][1])
+            return True
+        tx_param = primary_parameter if primary_parameter in EditValues.__dataclass_fields__ else effective[-1][0]
+        self.begin_drag(tx_param)
+        try:
+            for param, val in effective:
+                values = replace(self.current.values, **{param: val})
+                self._apply_values(values, "parameter", param)
+        finally:
+            self.end_drag()
+        return True
+
     def set_exposure(self, value):
         self.set_parameter("exposure_ev", value)
 
@@ -303,7 +355,7 @@ class StateStore:
     def reset(self) -> None:
         self.end_drag()
         if self.current:
-            self._apply_values(EditValues(goal=self.current.goal), "reset", "all")
+            self._apply_values(EditValues(goal=self.current.goal, base_rendering=self.current.base_rendering), "reset", "all")
 
     def undo(self) -> None:
         self.end_drag()

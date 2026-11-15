@@ -242,6 +242,8 @@ def resolve_api_key(settings: ApiSettings, credentials) -> str:
 def resolve_key_source(config: ApiConfig | GeminiModelsConfig, source: str, entered_key: str,
                        environment: str, credentials) -> str:
     """Shared explicit key resolution for generation settings or model-free metadata."""
+    if config.protocol == "ollama":
+        return ""
     _require(type(entered_key) is str)
     _validate_source(source, environment)
     if source == "session":

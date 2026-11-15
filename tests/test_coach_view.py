@@ -51,8 +51,8 @@ def test_feedback_priority_disclosure_and_safe_text(application):
     payload = '<img src="https://example.invalid/tracker.png"><a href="https://example.invalid">Click</a>'
     output.show_feedback(feedback(next_step_or_stop=payload))
     text = output.toPlainText()
-    assert text.index("NEXT STEP") < text.index("Watch / stop")
-    assert "WHAT CHANGED" not in text and "Parameters are neutral." in text
+    assert text.index("Suggestion") < text.index("Check after editing")
+    assert "No changes yet." not in text and "Parameters are neutral." not in text
     assert payload in text  # Provider markup is literal text, never an image or link.
     assert "tracker.png&quot;" in output.toHtml()
     assert '<img src="https://example.invalid' not in output.toHtml()
@@ -62,7 +62,7 @@ def test_feedback_priority_disclosure_and_safe_text(application):
     output.anchorClicked.emit(QUrl("photocoach:evidence"))
     assert output.evidence_expanded
     text = output.toPlainText()
-    assert text.index("WHY THIS HELPS") < text.index("WHAT CHANGED")
+    assert text.index("Parameters are neutral.") < text.index("No changes yet.")
     assert all(item in output.toPlainText() for item in feedback().evidence)
     output.anchorClicked.emit(QUrl("photocoach:evidence"))
     assert "Observed: Dark rocks." not in output.toPlainText()
@@ -71,22 +71,22 @@ def test_feedback_priority_disclosure_and_safe_text(application):
 
 def test_direct_answer_and_original_question_are_visible_and_escaped(application):
     output = CoachOutput()
-    question = 'How can I adjust the RGB curve? <img src="https://example.invalid/question">'
-    answer = 'The RGB curve and white balance gains affect the image differently.\n<img src="https://example.invalid/answer">is literal text.'
-    steps = "1. Double-click the RGB curve to add a control point.\n2. Drag the midtone point; compare with Undo."
+    question = '具体怎么调整rgb？ <img src="https://example.invalid/question">'
+    answer = '先区分 RGB 总曲线和白平衡增益。\n<img src="https://example.invalid/answer">是文本。'
+    steps = "1. 在 RGB curve 双击添加控制点。\n2. 拖动中间点；用 Undo 比较。"
     output.set_question_draft(question)
     output.show_feedback(feedback(question=question, answer=answer, next_step_or_stop=steps))
     text = output.toPlainText()
-    assert text.index(question) < text.index("ANSWER") < text.index(answer) < text.index("NEXT STEP")
-    assert steps in text and "WHY THIS HELPS" in text
-    assert "Parameters are neutral." in text and not output.evidence_expanded
+    assert text.index(question) < text.index(answer) < text.index("Suggestion")
+    assert steps in text and "Evidence and reasoning" in text
+    assert "Parameters are neutral." not in text and not output.evidence_expanded
     assert '<img src="https://example.invalid' not in output.toHtml()
-    output.set_question_draft("What should I try next?")
+    output.set_question_draft("接下来怎么做？")
     text = output.toPlainText()
-    assert "Question changed." in text and question in text
-    assert "What should I try next" not in text  # Keep the request's question, not the new draft, beside this answer.
+    assert "Edit or question changed." in text and question in text
+    assert "接下来怎么做" not in text  # Keep the request's question, not the new draft, beside this answer.
     output.set_question_draft(question)
-    assert "Question changed." not in output.toPlainText()
+    assert "Edit or question changed." in output.toPlainText()
     output.deleteLater()
 
 
@@ -99,12 +99,12 @@ def test_question_edit_keeps_reply_as_labeled_reference_without_editing_or_sendi
         state_version=state.revision, question=window.question.text(), answer="Use the shared tonal curve."))
     events = list(window.store.events)
     token = window._coach_generation
-    window.question.setText("How can I adjust the RGB curve?")
+    window.question.setText("具体怎么调整rgb？")
     assert window.store.current is state and window.store.events == events
     assert window._coach_generation > token
-    assert "Question changed." in window.coach_text.toPlainText()
+    assert "Edit or question changed." in window.coach_text.toPlainText()
     assert "How should I use RGB curve?" in window.coach_text.toPlainText()
-    assert "Earlier advice" in window.coach_summary.toolTip()
+    assert "changed" in window.coach_text.toPlainText()
     assert window.api_budget.attempts == 0
     window.close()
     window.deleteLater()
@@ -142,7 +142,7 @@ def test_bottom_coach_navigation_does_not_change_edits_or_send(application, tmp_
     assert "Saved key selected" in window.coach_connection.text()
     assert window.coach_connection.textFormat() == Qt.TextFormat.PlainText
     window.coach_text.show_feedback(feedback())
-    window.coach_details_button.click()
+    window.coach_usage_action.trigger()
     assert not window.coach_details.isHidden()
     window.coach_text.anchorClicked.emit(QUrl("photocoach:locate/exposure_ev"))
     assert window.tabs.currentIndex() == 0
@@ -177,7 +177,8 @@ def test_collapse_restores_dragged_height_and_keeps_editing_visible(application,
     assert window.workspace_splitter.sizes()[0] > before[0]
     window.coach_text.show_feedback(feedback(next_step_or_stop="1. Increase exposure slightly.\n2. Compare with Undo."))
     application.processEvents()
-    assert "Increase exposure" in window.coach_summary.toolTip()
+    assert "Increase exposure" in window.coach_text.toPlainText()
+    assert "New reply" in window.coach_collapse.text()
     assert "\n" not in window.coach_summary.toolTip()
     assert window.coach_panel.height() < 85
     assert window.coach_body.isHidden()  # New feedback does not defeat the user's photo space choice.
@@ -200,12 +201,14 @@ def test_reply_keeps_expanded_height_and_question_cursor(application, tmp_path):
     window.goal.setText("Natural light")
     window.question.setText("How should I adjust RGB?")
     window.question.setFocus()
-    window.question.setCursorPosition(8)
+    cursor = window.question.textCursor()
+    cursor.setPosition(8)
+    window.question.setTextCursor(cursor)
     application.processEvents()
     sizes = window.workspace_splitter.sizes()
     window.coach_text.show_feedback(feedback())
     application.processEvents()
-    assert window.question.hasFocus() and window.question.cursorPosition() == 8
+    assert window.question.hasFocus() and window.question.textCursor().position() == 8
     assert window.workspace_splitter.sizes() == sizes
     window.coach_collapse.click()
     window.coach_collapse.click()
@@ -226,8 +229,9 @@ def test_completed_advice_survives_edit_as_reference_but_not_photo_or_session_ch
     window._render_timer.stop()
     text = window.coach_text.toPlainText()
     assert "Increase exposure" in text and "Stop when rock texture" in text
-    assert "Earlier advice · based on v0" in text and "Current edit is v1" in text
-    assert "not been rechecked" in text
+    assert "Edit or question changed." in text
+    assert "Current edit is v1" in window.coach_text.response_text()
+    assert "not been rechecked" in window.coach_text.response_text()
     assert window.store.current.exposure_ev == .25
     assert window.coach_text.reference_revision == 1
     window.undo()
@@ -255,8 +259,8 @@ def test_completed_advice_survives_edit_as_reference_but_not_photo_or_session_ch
     ("Lower the RGB curve black endpoint.", "rgb_curve"),
     ("Try exposure and contrast.", None), ("Stop; this already fits your goal.", None),
     ("Try sharpening.", None),
-    ("Add a point to the RGB curve.", "rgb_curve"), ("Increase exposure a little.", "exposure_ev"),
-    ("Adjust white balance.", "white_balance"), ("Increase contrast and saturation.", None),
+    ("在 RGB 曲线中添加一个点。", "rgb_curve"), ("稍微增加曝光。", "exposure_ev"),
+    ("调整白平衡。", "white_balance"), ("增加对比度和饱和度。", None),
 ])
 def test_related_control_is_a_limited_unambiguous_navigation_hint(suggestion, control):
     assert related_control(suggestion) == control
@@ -290,18 +294,18 @@ def test_reader_is_modeless_retains_size_and_follows_question_and_state(applicat
     question = "How should I adjust the curve?"
     panel.output.set_question_draft(question)
     panel.output.show_feedback(feedback(question=question, answer="Lift one midtone point."))
-    panel.reader_button.click()
+    panel.reader_button.trigger()
     application.processEvents()
     assert panel.reader.isVisible() and not panel.reader.isModal()
     assert "Lift one midtone point." in panel.reader_output.toPlainText()
     panel.reader.resize(520, 420)
     panel.reader.hide()
-    panel.reader_button.click()
+    panel.reader_button.trigger()
     assert panel.reader.size().width() == 520 and panel.reader.size().height() == 420
     panel.output.keep_as_reference("photo-a", "session-a", 3)
     panel.output.set_question_draft("A new question")
-    assert "Current edit is v3" in panel.reader_output.toPlainText()
-    assert "Question changed." in panel.reader_output.toPlainText()
+    assert "Edit or question changed." in panel.reader_output.toPlainText()
+    assert "Edit or question changed." in panel.reader_output.toPlainText()
     assert question in panel.reader_output.toPlainText()
     panel.output.setPlainText("Photo changed. Ask about the current edit.")
     assert panel.reader_output.toPlainText() == "Photo changed. Ask about the current edit."
@@ -313,7 +317,7 @@ def test_reader_is_modeless_retains_size_and_follows_question_and_state(applicat
 def test_reader_disclosure_scroll_and_navigation_are_local(application):
     panel = CoachResponsePanel()
     panel.output.show_feedback(feedback(answer="A long answer. " * 120, next_step_or_stop="Use the RGB curve."))
-    panel.reader_button.click()
+    panel.reader_button.trigger()
     application.processEvents()
     panel.reader_sections[2].click()
     assert panel.reader_output.verticalScrollBar().value() > 0
@@ -333,7 +337,7 @@ def test_reader_disclosure_scroll_and_navigation_are_local(application):
     panel.reader_output.anchorClicked.emit(QUrl("photocoach:locate/rgb_curve"))
     assert controls == ["rgb_curve"] and panel.reader.isHidden()
     panel.output.show_feedback(feedback(answer="New response."))
-    panel.reader_button.click()
+    panel.reader_button.trigger()
     assert "New response." in panel.reader_output.toPlainText()
     assert not panel.reader_output.evidence_expanded
     assert panel.reader_output.verticalScrollBar().value() == 0
@@ -350,7 +354,7 @@ def test_hidden_reader_does_not_relayout_during_edits(application, monkeypatch):
         panel.output.keep_as_reference("photo-a", "session-a", revision)
     assert not renders
     panel.open_reader()
-    assert renders and "Current edit is v12" in panel.reader_output.toPlainText()
+    assert renders and "Current edit is v12" in panel.reader_output.response_text()
     panel.reader.close()
     panel.deleteLater()
 
@@ -379,9 +383,9 @@ def test_copy_includes_bound_question_hidden_evidence_and_reference_warning(appl
     panel.output.show_feedback(feedback(question="Original question", answer='<img src="https://example.invalid">'))
     panel.output.keep_as_reference("photo-a", "session-a", 9)
     panel.output.set_question_draft("New draft")
-    panel.copy_button.click()
+    panel.copy_button.trigger()
     assert len(copies) == 1
-    assert "Current edit is v9" in copies[0] and "Question changed." in copies[0]
+    assert "Current edit is v9" in copies[0] and "Edit or question changed." in copies[0]
     assert "Question sent: Original question" in copies[0] and "New draft" not in copies[0]
     assert "Observed: Dark rocks." in copies[0] and "WHAT CHANGED" in copies[0]
     assert '<img src="https://example.invalid">' in copies[0]  # Literal clipboard text.
@@ -407,13 +411,13 @@ def test_reader_navigation_and_question_shortcut_do_not_edit_or_send(application
     application.processEvents()
     events = list(window.store.events)
     size = window.workspace_splitter.sizes()
-    window.coach_question_shortcuts[1].click()
+    window.coach_question_actions[1].trigger()
     assert "shared RGB curve" in window.question.text() and window.question.hasFocus()
     QTest.keyClick(window.question, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert window.question.text() == "My original draft"
     window.coach_text.show_feedback(feedback(photo_id=state.photo_id, session_id=state.session_id,
         state_version=state.revision, next_step_or_stop="Use the RGB curve."))
-    window.coach_response.reader_button.click()
+    window.coach_response.reader_button.trigger()
     application.processEvents()
     assert window.workspace_splitter.sizes() == size
     window.coach_response.reader_output.anchorClicked.emit(QUrl("photocoach:locate/rgb_curve"))

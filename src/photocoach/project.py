@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from . import __version__
 from .imaging import dependency_versions
-from .safe_io import atomic_write, sha256_file
+from .safe_io import atomic_write, is_supported_raw_suffix, sha256_file
 from .state import EDIT_PIPELINE_VERSION, EditState, EditValues, HistoryEntry, StateStore
 from .gradients import LinearGradient
 
@@ -27,7 +27,7 @@ def snapshot_project(store: StateStore) -> dict:
     state = store.current
     if state is None:
         raise ValueError("Open a photo before saving a project.")
-    return {"format": "photocoach-project", "schema_version": 7,
+    return {"format": "photocoach-project", "schema_version": 9,
             "pipeline_version": EDIT_PIPELINE_VERSION, "project_id": store.project_id,
             "created_utc": store.created_utc, "saved_utc": store._now(),
             "source": {"path": str(state.source_path), "sha256": state.photo_id},
@@ -46,19 +46,23 @@ def _require(condition: bool, message="Project state and operation history disag
 
 
 def upgrade_project(data: dict) -> dict:
-    """Normalize only known v1–v6 contracts, without writing the source project.
+    """Normalize only known v1–v8 contracts, without writing the source project.
 
     Old history is enriched with neutral defaults for newer controls. The rest is still validated
     by full audit replay. New-schema files never get missing parameters filled in.
     """
     _require(isinstance(data, dict), "Invalid project document.")
     version = data.get("schema_version")
-    if version not in (1, 2, 3, 4, 5, 6) or type(version) is not int:
+    if version not in (1, 2, 3, 4, 5, 6, 7, 8) or type(version) is not int:
         return data
     _require(data.get("format") == "photocoach-project" and
              data.get("pipeline_version") == f"phase1-sdr-srgb-v{version}", "Unsupported legacy rendering pipeline.")
     data = copy.deepcopy(data)
-    additions = {"local_gradients": []} if version<=5 else {}
+    additions = {"base_rendering": "legacy_v1"}
+    if version <= 7:
+        additions["lens_corrections"] = EditValues().lens_corrections.to_dict()
+    if version <= 5:
+        additions["local_gradients"] = []
     if version <= 4:
         additions.update(whites=0.0,blacks=0.0,vibrance=0.0)
     if version <= 3:
@@ -69,7 +73,7 @@ def upgrade_project(data: dict) -> dict:
         additions.update(highlights=0.0, shadows=0.0)
     legacy_keys = set(EditValues().to_dict()) - set(additions)
     def parameters(value):
-        _require(isinstance(value, dict) and set(value) == legacy_keys, "Invalid legacy editing parameters.")
+        _require(isinstance(value, dict) and legacy_keys <= set(value) <= (legacy_keys | ({"detail"} if version == 8 else set())), "Invalid legacy editing parameters.")
         if version==6:
             _require(isinstance(value['local_gradients'],list),'Invalid legacy gradient collection.')
             for gradient in value['local_gradients']:
@@ -91,7 +95,7 @@ def upgrade_project(data: dict) -> dict:
             entry(item)
     except (KeyError, TypeError, IndexError, AttributeError) as error:
         raise ValueError("Malformed legacy project.") from error
-    data["schema_version"] = 7
+    data["schema_version"] = 9
     data["pipeline_version"] = EDIT_PIPELINE_VERSION
     return data
 
@@ -100,7 +104,7 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
     """Reconstruct undo/redo from audit events instead of trusting stored stacks."""
     data = upgrade_project(data)
     _require(data.get("format") == "photocoach-project" and type(data.get("schema_version")) is int
-             and data["schema_version"] == 7, "Unsupported project format or schema version. Newer projects require a newer PhotoCoach.")
+             and data["schema_version"] == 9, "Unsupported project format or schema version. Newer projects require a newer PhotoCoach.")
     _require(data.get("pipeline_version") == EDIT_PIPELINE_VERSION, "This project uses an unsupported rendering pipeline.")
     try:
         photo_id = data["source"]["sha256"]
@@ -111,7 +115,9 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
         target = EditValues.from_dict(data["state"]["parameters"])
         events = data["history"]["events"]
         _require(isinstance(events, list) and 1 <= len(events) <= 200000, "Invalid operation history length.")
-        values, revision, comparison = EditValues(), 0, False
+        values = EditValues.from_dict(events[0]["edit_before"])
+        _require(values == EditValues(base_rendering=values.base_rendering), "Invalid initial editing state.")
+        revision, comparison = 0, False
         undo: list[HistoryEntry] = []
         redo: list[HistoryEntry] = []
         gesture = None
@@ -132,7 +138,7 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
             kind = event["type"]
             entry_before = None
             if index == 0:
-                _require(kind == "photo_switch" and event["after"] == photo_id and after == EditValues())
+                _require(kind == "photo_switch" and event["after"] == photo_id and after == EditValues(base_rendering=before.base_rendering))
             elif kind in ("parameter", "reset", "cancel", "undo", "redo"):
                 _require(after != before)
                 revision += 1
@@ -145,7 +151,7 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
                 else:
                     _require(event["parameter"] == "all" and event["before"] == before.to_dict() and event["after"] == after.to_dict())
                 if kind == "reset":
-                    _require(after == EditValues(goal=before.goal) and gesture is None)
+                    _require(after == EditValues(goal=before.goal, base_rendering=before.base_rendering) and gesture is None)
                     entry_before = before
                 elif kind == "parameter":
                     if gesture is None:
@@ -237,21 +243,21 @@ def read_project(path: Path, *, source_override: Path | None = None) -> StateSto
     def invalid_constant(value):
         raise ValueError(f"Invalid JSON number: {value}")
     data = json.loads(path.read_text(encoding="utf-8"), parse_constant=invalid_constant)
-    legacy = isinstance(data, dict) and data.get("schema_version") in (1, 2, 3, 4, 5, 6)
+    legacy = isinstance(data, dict) and data.get("schema_version") in (1, 2, 3, 4, 5, 6, 7, 8)
     data = upgrade_project(data)
     undo, redo = validate_project(data)
     source = source_override or Path(data["source"]["path"])
     if not source.is_absolute():
         source = path.parent / source
     if not source.is_file():
-        raise SourceMissing("The project's ARW could not be found. Locate the same original photo.")
+        raise SourceMissing("The project's original RAW could not be found. Locate the same original photo.")
     source = source.resolve(strict=True)
-    _require(source.suffix.lower() == ".arw", "The project must reference a Sony ARW.")
-    _require(sha256_file(source) == data["source"]["sha256"], "The selected ARW does not match this project's source hash.")
+    _require(is_supported_raw_suffix(source), "The project must reference a Sony .ARW or Nikon .NEF photo.")
+    _require(sha256_file(source) == data["source"]["sha256"], "The selected RAW does not match this project's source hash.")
     _require(data["source"].get("byte_length") == source.stat().st_size, "The source file size does not match the project.")
     store = StateStore()
     if legacy:
-        store.load_warnings.append("Legacy project restored; existing edits are preserved. Saving uses format v7, which older PhotoCoach versions cannot open.")
+        store.load_warnings.append("Legacy project restored; existing edits are preserved. Saving uses format v9, which older PhotoCoach versions cannot open.")
     recorded = data.get("provenance", {}).get("dependencies", {})
     current_versions = dependency_versions()
     changed = [name for name in ("rawpy", "libraw", "numpy") if recorded.get(name) != current_versions.get(name)]

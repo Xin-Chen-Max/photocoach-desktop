@@ -149,11 +149,13 @@ def legacy_document(data):
     def walk(value):
         if isinstance(value,dict):
             if "white_balance" in value and "rgb_curve" in value:
+                value.pop("base_rendering")
                 value.pop("highlights")
                 value.pop("shadows")
                 value.pop("composition")
                 value.pop("color_mixer")
                 value.pop("local_gradients")
+                value.pop("lens_corrections")
                 for name in ("whites", "blacks", "vibrance"): value.pop(name)
             for item in value.values(): walk(item)
         elif isinstance(value,list):
@@ -185,7 +187,7 @@ def test_legacy_project_migration_keeps_history_pixels_and_original_file(tmp_pat
     restored.set_parameter("shadows", .2)
     write_project(tmp_path/"v2.photocoach", snapshot_project(restored))
     assert sha256_file(old)==digest and data["schema_version"]==1
-    assert json.loads((tmp_path/"v2.photocoach").read_text())["schema_version"]==7
+    assert json.loads((tmp_path/"v2.photocoach").read_text())["schema_version"]==9
 
 
 def test_project_migration_is_strict_for_missing_tampered_or_wrong_version_data(tmp_path):

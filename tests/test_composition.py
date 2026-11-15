@@ -113,9 +113,11 @@ def test_composition_history_reset_roundtrip_and_strict_v2_upgrade(tmp_path):
     def strip(value):
         if isinstance(value,dict):
             if "white_balance" in value:
+                value.pop("base_rendering")
                 value.pop("composition")
                 value.pop("color_mixer")
                 value.pop("local_gradients")
+                value.pop("lens_corrections")
                 for name in ("whites", "blacks", "vibrance"): value.pop(name)
             for item in value.values(): strip(item)
         elif isinstance(value,list):
@@ -126,7 +128,7 @@ def test_composition_history_reset_roundtrip_and_strict_v2_upgrade(tmp_path):
     before=copy.deepcopy(old)
     upgraded=upgrade_project(old)
     validate_project(upgraded)
-    assert old==before and upgraded["schema_version"]==7
+    assert old==before and upgraded["schema_version"]==9
     bad=copy.deepcopy(old)
     bad["state"]["parameters"]["composition"]={}
     with pytest.raises(ValueError): validate_project(bad)

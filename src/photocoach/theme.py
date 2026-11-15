@@ -31,11 +31,12 @@ def configure_appearance(app):
 
 
 STYLE = """
-QWidget { color:#e4e4e4; font-family:'Segoe UI'; font-size:13px; }
+QWidget { color:#e4e4e4; font-family:'Segoe UI','Microsoft YaHei'; font-size:13px; }
 QMainWindow, #appBody { background:#242424; }
 QLabel { background:transparent; border:0; }
 #photoPanel, #photoCanvas { background:#202020; border:0; }
-#editPanel, #coachPanel { background:#292929; border:0; }
+#editPanel { background:#292929; border:0; }
+#coachPanel { background:#292929; border:1px solid #363636; border-radius:4px; }
 #appTitle { font-weight:600; color:#c5c5c5; }
 QPushButton, QToolButton { background:#353535; border:1px solid #4a4a4a;
     border-radius:4px; padding:6px 10px; min-height:18px; }
@@ -53,6 +54,11 @@ QToolButton#sectionToggle { text-align:left; background:transparent; border:0;
     border-bottom:1px solid #3d3d3d; border-radius:0; padding:8px 2px; font-size:14px; font-weight:600; }
 QToolButton#sectionToggle:focus { border-bottom:1px solid #79afff; }
 QToolButton#sectionToggle:hover { background:#303030; }
+QToolButton#subsectionToggle { text-align:left; background:#2f2f2f; border:1px solid #424242;
+    border-radius:4px; padding:6px 8px; font-size:13px; font-weight:600; color:#e0e0e0; }
+QToolButton#subsectionToggle:hover { background:#383838; border-color:#5a5a5a; }
+QToolButton#subsectionToggle:focus { border-color:#79afff; }
+QPushButton[compact="true"] { padding:3px 8px; min-height:15px; font-size:12px; }
 QMenu { background:#303030; border:1px solid #555555; padding:4px; }
 QMenu::item { padding:7px 24px 7px 12px; }
 QMenu::item:selected { background:#315c91; color:white; }

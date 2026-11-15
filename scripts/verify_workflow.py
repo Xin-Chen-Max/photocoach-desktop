@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PIL import Image
 import tifffile
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QFontDatabase, QImage
 from PySide6.QtWidgets import QApplication, QFileDialog
 from photocoach.app import MainWindow, configure_appearance
 from photocoach.cli import _make_output_directory
@@ -33,7 +33,9 @@ def main():
     app = QApplication([])
     QFontDatabase.addApplicationFont("C:/Windows/Fonts/segoeui.ttf")
     configure_appearance(app)
-    window = MainWindow(settings_store=SettingsStore(output / "unused-settings.json"))
+    window = MainWindow(settings_store=SettingsStore(output / "unused-settings.json"), dev_mode=True)
+    window._allow_discard = lambda: True
+    window.network_pool.start = lambda *_: (_ for _ in ()).throw(AssertionError("No network allowed"))
     window.show()
     pixels = []
     display = window.preview.display
@@ -41,11 +43,18 @@ def main():
         pixels[:] = [value.copy()]
         display(value)
     window.preview.display = capture
+    detail_display = window.preview.display_detail
+    def capture_detail(value, request):
+        accepted = detail_display(value, request)
+        if accepted:
+            pixels[:] = [value.copy()]
+        return accepted
+    window.preview.display_detail = capture_detail
     timings = {}
     def idle(label):
         start = time.perf_counter()
         while (window._active or window._pending or window._pending_detail or window._protected_jobs
-               or window._render_timer.isActive() or window._detail_timer.isActive()):
+               or window._render_timer.isActive() or window._detail_timer.isActive() or window._settle_timer.isActive()):
             app.processEvents()
             if time.perf_counter() - start > 90:
                 raise TimeoutError(label)
@@ -62,6 +71,9 @@ def main():
         window.open_raw(sources[0])
         idle("open_raw")
         assert window.store.current.photo_id == hashes[sources[0].name]
+        window._refining_preview = True
+        window.request_preview()
+        idle("formal_baseline")
         baseline = pixels[0].copy()
         window.store.begin_drag("exposure_ev")
         for value in (5, 10, 15, 20, 25):
@@ -111,6 +123,9 @@ def main():
         assert project.is_file(), window.output_status.text()
         window.open_project(project)
         idle("reopen_project")
+        window._refining_preview = True
+        window.request_preview()
+        idle("reopen_formal")
         assert window.store.current.values == saved_values
         assert len(window.store.redo_stack) == 1
         np.testing.assert_array_equal(pixels[0], saved_pixels)
@@ -125,7 +140,7 @@ def main():
         request = window.coach.last_request
         assert request and request.parameters == window.store.current.values.to_dict()
         assert request.state_version == window.store.current.revision
-        assert "MOCK" in window.coach_text.toPlainText()
+        assert window.coach_text._feedback is not None and window.coach_text._feedback.source.startswith("MOCK")
         assert str(sources[0]) not in repr(request)
         screenshot("coach.png", 0)  # Coach and Edit share the workspace.
         screenshot("history.png", 1)
@@ -159,7 +174,9 @@ def main():
             actual = tiff.asarray()
             assert actual.dtype == np.uint16 and 34675 in tiff.pages[0].tags
             np.testing.assert_array_equal(actual, expected)
-        from verify_high_res_preview import image_array
+        def image_array(image):
+            image = image.convertToFormat(QImage.Format.Format_RGB888)
+            return np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())[:, :image.width()*3].reshape(image.height(), image.width(), 3).copy()
         l,t,r,b = window.preview.detail_request().rect
         reference = np.rint(expected[t:b,l:r].astype(np.float32)*(255/65535)).astype(np.uint8)
         difference = int(np.abs(reference.astype(np.int16)-image_array(window.preview._detail).astype(np.int16)).max())
@@ -170,7 +187,7 @@ def main():
         window.open_raw(sources[1])
         idle("switch_photo")
         assert window.store.current.photo_id == hashes[sources[1].name]
-        assert "MOCK · Local rules" not in window.coach_text.toPlainText()
+        assert window.coach_text._feedback is None
         assert window.coach.last_request is None
         after = {p.name: sha256_file(p) for p in sources}
         assert after == hashes

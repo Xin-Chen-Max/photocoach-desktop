@@ -81,21 +81,21 @@ def test_command_line_dev_flag(application, monkeypatch, argv, expected):
 def test_normal_ui_has_no_mock_and_first_run_shows_setup(application, tmp_path):
     w = window(tmp_path, dev_mode=False)
     assert w.dev_mode is False and w.coach_mode.currentIndex() == 1
-    assert w.analyze_button.text() == "Set up AI coach"
-    assert w.coach_model_status.text() == "Set up AI coach"
+    assert w.analyze_button.text() == "Set up coach"
+    assert w.coach_selector.text() == "Choose coach"
     assert w.coach.calls == 0
     for root in (w, w.coach_details):
         for text in visible_texts(root):
             assert "mock" not in text.lower() and "demo" not in text.lower(), text
-    assert w.coach_mode_picker.isHidden() and w.auto_mock.isHidden() and w.mock_limit_row.isHidden()
+    assert w.coach_mode.isHidden() and w.auto_mock.isHidden() and w.mock_limit_row.isHidden()
     w.close()
 
 
 def test_saved_connection_restores_and_shows_ask_coach_without_sending(application, tmp_path):
     w = window(tmp_path, dev_mode=False, settings=saved_settings())
     assert w.api_settings is not None and w.coach_mode.currentIndex() == 1
-    assert w.analyze_button.text() == "Ask coach"
-    assert "gemini-test-model" in w.coach_model_status.text()
+    assert w.analyze_button.text() == "Analyze photo"
+    assert "gemini-test-model" in w.coach_selector.toolTip()
     assert w.api_budget.attempts == 0 and w.coach.calls == 0
     assert "mock" not in w.coach_text.toPlainText().lower()
     w.close()
@@ -104,15 +104,15 @@ def test_saved_connection_restores_and_shows_ask_coach_without_sending(applicati
 def test_developer_mode_keeps_local_mock_available(application, tmp_path):
     w = window(tmp_path, dev_mode=True)
     assert w.coach_mode.currentIndex() == 0
-    assert w.analyze_button.text() == "Try local demo"
-    assert not w.coach_mode_picker.isHidden()
+    assert w.analyze_button.text() == "Analyze photo"
+    assert not w.coach_mode.isHidden()
     w.close()
 
 
 def test_setup_is_available_without_photo_and_sends_nothing(application, tmp_path, monkeypatch):
     w = window(tmp_path, dev_mode=False)
     seen = []
-    monkeypatch.setattr(w, 'configure_api', lambda: seen.append(True))
+    monkeypatch.setattr(w, '_show_coach_selection', lambda: seen.append(True))
     assert w.store.current is None and w.analyze_button.isEnabled()
     w.analyze_button.click()
     assert seen == [True] and w.api_budget.attempts == w.coach.calls == 0

@@ -1,14 +1,16 @@
-"""Shared floating-point editing pipeline for previews and full-resolution export."""
+"""Phase 1 shared float pipeline, used by preview and full export."""
 import numpy as np
 from concurrent.futures import CancelledError
 
 from .imaging import render_srgb
+from .lens import apply_vignetting
+from .detail import DETAIL_HALO_PX, apply_detail
 from .state import EditValues, IDENTITY_CURVE
 from .composition import output_size, sample_composition, Composition
 from .color_mixer import apply_color_mixer
 from .render_timing import timed
 from .scratch import Scratch
-from .gradients import RenderGeometry, tone_fields
+from .gradients import RenderGeometry, tone_fields, warmth_field
 
 
 def render_photo(linear, values, *, source_size=None, max_edge=None, cancel=None, timer=None,
@@ -26,29 +28,33 @@ def render_photo(linear, values, *, source_size=None, max_edge=None, cancel=None
         target = (max(1, round(size[0]*factor)), max(1, round(size[1]*factor)))
         with timed(timer, "geometry"):
             sampled = sample_composition(linear, values.composition, source_size=source_size,
-                                         target_size=target, scratch=scratch)
+                                         target_size=target, scratch=scratch, distortion=values.lens_corrections.distortion)
         return render_edit(sampled, values, cancel=cancel, timer=timer, scratch=scratch,
-                           geometry=RenderGeometry.full(source_size,values.composition,target))
-    if values.composition == Composition():
+                           geometry=RenderGeometry.full(source_size,values.composition,target,values.lens_corrections.distortion))
+    if values.composition == Composition() and not values.lens_corrections.distortion:
         return render_edit(linear, values, cancel=cancel, timer=timer, scratch=scratch,
                            geometry=RenderGeometry.full(source_size,values.composition,(linear.shape[1],linear.shape[0])))
     result = np.empty((size[1], size[0], 3), np.float32)
+    halo = DETAIL_HALO_PX if values.detail.active else 0
     for top in range(0, size[1], 128):
         if cancel is not None and cancel.is_set():
             raise CancelledError()
         bottom = min(top+128, size[1])
+        p_top = max(0, top - halo)
+        p_bottom = min(size[1], bottom + halo)
         with timed(timer, "geometry"):
             sampled = sample_composition(linear, values.composition,
-                                         source_size=source_size, rect=(0, top, size[0], bottom),
-                                         scratch=scratch)
-        result[top:bottom] = render_edit(sampled, values, cancel=cancel, timer=timer, scratch=scratch,
-            geometry=RenderGeometry(tuple(source_size),values.composition,(0,top,size[0],bottom),(size[0],bottom-top)))
+                                         source_size=source_size, rect=(0, p_top, size[0], p_bottom),
+                                         scratch=scratch, distortion=values.lens_corrections.distortion)
+        rendered = render_edit(sampled, values, cancel=cancel, timer=timer, scratch=scratch,
+            geometry=RenderGeometry(tuple(source_size),values.composition,(0,p_top,size[0],p_bottom),(size[0],p_bottom-p_top),values.lens_corrections.distortion))
+        result[top:bottom] = rendered[top - p_top : top - p_top + (bottom - top)] if halo else rendered
     return result
 
 
 def render_edit(linear_rgb: np.ndarray, values: EditValues, *, cancel=None, timer=None,
                 scratch: Scratch | None = None, geometry: RenderGeometry | None = None) -> np.ndarray:
-    """Exposure -> linear Highlights/Shadows -> SDR clip/OETF -> Whites/Blacks -> contrast -> saturation -> Vibrance -> HSL -> RGB curve.
+    """Exposure -> linear Highlights/Shadows -> base rendering -> SDR clip/OETF -> Whites/Blacks -> contrast -> saturation -> Vibrance -> HSL -> RGB curve.
 
     Contrast pivots encoded sRGB at 0.5 with slope 2**contrast. Saturation
     interpolates encoded RGB around weighted gray (0.2126,0.7152,0.0722).
@@ -60,20 +66,27 @@ def render_edit(linear_rgb: np.ndarray, values: EditValues, *, cancel=None, time
     if scratch is None:
         scratch = Scratch()
     with timed(timer, "tones"):
-        if any(g.active for g in values.local_gradients):
+        active_masks = any(g.active for g in values.local_gradients)
+        if active_masks or values.lens_corrections.vignetting_ev:
             if geometry is None or geometry.target_size!=(linear_rgb.shape[1],linear_rgb.shape[0]):
-                raise ValueError("Active gradients require an explicit matching source sampling geometry.")
+                raise ValueError("Spatial adjustments require an explicit matching source sampling geometry.")
             result=np.empty(linear_rgb.shape,np.float32)
             for top in range(0,linear_rgb.shape[0],128):
                 if cancel is not None and cancel.is_set():
                     raise CancelledError()
                 bottom=min(top+128,linear_rgb.shape[0])
-                fields=tone_fields(values.local_gradients,geometry.rows(top,bottom),values.highlights,values.shadows)
-                result[top:bottom]=render_srgb(linear_rgb[top:bottom],values.exposure_ev,
-                    highlights=values.highlights,shadows=values.shadows,cancel=cancel,scratch=scratch,local_fields=fields)
+                rows=geometry.rows(top,bottom)
+                grid=rows.source_grid() if active_masks else None
+                fields=tone_fields(values.local_gradients,rows,values.highlights,values.shadows,grid=grid) if active_masks else None
+                w_field=warmth_field(values.local_gradients,rows,grid=grid) if active_masks else None
+                sampled=apply_vignetting(linear_rgb[top:bottom],rows,values.lens_corrections.vignetting_ev)
+                result[top:bottom]=render_srgb(sampled,values.exposure_ev,
+                    highlights=values.highlights,shadows=values.shadows,cancel=cancel,scratch=scratch,local_fields=fields,local_warmth=w_field,
+                    base_rendering=values.base_rendering)
         else:
             result = render_srgb(linear_rgb, values.exposure_ev, highlights=values.highlights,
-                                 shadows=values.shadows, cancel=cancel, scratch=scratch)
+                                 shadows=values.shadows, cancel=cancel, scratch=scratch,
+                                 base_rendering=values.base_rendering)
     x, y = np.asarray(values.rgb_curve, dtype=np.float32).T
     for start in range(0, result.shape[0], 128):
         if cancel is not None and cancel.is_set():
@@ -86,6 +99,9 @@ def render_edit(linear_rgb: np.ndarray, values: EditValues, *, cancel=None, time
         if values.rgb_curve != IDENTITY_CURVE:
             with timed(timer, "curve"):
                 block[:] = np.interp(block, x, y)
+    if values.detail.active:
+        with timed(timer, "detail"):
+            apply_detail(result, values.detail, cancel=cancel, scratch=scratch)
     return result
 
 

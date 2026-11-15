@@ -138,7 +138,7 @@ def test_ten_new_edits_restore_history_and_ai_snapshot(tmp_path):
     for name in ('whites','blacks','vibrance'):
         assert request.parameters[name]==getattr(values,name)
         assert related_control(f'Adjust {name} slightly')==name
-    assert related_control('Reduce vibrance slightly')=='vibrance'
+    assert related_control('略微降低自然饱和度')=='vibrance'
     original=snapshot_project(store)
     for name in ('whites','blacks','vibrance'):
         damaged=copy.deepcopy(original)
@@ -151,7 +151,9 @@ def test_ten_new_edits_restore_history_and_ai_snapshot(tmp_path):
     def walk(v):
         if isinstance(v,dict):
             if 'white_balance' in v:
+                v.pop('base_rendering')
                 v.pop('local_gradients')
+                v.pop('lens_corrections')
                 for name in ('whites','blacks','vibrance'): v.pop(name)
             for item in v.values(): walk(item)
         elif isinstance(v,list):

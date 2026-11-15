@@ -1,7 +1,7 @@
 """Sampled final-SDR histogram; not a sensor histogram or recovery estimate."""
 import math
 import numpy as np
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QPainter, QColor, QPolygonF
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
@@ -29,11 +29,11 @@ def _sampled_histogram(linear, values, *, source_size=None):
     sampled = (linear[::step, ::step] if values.composition == Composition() else
                sample_composition(linear, values.composition,
                    target_size=(math.ceil(size[0]/step), math.ceil(size[1]/step))))
-    if any(g.active for g in values.local_gradients):
+    if any(g.active for g in values.local_gradients) or values.lens_corrections.distortion or values.lens_corrections.vignetting_ev:
         sampled=sample_composition(linear,values.composition,source_size=source_size,
-                                   target_size=(sampled.shape[1],sampled.shape[0]))
+                                   target_size=(sampled.shape[1],sampled.shape[0]),distortion=values.lens_corrections.distortion)
     pixels = quantize_srgb(render_edit(sampled, values,
-        geometry=RenderGeometry.full(source_size,values.composition,(sampled.shape[1],sampled.shape[0]))))
+        geometry=RenderGeometry.full(source_size,values.composition,(sampled.shape[1],sampled.shape[0]),values.lens_corrections.distortion)))
     count = pixels.shape[0] * pixels.shape[1]
     return {"rgb": [np.bincount(pixels[...,channel].ravel(), minlength=256).tolist() for channel in range(3)],
             "samples": count, "stride": step,
@@ -50,18 +50,32 @@ class HistogramPlot(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#202020"))
-        if self.data is None:
-            return
-        counts = np.log1p(np.asarray(self.data["rgb"]))
-        scale = max(1.0, float(counts.max()))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        for channel, color in zip(counts, ("#ee8b81", "#8dcfa0", "#86b9ef")):
-            painter.setPen(QColor(color))
-            painter.drawPolyline(QPolygonF([QPointF(3 + i*(self.width()-6)/255,
-                self.height()-3-v/scale*(self.height()-6)) for i,v in enumerate(channel)]))
-        for x, hit in ((3, self.data["black_percent"] > 0), (self.width()-10, self.data["white_percent"] > 0)):
-            painter.fillRect(x, 3, 7, 7, QColor("#f2bf80" if hit else "#536168"))
+        painter.fillRect(self.rect(), QColor("#1d1d1d"))
+        w, h = self.width(), self.height()
+        painter.setPen(QColor("#2c2c2c"))
+        for quarter in (1, 2, 3):
+            gx = round(3 + (w - 6) * quarter / 4)
+            painter.drawLine(gx, 1, gx, h - 2)
+        if self.data is not None:
+            counts = np.log1p(np.asarray(self.data["rgb"]))
+            scale = max(1.0, float(counts.max()))
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            base_y = h - 3
+            for channel, color in zip(counts, ("#ee8b81", "#8dcfa0", "#86b9ef")):
+                pts = [QPointF(3 + i*(w-6)/255, base_y - v/scale*(h-6)) for i, v in enumerate(channel)]
+                fill = QColor(color)
+                fill.setAlpha(34)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(fill)
+                painter.drawPolygon(QPolygonF([QPointF(3, base_y), *pts, QPointF(w - 3, base_y)]))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QColor(color))
+                painter.drawPolyline(QPolygonF(pts))
+            for x, hit in ((4, self.data["black_percent"] > 0), (w - 11, self.data["white_percent"] > 0)):
+                painter.fillRect(x, 4, 7, 7, QColor("#f2bf80" if hit else "#48545a"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(QColor("#3b3b3b"))
+        painter.drawRect(0, 0, w - 1, h - 1)
 
 
 class HistogramView(QWidget):
@@ -74,6 +88,7 @@ class HistogramView(QWidget):
         layout.setContentsMargins(0,0,0,0)
         layout.setSpacing(4)
         self.title = QLabel("Histogram · No photo")
+        self.title.setStyleSheet("color:#c8c8c8;font-size:12px;font-weight:600;")
         self.plot = HistogramPlot()
         if compact:
             self.plot.setMinimumHeight(64)
@@ -81,6 +96,7 @@ class HistogramView(QWidget):
         # Always reserve three explicit lines. Clearing/wrapping this label used
         # to move every slider underneath it while the pointer was dragging.
         self.limits = QLabel(self._limits_text())
+        self.limits.setProperty("secondary", True)
         for widget in (self.title, self.plot, self.limits):
             layout.addWidget(widget)
         self.setToolTip("Whole-photo RGB histogram with a logarithmic count axis. Sampled final 8-bit SDR output, independent of zoom. Black floor: all channels at 0. Highlight ceiling: at least one channel at 255. These may be intentional; they do not prove RAW clipping or recoverability. Small regions may be missed by sampling.")

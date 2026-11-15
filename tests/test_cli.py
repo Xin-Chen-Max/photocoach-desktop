@@ -75,6 +75,18 @@ def test_verify_exports_latest_full_state_and_keeps_manual_gate_pending(verifica
     assert not list(fixture.output.glob(".photocoach-*"))
 
 
+def test_verify_accepts_nikon_nef_source(verification_fixture, tmp_path) -> None:
+    nef_source = tmp_path / "nikon-original.NEF"
+    nef_source.write_bytes(verification_fixture.original)
+    nef_output = tmp_path / "nef-verification"
+    assert cli.verify(nef_source, nef_output, exposure=0.0, tiff=False, wb_checks=False) == 0
+    report = json.loads((nef_output / "report.json").read_text(encoding="utf-8"))
+    assert report["technical_probe_completed"] is True
+    assert report["source_name"] == "nikon-original.NEF"
+    assert report["source_unchanged"] is True
+    assert nef_source.read_bytes() == verification_fixture.original
+
+
 def test_existing_output_directory_is_rejected_before_hashing_or_decoding(verification_fixture, monkeypatch) -> None:
     fixture = verification_fixture
     fixture.output.mkdir()

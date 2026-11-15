@@ -32,6 +32,7 @@ def test_sha256_is_exact_and_opens_source_readonly(tmp_path, monkeypatch) -> Non
 
 
 @pytest.mark.parametrize("filename", ["output.arw", "output.ARW", "output.ArW",
+                                     "output.nef", "output.NEF", "output.NeF",
                                      "photo.jpg:private", "photo.jpg.", "photo.jpg "])
 def test_destination_rejects_raw_and_windows_normalization_aliases(tmp_path, filename) -> None:
     with pytest.raises(ValueError):
