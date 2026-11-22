@@ -67,7 +67,7 @@ assert PhotoCoachMCPServer().handle_request({"jsonrpc": "2.0", "id": 1, "method"
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QFontDatabase
 assert Path(photocoach.__file__).is_relative_to(Path(sys.argv[1]))
-assert photocoach.__version__ == "0.12.0"
+assert photocoach.__version__ == "0.12.1"
 app=QApplication([])
 QFontDatabase.addApplicationFont("C:/Windows/Fonts/segoeui.ttf")
 QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")
