@@ -10,7 +10,7 @@ The original photograph stays untouched. Editing, project recovery, and export r
 
 ## Download for Windows
 
-[Download PhotoCoach 0.12.0 for Windows 64-bit](https://github.com/Xin-Chen-Max/photocoach-desktop/releases/tag/v0.12.0).
+[Download PhotoCoach 0.12.1 for Windows 64-bit](https://github.com/Xin-Chen-Max/photocoach-desktop/releases/tag/v0.12.1) ([0.12.0 archive](https://github.com/Xin-Chen-Max/photocoach-desktop/releases/tag/v0.12.0)).
 
 Extract the whole ZIP and run **PhotoCoach/PhotoCoach.exe**. Keep `_internal` beside it. Python is included. The executable is unsigned and targets Windows AMD64. Ollama and model weights are separate downloads. Verify the ZIP with the release's `SHA256SUMS.txt` if needed.
 
@@ -38,7 +38,7 @@ Open a Sony `.ARW` or Nikon `.NEF`, make an adjustment, and compare it with the 
 
 Inspect sharpening and noise reduction at **100%** after **Full detail** appears. Spatial filters now run at native pixel scale before display reduction. Fit hides fine changes and takes more processing time with active detail filters. Ordinary tonal gestures retain a faster approximation.
 
-Open the bottom **Coach** panel and choose a saved connection, configure a cloud provider, or prepare a local model through **Choose coach**. Type a question and click **Analyze photo**; Ctrl+Enter submits and Enter adds a line. Review cloud requests before sending. Suggestions only change the photograph after an explicit **Apply suggestion** click. API usage is billed by the provider. See [usage and privacy](docs/usage.md).
+Open the bottom **Coach** panel and choose a saved connection, configure a cloud provider, or prepare a local model through **Choose coach**. Type a question and click **Analyze photo**; Ctrl+Enter submits and Enter adds a line. Review cloud requests and per-run budgets before sending. During analysis, the Agent v2 runtime can inspect 1:1 demosaiced crops, probe Bayer CFA headroom, query the bilingual editing playbook, and preview candidate adjustments in a sandboxed trial loop. Suggestions only change the photograph after an explicit **Apply suggestion** click. API usage is billed by the provider. See [usage and privacy](docs/usage.md).
 
 ## Run from source
 
@@ -86,7 +86,7 @@ To build a portable executable on Windows:
 ```powershell
 & .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
 & .\.venv\Scripts\python.exe scripts\build_windows.py --output dist\win64
-& .\.venv\Scripts\python.exe scripts\verify_windows_bundle.py dist\win64\PhotoCoach-0.12.0-win64.zip verification-runs\bundle-check
+& .\.venv\Scripts\python.exe scripts\verify_windows_bundle.py dist\win64\PhotoCoach-0.12.1-win64.zip verification-runs\bundle-check
 ```
 
 ## Current limits

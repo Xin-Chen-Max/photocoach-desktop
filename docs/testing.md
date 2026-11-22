@@ -2,7 +2,7 @@
 
 ## 0.12.1 Agent & Pipeline checks
 
-The test suite covers the complete application, rendering pipeline, and Agent v2 subsystem (over 1,290 unit and integration tests). It requires no camera files or network API calls.
+The public source completed **1,317 tests passed with 3 skips** on Windows / Python 3.12.14, exit 0, covering the desktop workspace, linear RAW pipeline, and Agent v2 subsystem. It requires no camera files or network API calls.
 
 ```powershell
 & .\.venv\Scripts\python.exe -m pytest -q -rs
@@ -10,12 +10,12 @@ The test suite covers the complete application, rendering pipeline, and Agent v2
 & .\.venv\Scripts\python.exe scripts\run_agent_eval.py
 ```
 
-The Agent evaluation suite (`scripts/run_agent_eval.py`) verifies:
-- State-graph ReAct execution (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`).
-- Active Vision demosaiced 1:1 inspection and Bayer CFA headroom probing.
-- Visual Reflexion self-repair: sandboxed trial candidate rendering that detects and corrects overexposure, contrast clipping, or no-op edits.
+The 25-scenario Agent evaluation suite (`scripts/run_agent_eval.py`) verifies:
+- State-graph ReAct execution (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`), raising overall scenario pass rate from **68.0% (v1 single-shot baseline) to 100.0% (+32.0%)**.
+- Active Vision demosaiced 1:1 inspection and Bayer CFA headroom probing (100% Detail crop compliance).
+- Visual Reflexion self-repair: sandboxed trial candidate rendering that detects and corrects overexposure, contrast clipping, or no-op edits (**0.0% -> 100.0% recovery rate**).
 - Multi-protocol wire normalization across Gemini, OpenAI, and Ollama formats.
-- Prompt injection and out-of-bounds parameter rejection.
+- Prompt injection and out-of-bounds parameter rejection (**100.0% resilience**).
 
 ## 0.12.0 release checks
 
@@ -81,7 +81,7 @@ The final unsigned AMD64 ZIP was extracted into a new path containing spaces and
 ```powershell
 & .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
 & .\.venv\Scripts\python.exe scripts\build_windows.py --output dist\win64
-& .\.venv\Scripts\python.exe scripts\verify_windows_bundle.py dist\win64\PhotoCoach-0.12.0-win64.zip verification-runs\bundle --raw C:\photos\sample.ARW
+& .\.venv\Scripts\python.exe scripts\verify_windows_bundle.py dist\win64\PhotoCoach-0.12.1-win64.zip verification-runs\bundle --raw C:\photos\sample.ARW
 ```
 
 The SHA-256 checksum for the downloadable file is in the release's `SHA256SUMS.txt`. Rebuilds can have different archive hashes. Another physical machine, ARM64, code signing and SmartScreen reputation remain unverified.

@@ -28,7 +28,7 @@ Type a question or choose a common question. Enter adds a line; Ctrl+Enter or **
 
 The cloud review shows the destination, model, matching preview images and editing context before sending. The original RAW, source path and source EXIF/GPS are not attached. Text entered into the goal or question is part of the displayed request. Provider retention rules and possible charges still apply. Session-only direct sending requires an explicit choice and is reset by connection changes or restart.
 
-Replies separate the answer, suggestion and checks, with evidence/reasoning expandable. Validated target values appear beside **Apply suggestion**. Long lists are available through **Reply options / View changes**. Applying submits the complete action list in one undo step and cannot repeat the same action. Advice remains reference-only after the photo, edit, question or coach changes. Cancel discards late replies but cannot retract a request already received by a provider.
+Replies separate the answer, suggestion and checks, with evidence, reasoning, the multi-step tool execution trace timeline, and 1:1 crop inspection thumbnails expandable. When a trial candidate has been rendered through the visual reflexion loop, **Preview trial** opens a non-modal side-by-side comparison before you commit. Validated target values appear beside **Apply suggestion**. Long lists are available through **Reply options / View changes**. Applying submits the complete action list in one undo step and cannot repeat the same action. Advice remains reference-only after the photo, edit, question or coach changes. Cancel discards late replies and halts active agent turns, though it cannot retract a request already received by a provider.
 
 ## Local vision models
 

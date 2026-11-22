@@ -11,10 +11,15 @@ flowchart LR
     State --> Export[Formal export]
     State --> Project[Local project and history]
     State --> Review[Matching previews and request review]
-    Review --> Provider[Manual cloud or local request]
-    Provider --> Feedback[Validated feedback and fixed targets]
+    Review --> Runtime[AgentRuntime ReAct state graph]
+    Runtime --> Tools[1:1 crop, CFA probe, HSL zones, BM25 RAG]
+    Tools --> Runtime
+    Runtime --> Trial[Visual Reflexion sandboxed trial render]
+    Trial --> Runtime
+    Runtime --> Feedback[Validated feedback and fixed targets]
     Feedback --> Apply[Explicit one-step application]
     Apply --> State
+    MCP[MCP stdio server] --> Tools
 ```
 
 ## Module boundaries
@@ -56,7 +61,7 @@ Retained linear buffers share a 512 MiB limit and display buffers a 64 MiB limit
 
 Schema 9 stores source identity, base rendering, parameters, dependency provenance and complete undo/redo history. Older projects migrate in memory and replay their histories. Schema 1-8 base modes become Legacy so opening does not change their appearance. Opening never writes over an old project.
 
-Coaching has separate request ownership and generation checks. Provider prose is escaped. Supported actions are validated against explicit target types/ranges and converted to immutable fixed targets from the analyzed revision. Text alone does not enable application. Applying verifies the whole result and uses one undo step. Photo, question, edit, connection or model changes make earlier replies reference-only.
+Coaching runs on a bounded state-graph runtime (`AgentRuntime`: `observe -> reason -> tool_call -> trial_render -> reflect -> finalize`) with separate request ownership, generation checks, `RunBudget` turn/tool/trial ceilings, and per-turn `SessionBudget` dollar reservations. When the network worker invokes image-inspection tools (`inspect_region_100pct`, `probe_sensor_headroom`, `propose_and_preview_trial`), execution marshals safely onto the serial single-owner image engine pool via queued Qt signals and event synchronization. Provider prose and trace timelines are HTML-escaped. Supported actions are validated against explicit target types/ranges and converted to immutable fixed targets from the analyzed revision. Text alone does not enable application. Applying verifies the whole result and uses one undo step. Photo, question, edit, connection or model changes make earlier replies reference-only.
 
 ## Network and local runtime
 
