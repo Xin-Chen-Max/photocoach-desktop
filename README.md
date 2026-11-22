@@ -1,8 +1,8 @@
 # PhotoCoach
 
-A Windows RAW photo editor with non-destructive adjustments and an optional AI coach that can see the current edit, its parameters, and the changes that led to it.
+A Windows RAW photo editor and bounded multimodal AI agent (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`) with non-destructive linear processing, active 1:1 demosaiced crop and Bayer CFA sensor inspection, visual reflexion trial self-repair, and a read-only Model Context Protocol (MCP) server.
 
-The original photograph stays untouched. Editing, project recovery, and export run locally. Cloud coaching starts only when you ask for it.
+The original photograph stays untouched. Editing, project recovery, and export run locally. Multimodal coaching starts only when you ask for it, and suggested edits apply only on explicit confirmation.
 
 ![PhotoCoach editor workspace](docs/images/editor.png)
 
@@ -57,11 +57,11 @@ py -3.12 -m venv .venv
 
 ## Engineering
 
-PySide6 provides the desktop interface. rawpy/LibRaw decodes RAW data into linear sRGB, NumPy applies edits, and Pillow/tifffile write exports.
+PySide6 provides the darkroom desktop interface. rawpy/LibRaw decodes RAW data into linear sRGB, NumPy applies edits, and Pillow/tifffile write exports.
 
-Immutable editing snapshots separate user actions from background work. Results carry source, revision, viewport and quality identifiers so an older job cannot overwrite a newer view. Rendering uses bounded strips, reusable decoded data and coalesced preview requests. Spatial filters use halo padding so settled 100% regions agree with exports.
+Immutable editing snapshots separate user actions from background work. Results carry source, revision, viewport and quality identifiers so an older job cannot overwrite a newer view. Rendering uses bounded strips, reusable decoded data, a seamless zoom pyramid, and coalesced preview requests. Spatial detail filters run at native pixel scale with halo padding so settled 100% regions match exports.
 
-Rendering and model requests have separate lifecycles. A photo, question, edit or coach change invalidates outdated suggestions. Validated relative actions become fixed targets for the analyzed revision and apply as one undo step. Requests are never retried automatically.
+The multimodal coaching engine runs on a bounded state-graph ReAct runtime (`AgentRuntime`) with explicit turn, tool, trial, and dollar-budget reservations (`RunBudget` / `SessionBudget`). Instead of relying on downscaled thumbnails alone, the agent actively invokes read-only diagnostic tools—1:1 demosaiced native crops (`inspect_region_100pct`), normalized Bayer CFA headroom probes (`probe_sensor_headroom`), 8-band HSL/CIELAB zoning (`analyze_hsl_zones`), and a bilingual BM25 Playbook RAG—then validates candidate edits through a sandboxed `propose_and_preview_trial` visual reflexion loop before presenting suggestions. The same schema-validated tool registry is exposed over a zero-bloat JSON-RPC `stdio` MCP server (`photocoach-mcp`).
 
 Read the [architecture](docs/architecture.md) for processing order, module boundaries and trade-offs.
 
