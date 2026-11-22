@@ -31,6 +31,7 @@ class GradientEditor(QWidget):
         layout.addLayout(creation)
         row=QHBoxLayout()
         self.add=QPushButton('Add mask');self.done=QPushButton('Done')
+        self.add.setProperty('compact',True);self.done.setProperty('compact',True)
         row.addWidget(self.add);row.addWidget(self.done);layout.addLayout(row)
         self.controls=QWidget();body=QVBoxLayout(self.controls);body.setContentsMargins(0,0,0,0)
         self.name=QLineEdit();self.name.setMaxLength(40);self.name.setPlaceholderText('Gradient name')
@@ -64,7 +65,7 @@ class GradientEditor(QWidget):
         self.angle.valueChanged.connect(lambda value:self._change(angle=float(value)))
         body.addWidget(self.angle_label);body.addWidget(self.angle)
         self.redraw=QPushButton('Redraw mask')
-        self.reset=QPushButton('Reset adjustments');self.delete=QPushButton('Delete mask')
+        self.reset=QPushButton('Reset adjustments');self.delete=QPushButton('Delete mask');self.redraw.setProperty('compact',True);self.delete.setProperty('compact',True);self.reset.setProperty('compact',True)
         mask_actions=QHBoxLayout();mask_actions.addWidget(self.redraw);mask_actions.addWidget(self.delete)
         body.addLayout(mask_actions);body.addWidget(self.reset)
         self.edit_on_photo=QCheckBox('Edit on photo');self.show_mask=QCheckBox('Show selected mask')
@@ -73,7 +74,7 @@ class GradientEditor(QWidget):
         layout.addWidget(self.controls)
         self.hint=QLabel('Add a gradient, then drag from the fully affected side toward the unaffected side.')
         self.hint.setProperty('secondary',True)
-        self.hint.setWordWrap(True);self.hint.setMinimumHeight(38);layout.addWidget(self.hint)
+        self.hint.setWordWrap(True);self.hint.setMinimumHeight(28);layout.addWidget(self.hint)
         self.setToolTip('Up to four manual linear or radial masks, attached to original image coordinates. Exposure adds in stops; overlapping Highlights/Shadows combine with global amounts and are limited to −1…+1. No RAW recovery or automatic subject detection.')
         self.add.clicked.connect(lambda:self.drawRequested.emit(False))
         self.redraw.clicked.connect(lambda:self.drawRequested.emit(True))
@@ -197,7 +198,7 @@ class GradientController:
         if not redraw and len(self.editor.values)>=4:return
         self.window.pick_wb.setChecked(False)
         self.drawing_id=self.editor.selected.id if redraw and self.editor.selected else uuid4().hex
-        self.drawing_radial=isinstance(self.editor.selected,RadialGradient) if redraw else self.editor.new_shape.currentText()=='Radial'
+        self.drawing_radial=isinstance(self.editor.selected,RadialGradient) if redraw else self.editor.new_shape.currentIndex()==1
         self.layer.new_drawing=True
         self.editor.edit_on_photo.setChecked(True)
         self.editor.show_mask.setChecked(True)

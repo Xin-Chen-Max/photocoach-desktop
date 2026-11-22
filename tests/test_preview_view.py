@@ -341,3 +341,112 @@ def test_pan_during_warm_edit_still_finishes_current_state(window, application, 
     assert not window.preview.quick_current
     assert calls[-1] == window.preview.view_generation
     assert window.store.preview_revision == window.store.current.revision
+
+
+def test_zoom_out_retains_pre_zoom_full_frame_layer_without_box(canvas, monkeypatch):
+    from photocoach.composition import Composition
+    monkeypatch.setattr(canvas, "devicePixelRatioF", lambda: 1.0)
+    canvas.resize(500, 300)
+    canvas.set_composition(Composition(angle=2.0))
+    assert canvas._quick.isNull()
+
+    req_fit = canvas.detail_request()
+    full_w, full_h = canvas.full_size
+    assert req_fit.rect == (0, 0, full_w, full_h)
+    fit_h = max(1, (full_h + req_fit.step - 1) // req_fit.step)
+    fit_w = max(1, (full_w + req_fit.step - 1) // req_fit.step)
+    canvas.display_detail(np.full((fit_h, fit_w, 3), (120, 140, 160), dtype=np.uint8), req_fit)
+
+    canvas.actual_size()
+    req_100 = canvas.detail_request()
+    rw = req_100.rect[2] - req_100.rect[0]
+    rh = req_100.rect[3] - req_100.rect[1]
+    canvas.display_detail(np.full((rh, rw, 3), (120, 140, 160), dtype=np.uint8), req_100)
+
+    # Zoom out before any new detail tile renders: surrounding pre-zoom Fit region stays visible.
+    canvas.zoom_at(0.4, QPointF(canvas.width() / 2, canvas.height() / 2))
+    outside_pt_x, outside_pt_y = 20, 20
+    sx, sy = canvas.source_at(QPointF(outside_pt_x, outside_pt_y))
+    assert 0 <= sx < full_w and 0 <= sy < full_h
+    assert not (req_100.rect[0] <= sx < req_100.rect[2] and req_100.rect[1] <= sy < req_100.rect[3])
+
+    target = QImage(canvas.width(), canvas.height(), QImage.Format.Format_RGB888)
+    canvas.render(target)
+    color = target.pixelColor(outside_pt_x, outside_pt_y)
+    assert (color.red(), color.green(), color.blue()) == (120, 140, 160)
+
+
+def test_edit_at_100pct_populates_full_frame_backdrop_for_zoom_out(window, application, monkeypatch):
+    from photocoach.imaging import DecodedPhoto, RawOptions
+    monkeypatch.setattr(window.preview, "devicePixelRatioF", lambda: 1.0)
+    window.preview.resize(500, 300)
+    linear = np.full((300, 400, 3), 0.25, dtype=np.float32)
+    photo = DecodedPhoto(
+        linear_rgb=linear,
+        metadata={"sha256": "photo-a", "visible_size": [4000, 3000], "orientation_flip": 0},
+        options=RawOptions(),
+        half_size=True,
+        source_path=Path("synthetic.ARW"),
+    )
+    window.engine.cache._entries[("synthetic", "photo-a")] = photo
+
+    window.preview.actual_size()
+    window.change_exposure(120)
+    spin(application, lambda: settled(window))
+    assert window.preview.quality == "Full detail"
+    assert not window.preview.quick_current
+    assert window.preview.has_current_full_frame()
+    assert window.engine.cache.decode_count == 0
+
+    roi_100 = window.preview._detail_rect
+    # Zoom out before release and stop detail timer: surround must already reflect +1.20 EV, not dark _quick.
+    window.preview.zoom_at(0.35, QPointF(250, 150))
+    window._detail_timer.stop()
+    px, py = 20, 20
+    sx, sy = window.preview.source_at(QPointF(px, py))
+    assert 0 <= sx < 4000 and 0 <= sy < 3000
+    assert not (roi_100[0] <= sx < roi_100[2] and roi_100[1] <= sy < roi_100[3])
+
+    target = QImage(window.preview.width(), window.preview.height(), QImage.Format.Format_RGB888)
+    window.preview.render(target)
+    color = target.pixelColor(px, py)
+    assert color.red() > 100 and color.green() > 100 and color.blue() > 100
+
+
+def test_zoom_in_and_out_does_not_cancel_inflight_backdrop(window, application, monkeypatch):
+    from photocoach.imaging import DecodedPhoto, RawOptions
+    photo = DecodedPhoto(
+        linear_rgb=np.full((300, 400, 3), 0.2, dtype=np.float32),
+        metadata={"sha256": "photo-a", "visible_size": [4000, 3000], "orientation_flip": 0},
+        options=RawOptions(),
+        half_size=True,
+        source_path=Path("synthetic.ARW"),
+    )
+    window.engine.cache._entries[("synthetic", "photo-a")] = photo
+
+    entered, release = threading.Event(), threading.Event()
+    cancel_states = []
+
+    def fake_backdrop(state):
+        entered.set()
+        assert release.wait(5)
+        cancel_states.append(bool(window.engine.cancel and window.engine.cancel.is_set()))
+        return np.full((300, 400, 3), 180, dtype=np.uint8), (4000, 3000)
+
+    monkeypatch.setattr(window.engine, "backdrop", fake_backdrop)
+    window.preview.actual_size()
+    window.change_exposure(50)
+    window._render_timer.stop()
+    window.request_preview()
+    spin(application, entered.is_set)
+    try:
+        window.preview.pan(40, 20)
+        window.preview.zoom_at(0.5, QPointF(window.preview.width() / 2, window.preview.height() / 2))
+        window._detail_timer.stop()
+        assert window._active is not None and window._active[1].kind == "backdrop"
+        assert not window._active[1].cancel.is_set()
+    finally:
+        release.set()
+    spin(application, lambda: window._active is None)
+    assert cancel_states == [False]
+    assert window.preview.has_current_full_frame()

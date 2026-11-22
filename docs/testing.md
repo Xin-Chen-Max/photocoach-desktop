@@ -1,5 +1,22 @@
 # Testing and verification
 
+## 0.12.1 Agent & Pipeline checks
+
+The test suite covers the complete application, rendering pipeline, and Agent v2 subsystem (over 1,290 unit and integration tests). It requires no camera files or network API calls.
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest -q -rs
+& .\.venv\Scripts\python.exe scripts\verify_wheel.py --output verification-runs\wheel-check
+& .\.venv\Scripts\python.exe scripts\run_agent_eval.py
+```
+
+The Agent evaluation suite (`scripts/run_agent_eval.py`) verifies:
+- State-graph ReAct execution (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`).
+- Active Vision demosaiced 1:1 inspection and Bayer CFA headroom probing.
+- Visual Reflexion self-repair: sandboxed trial candidate rendering that detects and corrects overexposure, contrast clipping, or no-op edits.
+- Multi-protocol wire normalization across Gemini, OpenAI, and Ollama formats.
+- Prompt injection and out-of-bounds parameter rejection.
+
 ## 0.12.0 release checks
 
 The public source completed **1,238 tests with 2 skips** on Windows / Python 3.12.14, exit 0. The skips are the opt-in real credential test and a symlink operation unavailable to this Windows account. The isolated wheel build and package smoke test also passed.

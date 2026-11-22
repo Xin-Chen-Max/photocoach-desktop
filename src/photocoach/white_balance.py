@@ -112,3 +112,94 @@ def sample_white_balance(state, position):
     if _fingerprint(source) != before:
         raise RuntimeError("The source changed while sampling. Reopen the photo.")
     return RawOptions("custom", gains)
+
+
+def measure_cfa_headroom(whole_data: np.ndarray, whole_colors: np.ndarray,
+                         local_data: np.ndarray, local_colors: np.ndarray,
+                         black: list[float] | tuple[float, ...], white: float) -> dict:
+    """Measure normalized Bayer sensor headroom and clipping without mutating source data."""
+    black_arr = np.asarray(black, dtype=np.float64)
+    if black_arr.shape[0] < 4 or not math.isfinite(float(white)):
+        raise ValueError("Invalid black/white sensor levels.")
+    denom = float(white) - black_arr
+    if np.any(denom <= 0):
+        raise ValueError("Invalid sensor dynamic range.")
+
+    def _stats(data, colors):
+        levels = black_arr[colors]
+        norm = (data.astype(np.float64) - levels) / denom[colors]
+        per_ch = {}
+        for idx, name in ((0, "r"), (1, "g"), (2, "b")):
+            mask = (colors == idx) if idx != 1 else ((colors == 1) | (colors == 3))
+            vals = norm[mask]
+            if vals.size == 0:
+                per_ch[name] = {"mean": 0.0, "p99": 0.0, "clipped_fraction": 0.0, "headroom_ev": 0.0, "cv": 0.0}
+                continue
+            mean_v = float(vals.mean())
+            p99 = float(np.percentile(vals, 99))
+            clipped = float(np.mean(vals >= 0.95))
+            headroom = max(0.0, math.log2(1.0 / max(1e-4, min(1.0, p99)))) if p99 < 0.99 else 0.0
+            cv = float(vals.std() / max(1e-6, abs(mean_v))) if mean_v > 0 else 1.0
+            per_ch[name] = {
+                "mean": round(mean_v, 5),
+                "p99": round(p99, 5),
+                "clipped_fraction": round(clipped, 5),
+                "headroom_ev": round(headroom, 3),
+                "cv": round(cv, 4),
+            }
+        overall_clipped = float(np.mean(norm >= 0.95)) if norm.size else 0.0
+        return per_ch, round(overall_clipped, 5)
+
+    whole_ch, whole_clipped = _stats(whole_data, whole_colors)
+    local_ch, local_clipped = _stats(local_data, local_colors)
+    reliable_neutral = (
+        all(local_ch[c]["mean"] >= 0.008 and local_ch[c]["clipped_fraction"] == 0.0 and local_ch[c]["cv"] <= 0.35
+            for c in ("r", "g", "b"))
+    )
+    return {
+        "whole_sensor_clipped_fraction": whole_clipped,
+        "whole_channels": whole_ch,
+        "patch_sensor_clipped_fraction": local_clipped,
+        "patch_channels": local_ch,
+        "is_reliable_neutral_candidate": reliable_neutral,
+        "note": "Normalized Bayer CFA sensor signal relative to white level; independent of display tone curve.",
+    }
+
+
+def inspect_sensor_headroom(state, x_norm: float = 0.5, y_norm: float = 0.5, patch_px: int = 64) -> dict:
+    """Read-only Bayer sensor headroom inspection at normalized composed coordinates."""
+    import rawpy
+    if not (0.0 <= x_norm <= 1.0 and 0.0 <= y_norm <= 1.0):
+        raise ValueError("Normalized inspection coordinates must lie in [0, 1].")
+    half = max(8, min(64, int(patch_px) // 2))
+    source = Path(state.source_path).resolve(strict=True)
+    before = _fingerprint(source)
+    if sha256_file(source) != state.photo_id:
+        raise RuntimeError("The source changed. Reopen the photo before inspecting sensor headroom.")
+    with source.open("rb") as stream, rawpy.imread(stream) as raw:
+        effective_whitebalance(raw.camera_whitebalance, RawOptions(),
+                               color_desc=raw.color_desc.decode("ascii"), num_colors=raw.num_colors)
+        if raw.raw_pattern is None or raw.raw_pattern.shape != (2, 2):
+            raise ValueError("Sensor headroom inspection currently supports Bayer RGBG sensors only.")
+        data = raw.raw_image_visible
+        colors = raw.raw_colors_visible
+        flip = int(raw.sizes.flip)
+        w, h = data.shape[1], data.shape[0]
+        oriented = (h, w) if flip & 4 else (w, h)
+        ow, oh = output_size(oriented, state.composition)
+        px = min(ow - 1, max(0, round(x_norm * (ow - 1))))
+        py = min(oh - 1, max(0, round(y_norm * (oh - 1))))
+        sx, sy = sensor_position((w, h), flip, state.composition, (px, py),
+                                 distortion=state.lens_corrections.distortion)
+        rect = (slice(max(0, sy - half), min(h, sy + half + 1)),
+                slice(max(0, sx - half), min(w, sx + half + 1)))
+        stats = measure_cfa_headroom(
+            data[::4, ::4], colors[::4, ::4],
+            data[rect], colors[rect],
+            raw.black_level_per_channel, raw.white_level,
+        )
+        stats["x_norm"] = round(float(x_norm), 3)
+        stats["y_norm"] = round(float(y_norm), 3)
+    if _fingerprint(source) != before:
+        raise RuntimeError("The source changed while inspecting. Reopen the photo.")
+    return stats

@@ -67,7 +67,10 @@ def test_forbidden_source_path_and_hardlink_alias_are_rejected(tmp_path) -> None
     with pytest.raises(ValueError, match="original photo"):
         validate_destination(source, forbidden_paths=(source,))
     alias = tmp_path / "alias.jpg"
-    os.link(source, alias)
+    try:
+        os.link(source, alias)
+    except OSError as exc:
+        pytest.skip(f"This Windows account does not permit test hardlinks: {exc}")
     with pytest.raises(ValueError, match="original photo"):
         validate_destination(alias, forbidden_paths=(source,))
     assert source.read_bytes() == b"private RAW bytes"

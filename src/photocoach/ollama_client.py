@@ -133,19 +133,43 @@ def model_identity(model=MODEL, *, cancel=None):
     return matches[0]["digest"]
 
 
-def chat_payload(model, messages, schema, *, output_tokens=4096):
+def chat_payload(model, messages, schema=None, *, output_tokens=4096, tools=None):
     if model != MODEL:
         raise LocalError("model")
-    return {"model": model, "messages": messages, "format": schema, "stream": False,
-            "think": False, "options": {"num_ctx": 8192, "num_predict": output_tokens, "temperature": .2},
-            "keep_alive": "5m"}
+    payload = {"model": model, "messages": messages, "stream": False,
+               "think": False, "options": {"num_ctx": 8192, "num_predict": output_tokens, "temperature": .2},
+               "keep_alive": "5m"}
+    if schema is not None:
+        payload["format"] = schema
+    if tools:
+        payload["tools"] = tools
+    return payload
 
 
-def chat_result(document):
-    if document.get("done") is not True or document.get("done_reason") != "stop":
+def chat_result(document, *, allow_tool_calls: bool = False):
+    reasons = ("stop", "tool_calls") if allow_tool_calls else ("stop",)
+    if document.get("done") is not True or document.get("done_reason") not in reasons:
         raise LocalError("response")
     message = document.get("message", {})
-    if message.get("role") != "assistant" or not isinstance(message.get("content"), str) or message.get("tool_calls"):
+    if message.get("role") != "assistant":
+        raise LocalError("response")
+    tool_calls = message.get("tool_calls")
+    content = message.get("content")
+    if not allow_tool_calls:
+        if not isinstance(content, str) or tool_calls:
+            raise LocalError("response")
+        return document
+    if content is not None and not isinstance(content, str):
+        raise LocalError("response")
+    if tool_calls:
+        if not isinstance(tool_calls, list):
+            raise LocalError("response")
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if (not isinstance(fn, dict) or not isinstance(fn.get("name"), str)
+                    or not fn["name"].strip() or not isinstance(fn.get("arguments"), (dict, str))):
+                raise LocalError("response")
+    elif not isinstance(content, str) or not content.strip():
         raise LocalError("response")
     return document
 

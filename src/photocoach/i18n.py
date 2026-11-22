@@ -79,6 +79,8 @@ def apply_workspace_language(window, lang: str) -> None:
     window.more_button.setText("更多" if zh else "More")
     if not window.store.current:
         window.filename.setText("未打开照片" if zh else "No photo open")
+    if hasattr(window, "unsaved_label"):
+        window.unsaved_label.setText("未保存修改" if zh else "Unsaved changes")
 
     # Canvas Toolbar
     window.fit_button.setText("适应窗口" if zh else "Fit")
@@ -110,6 +112,9 @@ def apply_workspace_language(window, lang: str) -> None:
     # Crop & Footer buttons
     window.crop_open_button.setText("裁剪与拉直…" if zh else "Crop and straighten…")
     window.crop_reset_button.setText("重置" if zh else "Reset")
+    if hasattr(window, "wb_label"):
+        window.wb_label.setText("白平衡" if zh else "White balance")
+    window.advanced_wb.setText("高级 RGB 增益" if zh else "Advanced RGB gains")
     window.apply_wb.setText("应用白平衡" if zh else "Apply white balance")
     if not window.pick_wb.isChecked():
         window.pick_wb.setText("吸取中性灰白平衡" if zh else "Pick neutral white balance")
@@ -118,12 +123,26 @@ def apply_workspace_language(window, lang: str) -> None:
     window.reset_button.setText("重置全部修改" if zh else "Reset edits")
     if hasattr(window, "help_button"):
         window.help_button.setText("编辑帮助" if zh else "Editing help")
+    if hasattr(window, "history_note"):
+        window.history_note.setText(
+            "已提交的操作 · 完整审计记录保存在工程中"
+            if zh
+            else "Committed actions · Complete audit is saved in the project"
+        )
 
     # Sub-editors
+    if hasattr(window.detail_editor, "note"):
+        window.detail_editor.note.setText(
+            "在 100% 视图下检查 · 明度锐化与彩色降噪"
+            if zh
+            else "Inspect at 100% · Luminance USM and color NR"
+        )
     window.detail_editor.preset.setText("Camera Raw 预设" if zh else "Camera Raw preset")
     window.detail_editor.reset.setText("重置细节" if zh else "Reset detail")
     window.detail_editor.set_values(window.detail_editor.values)
 
+    if hasattr(window.lens_editor, "note"):
+        window.lens_editor.note.setText("手动几何畸变与暗角校正" if zh else "Manual correction")
     window.lens_editor.reset.setText("重置镜头校正" if zh else "Reset lens corrections")
     window.lens_editor.set_values(window.lens_editor.values)
 
@@ -134,6 +153,10 @@ def apply_workspace_language(window, lang: str) -> None:
 
     # Local Gradients Editor
     ge = window.local_gradients
+    ge.new_mask_label.setText("新建蒙版" if zh else "New mask")
+    for idx, shape_label in enumerate(("线性 Linear", "径向 Radial") if zh else ("Linear", "Radial")):
+        ge.new_shape.setItemText(idx, shape_label)
+    ge.name.setPlaceholderText("蒙版名称" if zh else "Gradient name")
     ge.add.setText("添加蒙版" if zh else "Add mask")
     ge.done.setText("完成" if zh else "Done")
     ge.enabled.setText("启用" if zh else "Enabled")
@@ -186,6 +209,10 @@ def apply_workspace_language(window, lang: str) -> None:
         action.setText(title if zh else english)
     window.pause_coach.setText(("恢复教练" if window.coach.paused else "暂停教练") if zh else
                                ("Resume coach" if window.coach.paused else "Pause coach"))
+    if hasattr(window, "style_memory_enabled"):
+        window.style_memory_enabled.setText("在本地记住已采纳的风格偏好" if zh else "Remember applied style preferences locally")
+    if hasattr(window, "clear_style_memory_button"):
+        window.clear_style_memory_button.setText("清空风格记忆" if zh else "Clear style memory")
     window.coach_response.set_language(active)
     window._coach_toggle_text()
     window._update_coach_status()

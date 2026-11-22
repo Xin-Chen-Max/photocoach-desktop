@@ -22,7 +22,7 @@ class CurveEditor(QWidget):
         self.readout = QLabel(self)
         self.readout.setWordWrap(True)
         self.readout.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.readout.setStyleSheet("background: #222222; color: #e4e4e4; padding: 3px; font-size: 12px;")
+        self.readout.setStyleSheet("background: #1d1d1d; color: #e4e4e4; border: 1px solid #383838; border-radius: 3px; padding: 2px 5px; font-size: 11px;")
         self.readout.move(6, 6)
         self.readout.hide()
         self.setMinimumSize(240, 155)
@@ -69,13 +69,13 @@ class CurveEditor(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#222222"))
-        painter.setPen(QPen(QColor("#444444"), 1))
+        painter.fillRect(self.rect(), QColor("#1d1d1d"))
+        painter.setPen(QPen(QColor("#2c2c2c"), 1))
         for i in range(5):
             v = i / 4
             painter.drawLine(self._screen((v, 0)), self._screen((v, 1)))
             painter.drawLine(self._screen((0, v)), self._screen((1, v)))
-        painter.setPen(QPen(QColor("#777777"), 1, Qt.PenStyle.DashLine))
+        painter.setPen(QPen(QColor("#555555"), 1, Qt.PenStyle.DashLine))
         painter.drawLine(self._screen((0, 0)), self._screen((1, 1)))
         painter.setPen(QPen(QColor("#79afff"), 2))
         painter.drawPolyline(QPolygonF([self._screen(p) for p in self.points]))

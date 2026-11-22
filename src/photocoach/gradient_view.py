@@ -30,6 +30,12 @@ class GradientInteraction(QObject):
         return QPointF(view.width()/2+(x-view.center[0])*scale,view.height()/2+(y-view.center[1])*scale)
 
     def eventFilter(self,watched,event):
+        try:
+            return self._handle_event(watched,event)
+        except RuntimeError:
+            return False
+
+    def _handle_event(self,watched,event):
         view=self.view;editor=self.controller.editor
         kind=event.type()
         if kind in (QEvent.Type.Hide,QEvent.Type.FocusOut):self.finish()

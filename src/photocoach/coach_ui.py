@@ -763,12 +763,43 @@ class SendReviewDialog(QDialog):
         self.include_before = QCheckBox("Also send the before preview")
         self.include_before.setChecked(True)
         layout.addWidget(self.include_before)
-        summary = QLabel(f"{config.model} · {urlsplit(config.endpoint).hostname}\n" +
-                        (f"Local analysis on this PC · No API charges. Local attempts: {budget.attempts}."
-                         if config.protocol == "ollama" else f"May incur charges. Session attempts: {budget.attempts}."))
-        summary.setTextFormat(Qt.TextFormat.PlainText)
-        summary.setWordWrap(True)
-        outer.addWidget(summary)
+        agent_row = QHBoxLayout()
+        self.agent_loop_enabled = QCheckBox("Multi-step agent loop")
+        self.agent_loop_enabled.setToolTip(
+            "Allow active 100% crop inspection, color/sensor diagnostics, and visual trial self-check within the selected turn budget."
+        )
+        self.agent_loop_enabled.setChecked(True)
+        agent_row.addWidget(self.agent_loop_enabled, 1)
+        agent_row.addWidget(QLabel("Max turns"))
+        self.agent_max_turns = QSpinBox()
+        self.agent_max_turns.setRange(1, 5)
+        default_turns = 1
+        for candidate_turns in (3, 2, 1):
+            if budget.can_authorize_turns(candidate_turns) is None:
+                default_turns = candidate_turns
+                break
+        self.agent_max_turns.setValue(default_turns)
+        agent_row.addWidget(self.agent_max_turns)
+        layout.addLayout(agent_row)
+        self._summary_label = QLabel()
+        self._summary_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._summary_label.setWordWrap(True)
+        outer.addWidget(self._summary_label)
+
+        def _refresh_summary():
+            turns = self.selected_max_turns()
+            self.agent_max_turns.setEnabled(self.agent_loop_enabled.isChecked())
+            turn_note = f" · Up to {turns} agent turns" if turns > 1 else " · Single-shot mode"
+            if config.protocol == "ollama":
+                cost_line = f"Local analysis on this PC · No API charges. Local attempts: {budget.attempts}{turn_note}."
+            else:
+                cost_line = f"May incur charges. Session attempts: {budget.attempts}/{budget.call_limit}{turn_note}."
+            self._summary_label.setText(f"{config.model} · {urlsplit(config.endpoint).hostname}\n{cost_line}")
+
+        self._refresh_summary = _refresh_summary
+        self.agent_loop_enabled.toggled.connect(lambda *_: _refresh_summary())
+        self.agent_max_turns.valueChanged.connect(lambda *_: _refresh_summary())
+        _refresh_summary()
         disclosure = QLabel("Sends selected small previews, editing parameters, recent edits, goal and question. No RAW, source path or EXIF/GPS.")
         disclosure.setWordWrap(True)
         layout.addWidget(disclosure)
@@ -777,6 +808,8 @@ class SendReviewDialog(QDialog):
         layout.addWidget(self.skip_session)
         self.details_button = QPushButton("Details")
         self.details_button.setCheckable(True)
+        self.details_button.setAutoDefault(False)
+        self.details_button.setDefault(False)
         layout.addWidget(self.details_button)
         self.details = QScrollArea()
         self.details.setWidgetResizable(True)
@@ -825,10 +858,19 @@ class SendReviewDialog(QDialog):
         self.details_button.toggled.connect(self.details.setVisible)
         self.details_button.toggled.connect(lambda expanded: self.details_button.setText("Hide details" if expanded else "Details"))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Send")
+        send_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        send_button.setText("Send")
+        send_button.setDefault(True)
+        send_button.setAutoDefault(True)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_button is not None:
+            cancel_button.setAutoDefault(False)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+
+    def selected_max_turns(self) -> int:
+        return int(self.agent_max_turns.value()) if self.agent_loop_enabled.isChecked() else 1
 
     def update_context(self):
         include = self.include_before.isChecked()

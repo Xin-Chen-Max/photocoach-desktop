@@ -6,6 +6,7 @@ Prices and reservations are supplied by the user; no model prices are assumed.
 """
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import threading
 from uuid import uuid4
 
 
@@ -62,6 +63,7 @@ class SessionBudget:
 
     def __init__(self, call_limit=5, budget_usd=None, reserve_usd=None,
                  input_usd_per_million=None, output_usd_per_million=None):
+        self._lock = threading.RLock()
         self._attempts: dict[str, _Attempt] = {}
         self.configure(call_limit=call_limit, budget_usd=budget_usd,
                        reserve_usd=reserve_usd,
@@ -70,79 +72,113 @@ class SessionBudget:
 
     def configure(self, **settings):
         """Change limits/prices atomically without resetting prior usage."""
-        if settings.keys() - self._FIELDS:
-            raise ValueError("Unknown budget setting")
-        values = {key: settings.get(key, getattr(self, key, None)) for key in self._FIELDS}
-        values["call_limit"] = _count(values["call_limit"], "call_limit")
-        for key in self._FIELDS - {"call_limit"}:
-            values[key] = _money(values[key], key, positive=key == "reserve_usd")
-        if values["budget_usd"] is not None and values["reserve_usd"] is None:
-            raise ValueError("A dollar cap requires a positive per-call reservation")
-        if (values["input_usd_per_million"] is None) != (values["output_usd_per_million"] is None):
-            raise ValueError("Provide both input and output prices, or leave both unknown")
-        for key, value in values.items():
-            setattr(self, key, value)
+        with self._lock:
+            if settings.keys() - self._FIELDS:
+                raise ValueError("Unknown budget setting")
+            values = {key: settings.get(key, getattr(self, key, None)) for key in self._FIELDS}
+            values["call_limit"] = _count(values["call_limit"], "call_limit")
+            for key in self._FIELDS - {"call_limit"}:
+                values[key] = _money(values[key], key, positive=key == "reserve_usd")
+            if values["budget_usd"] is not None and values["reserve_usd"] is None:
+                raise ValueError("A dollar cap requires a positive per-call reservation")
+            if (values["input_usd_per_million"] is None) != (values["output_usd_per_million"] is None):
+                raise ValueError("Provide both input and output prices, or leave both unknown")
+            for key, value in values.items():
+                setattr(self, key, value)
 
     @property
     def attempts(self):
-        return len(self._attempts)
+        with self._lock:
+            return len(self._attempts)
 
     @property
     def remaining_calls(self):
-        return max(0, self.call_limit - self.attempts)
+        with self._lock:
+            return max(0, self.call_limit - len(self._attempts))
 
     @property
     def in_flight(self):
-        return sum(not item.settled for item in self._attempts.values())
+        with self._lock:
+            return sum(not item.settled for item in self._attempts.values())
 
     @property
     def unresolved(self):
-        return sum(item.cost is None for item in self._attempts.values())
+        with self._lock:
+            return sum(item.cost is None for item in self._attempts.values())
 
     @property
     def allocated_usd(self):
-        allocations = [item.allocation for item in self._attempts.values()]
-        return None if None in allocations else sum(allocations, Decimal(0))
+        with self._lock:
+            allocations = [item.allocation for item in self._attempts.values()]
+            return None if None in allocations else sum(allocations, Decimal(0))
 
     @property
     def known_cost_usd(self):
         # Unknown usage is not displayed as $0, including before the first call.
-        if not self._attempts or self.unresolved:
-            return None
-        return sum((item.cost for item in self._attempts.values()), Decimal(0))
+        with self._lock:
+            if not self._attempts or any(item.cost is None for item in self._attempts.values()):
+                return None
+            return sum((item.cost for item in self._attempts.values()), Decimal(0))
 
     @property
     def blocked_reason(self):
-        if self.remaining_calls == 0:
-            return "Session request limit reached (failed and in-flight calls count)."
-        if self.budget_usd is not None:
-            allocation = self.allocated_usd
-            if allocation is None:
-                return "Earlier session costs are unknown; a dollar cap cannot authorize another request."
-            if allocation + self.reserve_usd > self.budget_usd:
-                return "Session dollar allocation limit reached. Actual provider charges may differ."
-        return None
+        with self._lock:
+            if self.remaining_calls == 0:
+                return "Session request limit reached (failed and in-flight calls count)."
+            if self.budget_usd is not None:
+                allocation = self.allocated_usd
+                if allocation is None:
+                    return "Earlier session costs are unknown; a dollar cap cannot authorize another request."
+                if allocation + self.reserve_usd > self.budget_usd:
+                    return "Session dollar allocation limit reached. Actual provider charges may differ."
+            return None
+
+    def can_authorize_turns(self, max_turns: int) -> str | None:
+        """Check whether up to max_turns calls fit inside remaining session capacity."""
+        if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1:
+            raise ValueError("max_turns must be a positive integer")
+        with self._lock:
+            reason = self.blocked_reason
+            if reason is not None:
+                return reason
+            if self.remaining_calls < max_turns:
+                return (f"Session request limit allows {self.remaining_calls} more calls, "
+                        f"fewer than the selected {max_turns} agent turns.")
+            if self.budget_usd is not None:
+                allocation = self.allocated_usd
+                if allocation is None:
+                    return "Earlier session costs are unknown; a dollar cap cannot authorize another request."
+                if allocation + self.reserve_usd * max_turns > self.budget_usd:
+                    return (f"Session dollar allocation limit cannot cover up to {max_turns} agent turns. "
+                            "Reduce max turns or raise the budget.")
+            return None
 
     def reserve(self):
         """Count a single attempt before network dispatch; never retry implicitly."""
-        if self.blocked_reason:
-            raise BudgetExceeded(self.blocked_reason)
-        ticket = uuid4().hex
-        self._attempts[ticket] = _Attempt(self.reserve_usd, self.input_usd_per_million,
-                                         self.output_usd_per_million)
-        return ticket
+        with self._lock:
+            if self.blocked_reason:
+                raise BudgetExceeded(self.blocked_reason)
+            ticket = uuid4().hex
+            self._attempts[ticket] = _Attempt(self.reserve_usd, self.input_usd_per_million,
+                                             self.output_usd_per_million)
+            return ticket
 
     def settle(self, ticket, input_tokens=None, output_tokens=None, success=False):
         """Finish a ticket once; an error or incomplete usage keeps its estimate."""
-        if ticket not in self._attempts or self._attempts[ticket].settled:
-            raise ValueError("Unknown or already settled budget ticket")
-        if not isinstance(success, bool):
-            raise ValueError("success must be a boolean")
-        for name, value in (("input_tokens", input_tokens), ("output_tokens", output_tokens)):
-            if value is not None:
-                _count(value, name)
-        item = self._attempts[ticket]
-        if success and input_tokens is not None and output_tokens is not None and item.input_rate is not None:
-            item.cost = (input_tokens * item.input_rate + output_tokens * item.output_rate) / Decimal(1_000_000)
-        item.settled = True
-        item.success = success
+        with self._lock:
+            if ticket not in self._attempts or self._attempts[ticket].settled:
+                raise ValueError("Unknown or already settled budget ticket")
+            if not isinstance(success, bool):
+                raise ValueError("success must be a boolean")
+            for name, value in (("input_tokens", input_tokens), ("output_tokens", output_tokens)):
+                if value is not None:
+                    _count(value, name)
+            item = self._attempts[ticket]
+            if success and input_tokens is not None and output_tokens is not None and item.input_rate is not None:
+                item.cost = (input_tokens * item.input_rate + output_tokens * item.output_rate) / Decimal(1_000_000)
+            item.settled = True
+            item.success = success
+
+    def is_settled(self, ticket: str) -> bool:
+        with self._lock:
+            return ticket in self._attempts and self._attempts[ticket].settled

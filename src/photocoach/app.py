@@ -24,25 +24,32 @@ from .imaging import DecodedCache, RawOptions, decode_raw, export_image, quantiz
 from .models import ProbeState, ProbeStore
 from .state import EditValues
 from .lens import LensCorrections
+from .detail import DetailControls
 from .adjustments import render_edit, render_photo
-from .composition import Composition, sample_composition
+from .composition import Composition, output_size, sample_composition
 from .composition_ui import CompositionDialog
 from .histogram import sampled_histogram
 from .project import snapshot_project, write_project, read_project, SourceMissing
 from .coach import MockCoach, CoachFeedback, build_request
+from .coach_agent import check_trial
+from .agent_memory import (PlaybookRAG, SessionWorkingMemory, StyleMemoryStore,
+                           TurnSummary, compact_conversation)
+from .agent_runtime import AgentProgress, AgentRunResult, AgentRuntime, RunBudget
+from .agent_tools import build_default_tool_registry
+from .telemetry import TraceStore, export_otel_spans
 from .devmode import dev_mode_enabled
 from .auto_coach import AutoCoachSchedule
 from .api_coach import ApiCoach, ApiError, ApiResult, TransportProgress, TRANSPORT_STAGES
 from .budget import SessionBudget
 from .coach_ui import ApiSettingsDialog, SendReviewDialog, TextProbeReviewDialog, budget_text
-from .coach_view import usage_summary
+from .coach_view import format_live_agent_step, usage_summary
 from .settings import SettingsStore, SettingsError, resolve_api_key, credential_target
 from .connections import ConnectionStore, settings_for, ConnectionBook, infer_provider, connection_from_settings
 from .model_catalog import (ModelCatalogStore, classify_model, capability_evidence, CatalogError,
                             DEFAULT_CURATED, KNOWN_VISION_MODELS, is_ui_selectable_model)
 from .credentials import WindowsCredentialStore
 from .text_probe import run_text_probe, TextProbeResult
-from .white_balance import balance_coordinates, balance_gains, sample_white_balance
+from .white_balance import balance_coordinates, balance_gains, sample_white_balance, inspect_sensor_headroom
 from .preview import (reduce_linear, oriented_size, DetailRequest, render_region,
                       LINEAR_CACHE_BYTES, SMALL_RESERVE_BYTES)
 from .detail_cache import DetailGeometryCache
@@ -86,6 +93,7 @@ class Job:
     timing: dict | None = None
     overlay: OverlaySpec | None = None
     overlay_generation: int = 0
+    coach_request: object | None = None
 
 
 TIMED_JOB_KINDS = ("preview", "detail", "adjusting")
@@ -184,6 +192,31 @@ class PreviewEngine:
         if self.overlay_spec is not None:
             self._overlay(metadata,pixels,RenderGeometry.full(oriented_size(photo.metadata),values.composition,(pixels.shape[1],pixels.shape[0]),values.lens_corrections.distortion))
         return pixels, time.perf_counter() - started, metadata
+
+    def backdrop(self, state: ProbeState):
+        """Render a viewport-independent full-frame backdrop strictly from already-decoded RAM cache."""
+        options = RawOptions() if state.compare_baseline else state.raw_options
+        photo = self.cache.peek_loaded(state.photo_id, options)
+        if photo is None:
+            return None
+        small = (
+            self._small
+            if self._small is not None and self._small_key == (state.photo_id, options)
+            else reduce_linear(photo.linear_rgb)
+        )
+        values = (
+            EditValues(
+                base_rendering=state.base_rendering,
+                composition=state.composition,
+                lens_corrections=LensCorrections(state.lens_corrections.distortion),
+            )
+            if state.compare_baseline
+            else state.values
+        )
+        if values.detail.active:
+            values = replace(values, detail=DetailControls())
+        pixels = self._render_small(photo, small, values, cancel=self.cancel, timer=None)
+        return pixels, output_size(oriented_size(photo.metadata), values.composition)
 
     def _source_size(self, state):
         options = RawOptions() if state.compare_baseline else state.raw_options
@@ -299,6 +332,87 @@ class PreviewEngine:
             images.append(self._render_small(photo, small, snapshot.values, 768))
         return build_request(state, before, events, *images, question, source_size=oriented_size(photo.metadata))
 
+    def render_trial_values(self, state, values: EditValues, *, source_size=None, cancel=None) -> np.ndarray:
+        """Render one immutable EditValues candidate at <=768px using the formal Detail path."""
+        if cancel is not None and cancel.is_set():
+            raise CancelledError()
+        from .composition import output_size
+        snapshot = replace(state.with_values(values), compare_baseline=False)
+        size = source_size or self._source_size(snapshot)
+        full = output_size(size, values.composition)
+        detail = DetailRequest(0, full, (0, 0, *full), max(1, int(np.ceil(max(full) / 768))), size)
+        pixels = self.detail(snapshot, detail, include_metadata=False)[0]
+        if cancel is not None and cancel.is_set():
+            raise CancelledError()
+        return pixels
+
+    def check_coach_trial(self, state, request, feedback, *, cancel=None):
+        """Dry-run one proposal on the serial image worker; never mutate StateStore."""
+        if not isinstance(feedback, CoachFeedback):
+            raise ValueError("The coach returned invalid feedback.")
+        if (state.photo_id, state.session_id, state.revision) != (
+                request.photo_id, request.session_id, request.state_version):
+            raise ValueError("Trial snapshot no longer matches its request.")
+        return check_trial(
+            request, feedback,
+            lambda values: self.render_trial_values(state, values, source_size=request.source_size, cancel=cancel),
+            cancel=cancel,
+        )
+
+    def inspect_region_100pct(self, state, x_norm: float, y_norm: float, size_px: int = 512,
+                              *, apply_current_edits: bool = True, cancel=None) -> tuple[np.ndarray, dict]:
+        """Render a bounded 1:1 native-resolution crop and compute objective sharpness/noise metrics."""
+        if cancel is not None and cancel.is_set():
+            raise CancelledError()
+        if not (0.0 <= float(x_norm) <= 1.0 and 0.0 <= float(y_norm) <= 1.0):
+            raise ValueError("Crop coordinates must lie within [0, 1].")
+        from .composition import output_size
+        from .coach_agent import measure_preview
+        snapshot = replace(state, compare_baseline=not apply_current_edits)
+        size = self._source_size(snapshot)
+        full = output_size(size, snapshot.composition)
+        edge = max(128, min(512, int(size_px)))
+        cw, ch = min(full[0], edge), min(full[1], edge)
+        cx, cy = round(float(x_norm) * full[0]), round(float(y_norm) * full[1])
+        left = max(0, min(full[0] - cw, cx - cw // 2))
+        top = max(0, min(full[1] - ch, cy - ch // 2))
+        rect = (left, top, left + cw, top + ch)
+        detail = DetailRequest(0, full, rect, 1, size, native_detail=True)
+        patch = np.array(self.detail(snapshot, detail, include_metadata=False)[0], copy=True)
+        if cancel is not None and cancel.is_set():
+            raise CancelledError()
+        patch.setflags(write=False)
+        rgb = patch.astype(np.float32) / 255.0
+        luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+        gx = np.abs(np.diff(luma, axis=1, prepend=luma[:, :1]))
+        gy = np.abs(np.diff(luma, axis=0, prepend=luma[:1, :]))
+        edge_mag = gx + gy
+        if luma.shape[0] >= 3 and luma.shape[1] >= 3:
+            lap = (4.0 * luma[1:-1, 1:-1] - luma[:-2, 1:-1] - luma[2:, 1:-1]
+                   - luma[1:-1, :-2] - luma[1:-1, 2:])
+            lap_energy = float(np.mean(np.abs(lap)))
+        else:
+            lap_energy = 0.0
+        flat_mask = edge_mag <= np.percentile(edge_mag, 25)
+        flat_noise = float(luma[flat_mask].std()) if np.any(flat_mask) else float(luma.std())
+        whole_stats = measure_preview(patch)["whole"]
+        metrics = {
+            "rect_px": list(rect),
+            "full_size": list(full),
+            "patch_shape": [int(patch.shape[1]), int(patch.shape[0])],
+            "edge_energy_mean": round(float(edge_mag.mean()), 5),
+            "laplacian_sharpness": round(lap_energy, 5),
+            "flat_patch_noise_std": round(flat_noise, 5),
+            "mean_luminance": round(whole_stats["mean_luminance"], 5),
+            "display_ceiling_fraction": round(whole_stats["display_ceiling_fraction"], 5),
+            "display_floor_fraction": round(whole_stats["display_floor_fraction"], 5),
+        }
+        return patch, metrics
+
+    def inspect_raw_headroom(self, state, x_norm: float = 0.5, y_norm: float = 0.5, patch_px: int = 64) -> dict:
+        """Read-only Bayer CFA headroom inspection through white_balance.inspect_sensor_headroom."""
+        return inspect_sensor_headroom(state, x_norm=x_norm, y_norm=y_norm, patch_px=patch_px)
+
     @staticmethod
     def _render_small(photo, small, values, max_edge=1600, *, cancel=None, timer=None):
         if values.composition == Composition() and not values.lens_corrections.distortion:
@@ -320,8 +434,12 @@ class PreviewEngine:
 
 
 class MainWindow(QMainWindow):
+    _agentToolRequested = Signal(object)
+
     def __init__(self, *, settings_store=None, credentials=None, dev_mode: bool | None = None) -> None:
         super().__init__()
+        self._gui_thread_id = threading.get_ident()
+        self._agentToolRequested.connect(self._enqueue_agent_tool)
         # The local mock coach is a development/testing tool, never a normal-user mode.
         self.dev_mode = dev_mode_enabled(dev_mode)
         self.setWindowTitle(f"PhotoCoach {__version__} · Single-photo editor")
@@ -333,6 +451,7 @@ class MainWindow(QMainWindow):
         self._active: tuple[Worker, Job] | None = None
         self._pending: Job | None = None
         self._pending_detail: Job | None = None
+        self._pending_backdrop: Job | None = None
         self._protected_jobs: list[Job] = []
         self._generation = 0
         self._exporting = False
@@ -351,6 +470,7 @@ class MainWindow(QMainWindow):
         self._coach_unread = False
         self._review_settings = None
         self._review_include_before = True
+        self._review_max_turns = 1
         self._project_path: Path | None = None
         self._opening_project: Path | None = None
         self._close_approved = False
@@ -391,6 +511,11 @@ class MainWindow(QMainWindow):
         from .local_runtime import LocalRuntime, LocalSettingsStore, LocalConfig, default_models_dir
         local_path = (self.connection_store.path.with_name("local_ai.json") if self.connection_store else
                       default_models_dir().parent / "local_ai.json")
+        agent_base_dir = local_path.parent
+        self.agent_memory = SessionWorkingMemory()
+        self.style_memory = StyleMemoryStore(agent_base_dir / "agent_style_memory.json")
+        self.playbook = PlaybookRAG()
+        self.trace_store = TraceStore(agent_base_dir / "traces")
         self.local_runtime = LocalRuntime(LocalSettingsStore(local_path))
         try:
             self.local_config = self.local_runtime.store.load()
@@ -432,6 +557,11 @@ class MainWindow(QMainWindow):
         from .i18n import set_global_language
         set_global_language('en')
         self._build_ui()
+        self.style_memory_enabled.blockSignals(True)
+        self.style_memory_enabled.setChecked(self.style_memory.enabled)
+        self.style_memory_enabled.blockSignals(False)
+        self.style_memory_enabled.toggled.connect(self.style_memory.set_enabled)
+        self.clear_style_memory_button.clicked.connect(self.style_memory.clear)
         self._notice_timer.timeout.connect(self.local_controller.show_notice)
         self.coach_collapse.setChecked(True)
         self.coach_text.set_question_draft(self.question.text())
@@ -580,6 +710,7 @@ class MainWindow(QMainWindow):
         self._render_timer.stop()
         self._stop_detail()
         self._pending = None
+        self._pending_backdrop = None
         self._notice_timer.stop()
         self.view_notice.clear()
         self._render_diagnostics = {}
@@ -600,7 +731,12 @@ class MainWindow(QMainWindow):
             job.overlay=self.local_controller.overlay_spec()
             job.overlay_generation=self.preview.overlay_generation
             job.cancel = threading.Event()
+            if job.kind in ("preview", "adjusting"):
+                self._pending_backdrop = None
             self._cancel_obsolete_render()
+        elif job.kind == "backdrop":
+            if job.cancel is None:
+                job.cancel = threading.Event()
         if self._active is not None:
             if job.kind in ("detail", "preview", "adjusting"):
                 # All render intents share one latest slot, not a per-quality backlog.
@@ -610,6 +746,8 @@ class MainWindow(QMainWindow):
                 self._pending_detail = job
             elif job.kind in ("preview", "adjusting"):
                 self._pending = job
+            elif job.kind == "backdrop":
+                self._pending_backdrop = job
             else:
                 self._protected_jobs.append(job)
             self._update_coach_status()
@@ -649,7 +787,7 @@ class MainWindow(QMainWindow):
             # A save/export/crop preparation freezes a captured state. A pick
             # finishing meanwhile must not edit behind those disabled controls.
             valid = valid and not self._exporting
-        if job.kind in ("preview", "detail", "adjusting", "coach", "api_prepare", "composition_prepare", "wb_pick"):
+        if job.kind in ("preview", "detail", "adjusting", "backdrop", "coach", "coach_check", "api_prepare", "composition_prepare", "wb_pick"):
             valid = valid and self.store.accepts(job.snapshot)
         if job.kind in ("detail", "adjusting"):
             valid = valid and job.view_request.generation == self.preview.view_generation
@@ -660,7 +798,7 @@ class MainWindow(QMainWindow):
             valid = valid and not self._refining_preview
         if job.kind == "api_prepare":
             valid = valid and job.coach_token == self._coach_generation and not self.coach.paused
-        if job.kind == "coach":
+        if job.kind in ("coach", "coach_check"):
             valid = valid and job.coach_token == self._coach_generation and not self.coach.paused
             if job.automatic:
                 valid = valid and self.auto_mock.isChecked() and self.coach_mode.currentIndex() == 0
@@ -670,7 +808,9 @@ class MainWindow(QMainWindow):
                 valid = valid and (result.photo_id, result.session_id, result.state_version) == (
                     job.snapshot.photo_id, job.snapshot.session_id, job.snapshot.revision)
         if valid and not self._closing:
-            if error is not None:
+            if job.kind == "agent_tool":
+                pass
+            elif error is not None:
                 self.status.setText(f"Operation failed: {error}")
                 if job.kind in ("load", "project_load", "preview"):
                     self.histogram.clear("Unavailable")
@@ -700,15 +840,18 @@ class MainWindow(QMainWindow):
                     self.output_status.show()
                     if isinstance(error, SourceMissing):
                         QTimer.singleShot(0, self.locate_project_source)
-                elif job.kind == "coach":
+                elif job.kind in ("coach", "coach_check"):
                     if job.automatic:
                         self.auto_mock.setChecked(False)
-                    self.coach_text.setPlainText(f"Mock analysis failed: {error}\nEditing remains available.", kind="error")
+                    message = (f"Mock analysis failed: {error}" if job.kind == "coach" else
+                               "Coach workflow failed. No edit was applied; analyze again.")
+                    self.coach_text.setPlainText(message + "\nEditing remains available.", kind="error")
                 elif job.kind == "api_prepare":
                     self.coach_text.setPlainText("Unable to prepare matching previews. Render the current edit and try again.", kind="error")
             elif job.kind == "load":
                 photo, pixels = result
                 state = self.store.activate(photo.source_path, photo.metadata["photo_id"], base_rendering="natural_v1")
+                self.agent_memory.clear()
                 self._project_path = None
                 for widget in (self.exposure_slider, self.compare, self.wb_mode):
                     widget.blockSignals(True)
@@ -760,6 +903,25 @@ class MainWindow(QMainWindow):
                 self._show_metadata(metadata)
                 self._record_render_details(job, elapsed, presentation=time.perf_counter() - presented)
                 self.status.clear()
+                options = RawOptions() if job.snapshot.compare_baseline else job.snapshot.raw_options
+                if (
+                    not self.preview.has_current_full_frame()
+                    and not self._interactive_preview
+                    and not self._closing
+                    and not self._exporting
+                    and self.engine.cache.peek_loaded(job.snapshot.photo_id, options) is not None
+                ):
+                    snap = job.snapshot
+                    self._pending_backdrop = Job(
+                        "backdrop",
+                        self._generation,
+                        lambda s=snap: self.engine.backdrop(s),
+                        snap,
+                    )
+            elif job.kind == "backdrop":
+                if result is not None:
+                    pixels, full_size = result
+                    self.preview.display_backdrop(pixels, full_size)
             elif job.kind == "adjusting":
                 pixels, elapsed, metadata = result
                 presented = time.perf_counter()
@@ -768,6 +930,7 @@ class MainWindow(QMainWindow):
                 self._record_render_details(job, elapsed, presentation=time.perf_counter() - presented)
             elif job.kind == "project_load":
                 self.store, pixels, metadata = result
+                self.agent_memory.clear()
                 self._project_path = self._opening_project
                 self.store.mark_preview(self.store.current)
                 self.filename.setText(self.store.current.source_path.name)
@@ -801,7 +964,7 @@ class MainWindow(QMainWindow):
                 self.output_status.setText(f"Project saved: {result}")
                 self.output_status.show()
                 self.status.clear()
-            elif job.kind == "coach":
+            elif job.kind in ("coach", "coach_check"):
                 self.coach_text.show_feedback(result)
             elif job.kind == "api_prepare":
                 # Finish the serial render queue before entering a modal review.
@@ -829,7 +992,7 @@ class MainWindow(QMainWindow):
                 self.view_notice.setText(metadata['overlay_error'])
             elif job.kind in TIMED_JOB_KINDS and error is None and not self._notice_timer.isActive():
                 self.local_controller.show_notice()
-        if job.kind in ("coach", "api_prepare"):
+        if job.kind in ("coach", "coach_check", "api_prepare"):
             if not valid:
                 self.coach.last_request = None
             self._update_coach_status()
@@ -841,15 +1004,21 @@ class MainWindow(QMainWindow):
                 pending = self._protected_jobs.pop(0)
             elif self._pending:
                 pending, self._pending = self._pending, None
-            else:
+            elif self._pending_detail:
                 pending, self._pending_detail = self._pending_detail, None
+            else:
+                pending, self._pending_backdrop = self._pending_backdrop, None
             if pending is None:
                 break
             if pending.generation != self._generation:
                 continue
-            if pending.kind in ("preview", "detail", "adjusting", "coach", "api_prepare", "composition_prepare") and not self.store.accepts(pending.snapshot):
+            if pending.kind in ("preview", "detail", "adjusting", "backdrop", "coach", "coach_check", "api_prepare", "composition_prepare") and not self.store.accepts(pending.snapshot):
+                continue
+            if pending.kind in ("coach", "coach_check", "api_prepare") and pending.coach_token != self._coach_generation:
                 continue
             if pending.kind in ("detail", "adjusting") and pending.view_request.generation != self.preview.view_generation:
+                continue
+            if pending.kind == "backdrop" and self.preview.has_current_full_frame():
                 continue
             self._queue(pending)
             break
@@ -959,6 +1128,7 @@ class MainWindow(QMainWindow):
             self._gesture_preview_edge = None
             self._native_detail_preview = False
             self._settle_timer.stop()
+            self._pending_backdrop = None
             self.store.set_compare(checked)
             self._sync_comparison_buttons()
             self._invalidate_coach(keep_reference=True)
@@ -1026,7 +1196,7 @@ class MainWindow(QMainWindow):
         self._pending_detail = None
 
     def _view_changed(self) -> None:
-        self._cancel_obsolete_render()
+        self._cancel_obsolete_render(view_only=True)
         self._stop_detail()
         if self._interactive_preview:
             self.preview.set_quality("Adjusting")
@@ -1165,6 +1335,8 @@ class MainWindow(QMainWindow):
         self._coach_generation += 1
         if self._network_active is not None:
             self._network_active[2].set()
+        if self._active and self._active[1].kind in ("coach_check", "agent_tool") and self._active[1].cancel is not None:
+            self._active[1].cancel.set()
         state = self.store.current
         retained = (keep_reference and state is not None and
                     self.coach_text.keep_as_reference(state.photo_id, state.session_id, state.revision, coach_changed=coach_changed))
@@ -1200,10 +1372,14 @@ class MainWindow(QMainWindow):
         if not self._render_timer.isActive():
             self._render_timer.start()
 
-    def _cancel_obsolete_render(self):
+    def _cancel_obsolete_render(self, *, view_only: bool = False):
+        if not view_only:
+            self._pending_backdrop = None
         if self._active is not None:
             _, active = self._active
-            if active.cancel is not None:
+            if active.kind == "backdrop" and view_only:
+                return
+            if active.cancel is not None and active.kind not in ("coach_check", "agent_tool"):
                 active.cancel.set()
 
     def open_composition(self):
@@ -1405,6 +1581,7 @@ class MainWindow(QMainWindow):
         self._render_timer.stop()
         self._stop_detail()
         self._pending = None
+        self._pending_backdrop = None
         self._notice_timer.stop()
         self.view_notice.clear()
         self._invalidate_coach("Opening project. Previous feedback has been cleared.")
@@ -1797,8 +1974,8 @@ class MainWindow(QMainWindow):
 
     def _coach_busy(self):
         return (self._network_active is not None or
-                bool(self._active and self._active[1].kind in ("coach", "api_prepare")) or
-                any(job.kind in ("coach", "api_prepare") for job in self._protected_jobs))
+                bool(self._active and self._active[1].kind in ("coach", "coach_check", "api_prepare", "agent_tool")) or
+                any(job.kind in ("coach", "coach_check", "api_prepare", "agent_tool") for job in self._protected_jobs))
 
     def _sync_coach_presentation(self):
         if self._closing:
@@ -1832,6 +2009,12 @@ class MainWindow(QMainWindow):
                 action = text("Cancelling…", "正在取消…")
             else:
                 status, action, enabled = text("Analyzing…", "正在分析…"), text("Cancel analysis", "取消分析"), True
+                if local and self._network_progress is not None:
+                    stage, _ = self._network_progress[0].snapshot()
+                    status = (text("Preparing local model…", "正在准备本地模型…") if stage == "local_preparing" else
+                              text("Loading model / analyzing…", "正在加载模型或分析照片…"))
+                if self._active and self._active[1].kind == "coach_check":
+                    status = text("Checking proposed edit…", "正在检查试调…")
         elif not demo and config is None:
             status, action = text("Choose a local or cloud coach", "选择本地或云端教练"), text("Set up coach", "设置教练")
             enabled = not self._closing and not self._exporting
@@ -1860,6 +2043,11 @@ class MainWindow(QMainWindow):
                 status = text("Applied · Undo to compare", "已应用，可撤销比较")
             elif output.reference_revision is not None:
                 status = text("Edit or question changed · analyze again", "编辑或提问已变化，请重新分析")
+            elif output._feedback.agent_report is not None:
+                report = output._feedback.agent_report
+                status = text(*{"review": ("Trial checked · Preview before applying", "试调已检查，请先预览比较"),
+                                "blocked": ("Suggestion held · Review trial checks", "建议暂不应用，请查看试调检查"),
+                                "no_edit": ("Review complete · No edit proposed", "分析完成，本轮不修改照片")}[report.status])
             else:
                 status = text("Reply ready", "建议已就绪")
         self.coach_summary.setText(status)
@@ -1874,7 +2062,8 @@ class MainWindow(QMainWindow):
             return
         if self._coach_busy():
             self._coach_cancel_requested = True
-            self._protected_jobs = [job for job in self._protected_jobs if job.kind not in ("coach", "api_prepare")]
+            self._protected_jobs = [job for job in self._protected_jobs
+                                    if job.kind not in ("coach", "coach_check", "api_prepare", "agent_tool")]
             from .i18n import tr
             self._invalidate_coach(tr("Analysis cancelled.", "分析已取消。"))
             self._sync_coach_presentation()
@@ -1948,6 +2137,8 @@ class MainWindow(QMainWindow):
     def _coach_feedback_changed(self, available):
         self._coach_unread = bool(available and self.coach_collapse.isChecked())
         self._coach_toggle_text()
+        if available:
+            self._sync_coach_presentation()
 
     def _coach_toggle_text(self):
         from .i18n import get_language
@@ -2026,6 +2217,7 @@ class MainWindow(QMainWindow):
         if not self.store.current or self._exporting or not self.exposure_slider.isEnabled():
             return False
         self._finish_gesture()
+        before_values = self.store.current.values
         changes = getattr(action, "changes", ())
         if len(changes) > 1:
             self._ensure_edited_view()
@@ -2039,6 +2231,11 @@ class MainWindow(QMainWindow):
         if not action.is_applied(self.store.current.values):
             self.status.setText("The edit does not match all suggested targets.")
             return False
+        self.agent_memory.mark_last_applied(action.label)
+        try:
+            self.style_memory.record_applied_edit(before_values, self.store.current.values, self.store.current.goal)
+        except Exception:
+            pass
         has_local = action.parameter == "local_gradients" or any(p == "local_gradients" for p, _ in changes)
         if has_local:
             lg_val = self.store.current.local_gradients
@@ -2061,6 +2258,8 @@ class MainWindow(QMainWindow):
                 or self.coach_text._superseded_question or self.coach_text._superseded_coach or self.store.gesture_active or self.coach_text.reference_revision is not None):
             return False
         actions = feedback.actions
+        if feedback.agent_plan and (not feedback.agent_report or not feedback.agent_report.can_apply):
+            return False
         if not (0 <= index < len(actions)):
             return False
         return not actions[index].is_applied(state.values) and self.apply_coach_action(actions[index])
@@ -2138,6 +2337,50 @@ class MainWindow(QMainWindow):
         self._update_coach_status()
         self.network_pool.start(worker)
 
+    def _enqueue_agent_tool(self, payload) -> None:
+        snapshot, coach_token, fn, box, done_event, cancel_event = payload
+        if (self._closing or cancel_event.is_set() or self.coach.paused or
+                coach_token != self._coach_generation or not self.store.accepts(snapshot)):
+            box.append((None, CancelledError()))
+            done_event.set()
+            return
+
+        def wrapped():
+            try:
+                box.append((fn(), None))
+            except Exception as exc:
+                box.append((None, exc))
+            finally:
+                done_event.set()
+
+        self._queue(Job("agent_tool", self._generation, wrapped, snapshot, coach_token, cancel=cancel_event))
+
+    def _run_serial_agent_tool(self, snapshot, coach_token: int, cancel_event: threading.Event, fn):
+        if cancel_event.is_set() or self._closing or coach_token != self._coach_generation:
+            raise CancelledError()
+        box: list = []
+        done_event = threading.Event()
+        payload = (snapshot, coach_token, fn, box, done_event, cancel_event)
+        if threading.get_ident() == self._gui_thread_id:
+            self._enqueue_agent_tool(payload)
+            app = QApplication.instance()
+            while not done_event.wait(0.01):
+                if app is not None:
+                    app.processEvents()
+                if cancel_event.is_set() or self._closing or coach_token != self._coach_generation:
+                    raise CancelledError()
+        else:
+            self._agentToolRequested.emit(payload)
+            while not done_event.wait(0.025):
+                if cancel_event.is_set() or self._closing or coach_token != self._coach_generation:
+                    raise CancelledError()
+        if not box:
+            raise CancelledError()
+        res, err = box[0]
+        if err is not None:
+            raise err
+        return res
+
     def review_api_request(self, request, job) -> None:
         if (self._closing or self._network_active or self._reviewing or not self.api_settings or
                 self.coach_mode.currentIndex() != 1 or self.coach.paused or self._exporting or
@@ -2156,17 +2399,20 @@ class MainWindow(QMainWindow):
                          )
                          else settings.config)
         skip_session = False
+        max_turns = 1
         self._reviewing = True
         self._update_coach_status()
         try:
             if self._review_settings is settings:
                 accepted = True
                 include_before = self._review_include_before
+                max_turns = getattr(self, "_review_max_turns", 1)
             else:
                 dialog = SendReviewDialog(self, request, effective_cfg, budget)
                 accepted = dialog.exec() == QDialog.DialogCode.Accepted
                 include_before = dialog.include_before.isChecked()
                 skip_session = dialog.skip_session.isChecked()
+                max_turns = getattr(dialog, "selected_max_turns", lambda: 1)()
                 dialog.deleteLater()
         finally:
             self._reviewing = False
@@ -2182,6 +2428,9 @@ class MainWindow(QMainWindow):
         if skip_session:
             self._review_settings = settings
             self._review_include_before = include_before
+            self._review_max_turns = max_turns
+        while max_turns > 1 and budget.can_authorize_turns(max_turns) is not None:
+            max_turns -= 1
         try:
             # Credentials are read only for a user-confirmed request, never logged or serialized.
             key = resolve_api_key(settings, self.credentials)
@@ -2193,8 +2442,58 @@ class MainWindow(QMainWindow):
             self.coach_text.setPlainText(str(error), kind="error")
             return
         cancel = threading.Event()
-        progress = TransportProgress()
+        use_agent_loop = (max_turns > 1 and getattr(adapter, "supports_tools", False) and hasattr(adapter, "step"))
+        progress = AgentProgress(max_turns) if use_agent_loop else TransportProgress()
+        if effective_cfg.protocol == "ollama":
+            progress.advance("local_preparing")
+        job.coach_request = request
         local_config = self.local_config
+        style_snippet = self.style_memory.prompt_snippet()
+        working_snippet = self.agent_memory.prompt_snippet()
+
+        def run_coach_call():
+            if not use_agent_loop:
+                return adapter.analyze(request, cancel_event=cancel, include_before=include_before, progress=progress)
+            runtime = AgentRuntime(
+                adapter,
+                build_default_tool_registry(),
+                run_budget=RunBudget(
+                    max_llm_turns=max_turns,
+                    max_wall_seconds=max(60.0, float(effective_cfg.timeout_seconds) * max_turns),
+                ),
+                session_budget=budget,
+                playbook=self.playbook,
+                style_memory_snippet=style_snippet,
+                working_memory_snippet=working_snippet,
+                compactor=compact_conversation,
+            )
+            return runtime.run(
+                request,
+                state=job.snapshot,
+                include_before=include_before,
+                initial_ticket=ticket,
+                render_trial=lambda values: self._run_serial_agent_tool(
+                    job.snapshot, job.coach_token, cancel,
+                    lambda: self.engine.render_trial_values(
+                        job.snapshot, values, source_size=request.source_size, cancel=cancel),
+                ),
+                render_crop_100pct=lambda x, y, s, apply_current_edits=True: self._run_serial_agent_tool(
+                    job.snapshot, job.coach_token, cancel,
+                    lambda: self.engine.inspect_region_100pct(
+                        job.snapshot, x, y, s, apply_current_edits=apply_current_edits, cancel=cancel),
+                ),
+                inspect_cfa=lambda x, y, p: self._run_serial_agent_tool(
+                    job.snapshot, job.coach_token, cancel,
+                    lambda: self.engine.inspect_raw_headroom(job.snapshot, x, y, p),
+                ),
+                cancel=cancel,
+                progress=progress,
+                stale_check=lambda: (
+                    self._closing or cancel.is_set() or self.coach.paused
+                    or job.generation != self._generation or job.coach_token != self._coach_generation
+                ),
+            )
+
         def analyze():
             if effective_cfg.protocol == "ollama":
                 try:
@@ -2204,10 +2503,11 @@ class MainWindow(QMainWindow):
                 if not self.local_runtime.inference_lock.acquire(blocking=False):
                     raise ApiError("busy")
                 try:
-                    return adapter.analyze(request, cancel_event=cancel, include_before=include_before, progress=progress)
+                    return run_coach_call()
                 finally:
                     self.local_runtime.inference_lock.release()
-            return adapter.analyze(request, cancel_event=cancel, include_before=include_before, progress=progress)
+            return run_coach_call()
+
         worker = Worker(analyze)
         worker.signals.done.connect(self._network_done)
         self._network_active = (worker, job, cancel, ticket)
@@ -2230,9 +2530,42 @@ class MainWindow(QMainWindow):
         stage, elapsed = progress.snapshot()
         context = "Text-only test · No photo or edit data" if job.kind == "text_probe" else f"State v{job.snapshot.revision}"
         from .i18n import tr
+        zh = tr("en", "zh") == "zh"
         caption = tr("Text-only test", "纯文本测试") if job.kind == "text_probe" else tr("Analyzing selected previews", "正在分析所选预览")
-        self.coach_text.setPlainText(caption + f" · {elapsed:.1f} / {limit:g}s")
-        self.coach_hint.setText(f"{TRANSPORT_STAGES[stage].capitalize()} · {limit:g}s total connection limit · {context}")
+        local = bool(self.api_settings and self.api_settings.config.protocol == "ollama" and job.kind != "text_probe")
+        if local:
+            caption = (tr("Preparing local model…", "正在准备本地模型…") if stage == "local_preparing" else
+                       tr("Loading local model / analyzing photo…", "正在加载本地模型或分析照片…"))
+        loading_notice = tr("First use may take longer while the model loads into memory. You can cancel.",
+                            "首次使用可能需要较长时间将模型加载到内存或显存，请稍候；也可取消。")
+        if job.kind == "text_probe":
+            self.coach_text.setPlainText(caption + f" · {elapsed:.1f} / {limit:g}s")
+        elif isinstance(progress, AgentProgress):
+            turn, max_turns, step_label, active_detail, spans = progress.live_trace_snapshot()
+            if max_turns > 1 and turn > 0:
+                caption += (f" · 第 {turn}/{max_turns} 轮" if zh else f" · Turn {turn}/{max_turns}")
+            active_step, stage_hint = format_live_agent_step(
+                turn, max_turns, step_label, active_detail, stage, zh=zh,
+            )
+            self.coach_text.show_live_progress(
+                caption + f" · {elapsed:.1f} / {limit:g}s",
+                spans=spans,
+                active_step=active_step,
+                stage_hint=stage_hint,
+                notice=loading_notice if local else "",
+                zh=zh,
+            )
+        else:
+            _, stage_hint = format_live_agent_step(0, 1, "", "", stage, zh=zh)
+            self.coach_text.show_live_progress(
+                caption + f" · {elapsed:.1f} / {limit:g}s",
+                active_step=stage_hint + ("…" if stage_hint and not stage_hint.endswith("…") else ""),
+                notice=loading_notice if local else "",
+                zh=zh,
+            )
+        self.coach_hint.setText(loading_notice if local else
+                                f"{TRANSPORT_STAGES[stage].capitalize()} · {limit:g}s total connection limit · {context}")
+        self._sync_coach_presentation()
 
     def _network_done(self, result, error) -> None:
         if self._network_active is None:
@@ -2241,9 +2574,15 @@ class MainWindow(QMainWindow):
         self._network_active = None
         self._network_timer.stop()
         self._network_progress = None
-        success = error is None and isinstance(result, TextProbeResult if job.kind == "text_probe" else ApiResult)
-        (self._network_budget or self.api_budget).settle(ticket, result.input_tokens if success else None,
-                               result.output_tokens if success else None, success=success)
+        active_budget = self._network_budget or self.api_budget
+        is_agent_run = isinstance(result, AgentRunResult)
+        success = error is None and isinstance(
+            result, TextProbeResult if job.kind == "text_probe" else (ApiResult, AgentRunResult)
+        )
+        if not active_budget.is_settled(ticket):
+            in_tok = result.total_input_tokens if is_agent_run else (result.input_tokens if success else None)
+            out_tok = result.total_output_tokens if is_agent_run else (result.output_tokens if success else None)
+            active_budget.settle(ticket, in_tok if success else None, out_tok if success else None, success=success)
         self._network_budget = None
         valid = (not self._closing and not cancel.is_set() and not self.coach.paused and
                  self.coach_mode.currentIndex() == 1 and job.generation == self._generation and
@@ -2254,7 +2593,57 @@ class MainWindow(QMainWindow):
                 self.coach_text.setPlainText(result.text())
             elif success and (result.feedback.photo_id, result.feedback.session_id, result.feedback.state_version) == (
                     job.snapshot.photo_id, job.snapshot.session_id, job.snapshot.revision):
-                self.coach_text.show_feedback(result.feedback)
+                if is_agent_run:
+                    request = job.coach_request
+                    try:
+                        if request is not None:
+                            self.trace_store.record_run(request.request_id, result.to_record(request))
+                            export_otel_spans(request.request_id, result.spans, {
+                                "turns_used": result.turns_used,
+                                "tool_calls_used": result.tool_calls_used,
+                            })
+                    except Exception:
+                        pass
+                    plan = result.feedback.agent_plan
+                    self.agent_memory.record(
+                        result.feedback.photo_id, result.feedback.session_id,
+                        TurnSummary(
+                            state_version=result.feedback.state_version,
+                            question=result.feedback.question,
+                            decision=plan.decision if plan else "legacy",
+                            objective=plan.objective if plan else result.feedback.main_change[:80],
+                            tools_used=tuple(
+                                s.name for s in result.spans if s.node in ("tool_call", "trial_render")
+                            ),
+                            action_label=result.feedback.actions[0].label if result.feedback.actions else "",
+                        ),
+                    )
+                    if result.feedback.agent_plan is not None and result.feedback.agent_report is None:
+                        request = job.coach_request
+                        if request is None:
+                            self.coach_text.setPlainText("The analysis snapshot is unavailable. Analyze again; no edit was applied.", kind="error")
+                        else:
+                            from .i18n import tr
+                            self.coach_text.setPlainText(tr("Rendering and checking the proposed edit…", "正在生成并检查试调…"))
+                            trial_cancel = threading.Event()
+                            self._queue(Job("coach_check", self._generation,
+                                lambda: self.engine.check_coach_trial(job.snapshot, request, result.feedback, cancel=trial_cancel),
+                                job.snapshot, job.coach_token, cancel=trial_cancel))
+                    else:
+                        self.coach_text.show_feedback(result.feedback)
+                elif result.feedback.agent_plan is not None:
+                    request = job.coach_request
+                    if request is None:
+                        self.coach_text.setPlainText("The analysis snapshot is unavailable. Analyze again; no edit was applied.", kind="error")
+                    else:
+                        from .i18n import tr
+                        self.coach_text.setPlainText(tr("Rendering and checking the proposed edit…", "正在生成并检查试调…"))
+                        trial_cancel = threading.Event()
+                        self._queue(Job("coach_check", self._generation,
+                            lambda: self.engine.check_coach_trial(job.snapshot, request, result.feedback, cancel=trial_cancel),
+                            job.snapshot, job.coach_token, cancel=trial_cancel))
+                else:
+                    self.coach_text.show_feedback(result.feedback)
                 if (result.live_photo_response and self.api_settings and self.api_settings.config.model
                         and self.api_settings.remember_settings):
                     try:
@@ -2348,7 +2737,8 @@ class MainWindow(QMainWindow):
             self._cancel_auto_coach()
             return
         blocked = (self.store.gesture_active or self._active is not None or self._pending is not None
-                   or self._pending_detail is not None or bool(self._protected_jobs) or self._exporting
+                   or self._pending_detail is not None or self._pending_backdrop is not None
+                   or bool(self._protected_jobs) or self._exporting
                    or self._network_active is not None or self._reviewing or self._render_timer.isActive()
                    or self._settle_timer.isActive()
                    or not self.analyze_button.isEnabled() or QApplication.activeModalWidget() is not None
@@ -2407,7 +2797,7 @@ class MainWindow(QMainWindow):
             return
         def analyze_current():
             request = self.engine.coach_request(state, before, events, question)
-            return self.coach.analyze(request)
+            return self.engine.check_coach_trial(state, request, self.coach.analyze(request))
         self._queue(Job("coach", self._generation, analyze_current, state, token, automatic=automatic))
 
     def closeEvent(self, event) -> None:
@@ -2418,6 +2808,7 @@ class MainWindow(QMainWindow):
                 return
             self._close_approved = True
         self.coach_response.reader.hide()
+        self.coach_response.trial.hide()
         self.coach_selection.hide()
         if self._local_dialog and self._local_dialog.busy:
             self._closing = True
@@ -2429,6 +2820,8 @@ class MainWindow(QMainWindow):
         self._settle_timer.stop()
         self._cancel_obsolete_render()
         self._cancel_auto_coach()
+        if self._active and self._active[1].kind in ("coach_check", "agent_tool") and self._active[1].cancel is not None:
+            self._active[1].cancel.set()
         self._notice_timer.stop()
         self._protected_jobs.clear()
         if self._active is not None or self._network_active is not None:
@@ -2436,6 +2829,7 @@ class MainWindow(QMainWindow):
             if self._network_active is not None:
                 self._network_active[2].set()
             self._pending = None
+            self._pending_backdrop = None
             self._render_timer.stop()
             self._set_controls(False)
             self.open_button.setEnabled(False)

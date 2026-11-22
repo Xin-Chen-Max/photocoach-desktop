@@ -47,6 +47,300 @@ LIGHTING_RECIPE_META: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _box_blur_2d(arr: np.ndarray, ry: int, rx: int) -> np.ndarray:
+    """Fast O(H*W) edge-padded 2D box average using pure NumPy cumulative sums."""
+    arr = np.asarray(arr, dtype=np.float32)
+    h, w = arr.shape[:2]
+    ry = max(1, min(int(ry), max(1, h // 2)))
+    rx = max(1, min(int(rx), max(1, w // 2)))
+    pad_x = np.pad(arr, ((0, 0), (rx + 1, rx)), mode="edge")
+    cs_x = np.cumsum(pad_x, axis=1, dtype=np.float64)
+    horiz = (cs_x[:, 2 * rx + 1 :] - cs_x[:, :w]) / float(2 * rx + 1)
+    pad_y = np.pad(horiz, ((ry + 1, ry), (0, 0)), mode="edge")
+    cs_y = np.cumsum(pad_y, axis=0, dtype=np.float64)
+    vert = (cs_y[2 * ry + 1 :, :] - cs_y[:h, :]) / float(2 * ry + 1)
+    return vert.astype(np.float32)
+
+
+def _detect_foreground_subjects(
+    luma: np.ndarray,
+    edge_energy: np.ndarray,
+    horizon_y: float,
+    *,
+    max_candidates: int = 5,
+) -> list[dict[str, Any]]:
+    """Detect salient foreground subject blobs (including dark subjects on brighter ground)."""
+    h, w = luma.shape[:2]
+    if h < 20 or w < 20:
+        return []
+    y0 = max(1, min(h - 8, int(round(max(0.10, min(0.32, horizon_y * 0.70)) * h))))
+    y1 = max(y0 + 6, int(round(h * 0.92)))
+    bg = _box_blur_2d(luma, max(4, h // 5), max(4, w // 5))
+    dark_contrast = np.maximum(0.0, bg - luma)
+    abs_contrast = np.abs(luma - bg)
+    sal_map = 1.45 * dark_contrast + 0.55 * abs_contrast + 0.30 * edge_energy
+
+    sub_sal = sal_map[y0:y1, :]
+    sub_luma = luma[y0:y1, :]
+    sub_bg = bg[y0:y1, :]
+    gh = min(24, sub_sal.shape[0])
+    gw = min(36, sub_sal.shape[1])
+    r_edges = np.linspace(0, sub_sal.shape[0], gh + 1, dtype=int)
+    c_edges = np.linspace(0, sub_sal.shape[1], gw + 1, dtype=int)
+
+    grid_sal = np.zeros((gh, gw), dtype=np.float32)
+    grid_lum = np.zeros((gh, gw), dtype=np.float32)
+    grid_bg = np.zeros((gh, gw), dtype=np.float32)
+    for r in range(gh):
+        r0, r1 = int(r_edges[r]), max(int(r_edges[r]) + 1, int(r_edges[r + 1]))
+        for c in range(gw):
+            c0, c1 = int(c_edges[c]), max(int(c_edges[c]) + 1, int(c_edges[c + 1]))
+            grid_sal[r, c] = float(sub_sal[r0:r1, c0:c1].mean())
+            grid_lum[r, c] = float(sub_luma[r0:r1, c0:c1].mean())
+            grid_bg[r, c] = float(sub_bg[r0:r1, c0:c1].mean())
+
+    max_sal = float(grid_sal.max())
+    if max_sal < 0.04:
+        return []
+    thresh = max(float(np.percentile(grid_sal, 82)), float(grid_sal.mean() + 0.95 * grid_sal.std()), 0.05)
+    active = grid_sal >= thresh
+    if not np.any(active):
+        return []
+
+    visited = np.zeros((gh, gw), dtype=bool)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    span_y = (y1 - y0) / float(h)
+    top_norm_base = y0 / float(h)
+    for r in range(gh):
+        for c in range(gw):
+            if not active[r, c] or visited[r, c]:
+                continue
+            stack = [(r, c)]
+            visited[r, c] = True
+            cells: list[tuple[int, int]] = []
+            while stack:
+                cr, cc = stack.pop()
+                cells.append((cr, cc))
+                # 4-connectivity keeps distinct nearby subjects from merging across diagonal sand pixels
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = cr + dr, cc + dc
+                    if 0 <= nr < gh and 0 <= nc < gw and not visited[nr, nc] and active[nr, nc]:
+                        visited[nr, nc] = True
+                        stack.append((nr, nc))
+            if len(cells) < 2 and max_sal > 0.08:
+                continue
+            rs = [cell[0] for cell in cells]
+            cs = [cell[1] for cell in cells]
+            left = min(cs) / float(gw)
+            right = (max(cs) + 1) / float(gw)
+            top = top_norm_base + (min(rs) / float(gh)) * span_y
+            bottom = top_norm_base + ((max(rs) + 1) / float(gh)) * span_y
+            bw = right - left
+            bh = bottom - top
+            # Reject horizon/background bands spanning almost the entire frame width
+            if bw > 0.72 and bh < 0.20:
+                continue
+            if bw > 0.78 or bh > 0.65:
+                continue
+            weights = [float(grid_sal[cr, cc]) for cr, cc in cells]
+            w_sum = sum(weights) + 1e-6
+            cx = sum(((cc + 0.5) / float(gw)) * wt for (_, cc), wt in zip(cells, weights)) / w_sum
+            cy = sum((top_norm_base + ((cr + 0.5) / float(gh)) * span_y) * wt for (cr, _), wt in zip(cells, weights)) / w_sum
+            m_lum = sum(float(grid_lum[cr, cc]) for cr, cc in cells) / float(len(cells))
+            m_bg = sum(float(grid_bg[cr, cc]) for cr, cc in cells) / float(len(cells))
+            contrast = max(0.01, float(np.mean(weights)))
+            dist_center = math.hypot(cx - 0.5, cy - 0.52)
+            score = (len(cells) ** 0.75) * contrast * max(0.35, 1.30 - 0.75 * dist_center)
+            crest_y = min(bottom - 0.01, top + 0.18 * bh)
+            scored.append((score, {
+                "center": [round(cx, 3), round(cy, 3)],
+                "bbox": [round(max(0.01, left), 3), round(max(0.01, top), 3),
+                         round(min(0.99, right), 3), round(min(0.99, bottom), 3)],
+                "crest": [round(cx, 3), round(crest_y, 3)],
+                "size": [round(bw, 3), round(bh, 3)],
+                "mean_luma": round(m_lum, 3),
+                "bg_luma": round(m_bg, 3),
+                "is_dark_subject": bool(m_lum < m_bg - 0.025),
+            }))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    results: list[dict[str, Any]] = []
+    for idx, (_, item) in enumerate(scored[:max_candidates], start=1):
+        results.append({"id": idx, **item})
+    return results
+
+
+def build_overhead_spotlight_actions(
+    bbox: tuple[float, float, float, float] | list[float],
+    source_pt: tuple[float, float] = (0.35, 0.14),
+    *,
+    is_dark_subject: bool = True,
+    direction: str = "auto",
+    strength: str = "moderate",
+    recipe: str = "spotlight",
+    max_masks: int = 4,
+) -> list[dict[str, Any]]:
+    """Construct ACTION_SCHEMA-compliant create_mask actions anchored to a subject crest & overhead beam."""
+    left, top, right, bottom = [float(v) for v in bbox]
+    if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+        raise ValueError("Invalid target_box coordinates.")
+    if max_masks < 1:
+        raise MaskCapacityError("No free local mask slots remain (maximum 4).")
+    cx = (left + right) / 2.0
+    bw = max(0.06, right - left)
+    bh = max(0.05, bottom - top)
+    crest_y = min(bottom, top + 0.16 * bh)
+
+    scales = {"subtle": 0.75, "moderate": 1.0, "dramatic": 1.28}
+    scale = scales.get(strength, 1.0)
+
+    sx, sy = float(source_pt[0]), float(source_pt[1])
+    if direction == "overhead":
+        sx, sy = cx, max(0.03, top - 0.26)
+    elif direction == "top_left":
+        sx, sy = max(0.06, cx - 0.28), max(0.03, top - 0.24)
+    elif direction == "top_right":
+        sx, sy = min(0.94, cx + 0.28), max(0.03, top - 0.24)
+
+    dx_light = cx - sx
+    dy_light = max(0.05, crest_y - sy)
+    beam_angle = 0.0 if direction == "overhead" else round(_clamp(math.degrees(math.atan2(dx_light, dy_light)) * 0.42, -30.0, 30.0), 1)
+
+    if recipe == "window_light":
+        from_right = sx > cx
+        k_start = [round(min(0.96, cx + 0.34) if from_right else max(0.04, cx - 0.34), 3), round(max(0.06, crest_y - 0.18), 3)]
+        k_end = [round(max(0.18, cx - 0.16) if from_right else min(0.82, cx + 0.16), 3), round(min(0.92, bottom + 0.14), 3)]
+        actions: list[dict[str, Any]] = [{
+            "operation": "create_mask",
+            "kind": "linear",
+            "name": "Window Key Light",
+            "start": k_start,
+            "end": k_end,
+            "exposure_ev": round(_clamp((0.48 if is_dark_subject else 0.54) * scale, 0.20, 1.20), 2),
+            "highlights": round(_clamp(0.18 * scale, 0.05, 0.45), 2),
+            "shadows": round(_clamp((0.34 if is_dark_subject else 0.22) * scale, 0.05, 0.65), 2),
+            "warmth": round(_clamp(0.34 * scale, 0.10, 0.65), 2),
+            "inverted": False,
+            "angle": 0.0,
+            "feather": 0.0,
+        }]
+        if max_masks >= 2:
+            actions.append({
+                "operation": "create_mask",
+                "kind": "linear",
+                "name": "Shadow Falloff",
+                "start": [round(max(0.04, 1.0 - k_start[0]), 3), round(min(0.94, bottom + 0.16), 3)],
+                "end": [round(cx, 3), round(crest_y, 3)],
+                "exposure_ev": round(_clamp(-0.26 * scale, -0.60, -0.10), 2),
+                "highlights": -0.10,
+                "shadows": -0.14,
+                "warmth": -0.12,
+                "inverted": False,
+                "angle": 0.0,
+                "feather": 0.0,
+            })
+        return actions
+
+    if recipe == "sunbeam":
+        span_w = max(0.42, min(0.76, bw * 2.5))
+        span_h = max(0.36, min(0.70, (bottom - sy) * 0.95))
+        beam_cx = max(0.16, min(0.84, 0.68 * cx + 0.32 * sx))
+        beam_cy = max(0.16, min(0.76, 0.58 * crest_y + 0.42 * max(0.08, sy + 0.10)))
+    elif recipe == "rim_backlight":
+        span_w = max(0.32, min(0.64, bw * 1.9))
+        span_h = max(0.22, min(0.48, bh * 1.9))
+        beam_cx = cx
+        beam_cy = max(0.08, top + 0.06 * bh)
+    elif recipe == "mountain_beam":
+        span_w = max(0.48, min(0.88, bw * 2.4))
+        span_h = max(0.30, min(0.62, bh * 2.2))
+        beam_cx = cx
+        beam_cy = max(0.14, min(0.78, crest_y + 0.12 * bh))
+    else:
+        # Overhead 3D spotlight: anchor upper-crest core slightly above subject spine so the
+        # top surface gets peak illumination, side slopes roll off gently, and ground shadows hold.
+        span_w = max(0.24, min(0.50, bw * 1.65))
+        span_h = max(0.18, min(0.42, bh * 2.10))
+        beam_cx = max(0.10, min(0.90, cx + (sx - cx) * 0.10))
+        beam_cy = max(0.10, min(0.84, top + 0.18 * bh - min(0.012, 0.08 * bh)))
+
+    b_x0 = round(_clamp(beam_cx - span_w / 2.0, 0.02, 0.74), 3)
+    b_y0 = round(_clamp(beam_cy - span_h / 2.0, 0.02, 0.80), 3)
+    b_x1 = round(_clamp(b_x0 + span_w, min(0.98, b_x0 + 0.22), 0.98), 3)
+    b_y1 = round(_clamp(b_y0 + span_h, min(0.98, b_y0 + 0.18), 0.98), 3)
+
+    key_ev = round(_clamp((0.40 if is_dark_subject else 0.48) * scale, 0.24, 1.10), 2)
+    key_hl = round(_clamp((0.20 if recipe != "sunbeam" else 0.24) * scale, 0.06, 0.45), 2)
+    key_sh = round(_clamp((0.36 if is_dark_subject else 0.22) * scale, 0.12, 0.65), 2)
+    key_warmth = round(_clamp((0.32 if recipe == "spotlight" else 0.44) * scale, 0.15, 0.65), 2)
+    key_feather = 0.84 if recipe in ("sunbeam", "mountain_beam") else 0.82
+
+    key_name = {
+        "sunbeam": "Sunbeam Shaft",
+        "rim_backlight": "Rim Backlight",
+        "mountain_beam": "Overhead Ridge Beam",
+    }.get(recipe, "Overhead Key Light")
+
+    actions = [{
+        "operation": "create_mask",
+        "kind": "radial",
+        "name": key_name,
+        "start": [b_x0, b_y0],
+        "end": [b_x1, b_y1],
+        "exposure_ev": key_ev,
+        "highlights": key_hl,
+        "shadows": key_sh,
+        "warmth": key_warmth,
+        "inverted": False,
+        "angle": beam_angle,
+        "feather": key_feather,
+    }]
+    if max_masks >= 2 and recipe != "rim_backlight":
+        f_x0 = round(_clamp(b_x0 - 0.06, 0.01, 0.70), 3)
+        f_y0 = round(_clamp(b_y0 - 0.05, 0.01, 0.72), 3)
+        f_x1 = round(_clamp(b_x1 + 0.06, min(0.99, f_x0 + 0.26), 0.99), 3)
+        f_y1 = round(_clamp(b_y1 + 0.06, min(0.99, f_y0 + 0.22), 0.99), 3)
+        actions.append({
+            "operation": "create_mask",
+            "kind": "radial",
+            "name": "Ambient Falloff",
+            "start": [f_x0, f_y0],
+            "end": [f_x1, f_y1],
+            "exposure_ev": round(_clamp(-0.28 * scale, -0.55, -0.14), 2),
+            "highlights": -0.14,
+            "shadows": -0.12,
+            "warmth": -0.10,
+            "inverted": True,
+            "angle": beam_angle,
+            "feather": 0.78,
+        })
+    if max_masks >= 3 and recipe == "spotlight":
+        # Focused upper-crest rim catch light: peaks on the upward-facing top surface and fades
+        # cleanly across the side slope without illuminating the ground beneath.
+        c_w = max(0.18, min(0.36, bw * 1.25))
+        c_h = max(0.08, min(0.22, bh * 1.15))
+        c_cy = max(0.06, min(0.88, top + 0.22 * bh))
+        c_x0 = round(_clamp(cx - c_w / 2.0, 0.03, 0.78), 3)
+        c_y0 = round(_clamp(c_cy - c_h / 2.0, 0.03, 0.86), 3)
+        c_x1 = round(_clamp(c_x0 + c_w, min(0.97, c_x0 + 0.18), 0.97), 3)
+        c_y1 = round(_clamp(c_y0 + c_h, min(0.97, c_y0 + 0.08), 0.97), 3)
+        actions.append({
+            "operation": "create_mask",
+            "kind": "radial",
+            "name": "Top Crest Highlight",
+            "start": [c_x0, c_y0],
+            "end": [c_x1, c_y1],
+            "exposure_ev": round(_clamp((0.30 if is_dark_subject else 0.24) * scale, 0.14, 0.65), 2),
+            "highlights": round(_clamp(0.26 * scale, 0.08, 0.45), 2),
+            "shadows": round(_clamp((0.32 if is_dark_subject else 0.16) * scale, 0.10, 0.55), 2),
+            "warmth": round(_clamp(0.22 * scale, 0.08, 0.45), 2),
+            "inverted": False,
+            "angle": beam_angle,
+            "feather": 0.85,
+        })
+    return actions
+
+
 def analyze_scene_lighting(preview: np.ndarray, question: str = "", goal: str = "") -> dict[str, Any]:
     """Analyze preview pixels to locate the ridge contour, peak, natural light vector, and sunlit slope."""
     h, w = preview.shape[:2]
@@ -109,7 +403,8 @@ def analyze_scene_lighting(preview: np.ndarray, question: str = "", goal: str = 
     ridge_relief_span = float(max(ridge_ys) - min(ridge_ys))
     q_combined = f"{question} {goal}"
     wants_center_subject = bool(re.search(
-        r"\b(?:center|middle|car|vehicle|road|street|subject|person)\b|中间|中央|车|车辆|车道|道路|马路|街道|主体|人物",
+        r"\b(?:center|middle|car|vehicle|road|street|subject|person|seal|sea ?lion|animal|bird|dog|cat|wildlife|spotlight|foreground)s?\b|"
+        r"中间|中央|车|车辆|车道|道路|马路|街道|主体|人物|海狮|海豹|动物|聚光|前景",
         q_combined, re.I,
     ))
     wants_mountain = bool(re.search(
@@ -221,6 +516,35 @@ def analyze_scene_lighting(preview: np.ndarray, question: str = "", goal: str = 
         beam_angle = round(_clamp(raw_deg * 0.45, -24.0, 24.0), 1)
     terrain_luma = float(luma[best_r:, :].mean()) if best_r < h else mean_luma
     sky_luma = float(luma[:best_r, :].mean()) if best_r > 0 else mean_luma
+    subject_candidates = _detect_foreground_subjects(luma, edge_energy, horizon_y)
+    if (not is_mountain_scene) and subject_candidates:
+        primary = subject_candidates[0]
+        target_x = _clamp(primary["center"][0], 0.08, 0.92)
+        target_y = _clamp(primary["center"][1], 0.14, 0.90)
+        primary_box = tuple(primary["bbox"])
+        primary_dark = bool(primary["is_dark_subject"])
+    else:
+        primary_box = (
+            _clamp(target_x - 0.16, 0.05, 0.72),
+            _clamp(target_y - 0.12, 0.08, 0.72),
+            _clamp(target_x + 0.16, 0.28, 0.95),
+            _clamp(target_y + 0.12, 0.28, 0.92),
+        )
+        primary_dark = bool(mean_luma < 0.35)
+    recommended_recipes = {
+        "spotlight": build_overhead_spotlight_actions(
+            primary_box,
+            (round(source_x, 2), round(source_y, 2)),
+            is_dark_subject=primary_dark,
+            recipe="spotlight",
+        ),
+        "sunbeam": build_overhead_spotlight_actions(
+            primary_box,
+            (round(source_x, 2), round(source_y, 2)),
+            is_dark_subject=primary_dark,
+            recipe="sunbeam",
+        ),
+    }
 
     return {
         "horizon_y": horizon_y,
@@ -245,6 +569,8 @@ def analyze_scene_lighting(preview: np.ndarray, question: str = "", goal: str = 
         "rec_shadows": rec_shadows,
         "rec_highlights": rec_highlights,
         "is_mountain_scene": is_mountain_scene,
+        "subject_candidates": subject_candidates,
+        "recommended_recipes": recommended_recipes,
     }
 
 
@@ -517,29 +843,52 @@ def make_lighting_action(recipe_id: str, values: EditValues,
             focus_control=f"local_gradients.{target}",
         )
 
-    # Default recipe: 3D Subject Spotlight + Ambient Falloff (centered on detected scene target_x, target_y)
-    ev = _clamp(custom_ev if custom_ev is not None else 0.45, -3.0, 3.0)
-    if scene:
+    # Default recipe: Overhead 3D Subject Spotlight + Ambient Falloff (anchored on upper subject crest)
+    ev = _clamp(custom_ev if custom_ev is not None else 0.46, -3.0, 3.0)
+    ang = _clamp(custom_angle if custom_angle is not None else 0.0, -90.0, 90.0)
+    if scene and scene.get("subject_candidates"):
+        cand = scene["subject_candidates"][0]
+        rig = build_overhead_spotlight_actions(
+            cand["bbox"],
+            (scene["source_x"], scene["source_y"]),
+            is_dark_subject=bool(cand.get("is_dark_subject", True)),
+            recipe="spotlight",
+        )
+        k_spec, f_spec = rig[0], rig[1]
+        k_start = tuple(k_spec["start"])
+        k_end = tuple(k_spec["end"])
+        a_start = tuple(f_spec["start"])
+        a_end = tuple(f_spec["end"])
+        if custom_ev is None:
+            ev = float(k_spec["exposure_ev"])
+        if custom_angle is None:
+            ang = float(k_spec["angle"])
+        hl = float(k_spec["highlights"])
+        sh = float(k_spec["shadows"])
+        feather = float(k_spec["feather"])
+        w_spot = float(k_spec["warmth"])
+    elif scene:
         tx, ty = scene["target_x"], scene["target_y"]
-        k_start = (_clamp(tx - 0.24, 0.08, 0.52), _clamp(ty - 0.26, 0.12, 0.54))
-        k_end = (_clamp(tx + 0.24, 0.48, 0.92), _clamp(ty + 0.26, 0.46, 0.92))
-        a_start = (_clamp(k_start[0] - 0.06, 0.04, 0.46), _clamp(k_start[1] - 0.06, 0.06, 0.48))
+        k_start = (_clamp(tx - 0.24, 0.08, 0.52), _clamp(ty - 0.28, 0.08, 0.52))
+        k_end = (_clamp(tx + 0.24, 0.48, 0.92), _clamp(ty + 0.22, 0.46, 0.92))
+        a_start = (_clamp(k_start[0] - 0.06, 0.04, 0.46), _clamp(k_start[1] - 0.06, 0.04, 0.48))
         a_end = (_clamp(k_end[0] + 0.06, 0.54, 0.96), _clamp(k_end[1] + 0.06, 0.52, 0.96))
-        w_spot = 0.28
+        hl, sh, feather, w_spot = 0.20, 0.34, 0.78, 0.34
     else:
         k_start, k_end = (0.24, 0.16), (0.76, 0.84)
         a_start, a_end = (0.18, 0.12), (0.82, 0.88)
-        w_spot = 0.0
+        hl, sh, feather, w_spot = 0.14, 0.28, 0.72, 0.0
     key_light = RadialGradient(
         id="coach-key-light",
         name="Key Light",
         start=custom_start or k_start,
         end=custom_end or k_end,
         exposure_ev=ev,
-        highlights=0.10,
-        shadows=0.25,
-        feather=0.68,
-        warmth=w_spot,
+        highlights=hl if custom_highlights is None else _clamp(custom_highlights, -1.0, 1.0),
+        shadows=sh if custom_shadows is None else _clamp(custom_shadows, -1.0, 1.0),
+        feather=feather if custom_feather is None else _clamp(custom_feather, 0.0, 1.0),
+        warmth=w_spot if custom_warmth is None else _clamp(custom_warmth, -1.0, 1.0),
+        angle=ang,
     )
     ambient_falloff = RadialGradient(
         id="coach-ambient-falloff",
@@ -547,10 +896,12 @@ def make_lighting_action(recipe_id: str, values: EditValues,
         start=a_start,
         end=a_end,
         exposure_ev=-0.28,
-        highlights=-0.12,
-        shadows=-0.15,
+        highlights=-0.14,
+        shadows=-0.12,
         inverted=True,
-        feather=0.72,
+        feather=0.78,
+        warmth=-0.10,
+        angle=ang,
     )
     masks = [key_light, ambient_falloff]
     updated = upsert(masks)

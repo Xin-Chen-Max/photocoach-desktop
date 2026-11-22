@@ -46,27 +46,27 @@ def test_classify_manual_unverified_models():
 def test_catalog_store_default_and_persistence(tmp_path):
     catalog_path = tmp_path / "model_catalog.json"
     store = ModelCatalogStore(catalog_path)
-
+    
     # Defaults load when file does not exist
     gemini_models = store.get_models("gemini")
     assert len(gemini_models) >= 1
     assert any(m.id == "gemini-3.5-flash-lite" and m.capability == "supported" for m in gemini_models)
     assert store.get_last_updated("gemini") is None
-
+    
     # Update models from API fetch
     fetched = ["gemini-2.5-flash", "gemini-custom-future", "gemini-test-tts"]
     updated = store.update_provider_models("gemini", fetched)
     assert len(updated) == 3
     assert store.get_last_updated("gemini") is not None
     assert catalog_path.exists()
-
+    
     # Reload from disk
     new_store = ModelCatalogStore(catalog_path)
     reloaded = new_store.get_models("gemini")
     assert [m.id for m in reloaded] == fetched
     tts_model = next(m for m in reloaded if m.id == "gemini-test-tts")
     assert tts_model.capability == "unsupported"
-
+    
     # Mark verified
     new_store.mark_model_verified("gemini-custom-future", provider="gemini", scope="gemini")
     verified_models = new_store.get_models("gemini")

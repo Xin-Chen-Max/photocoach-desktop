@@ -47,6 +47,8 @@ class ColorMixerEditor(QWidget):
             body.addWidget(slider)
         self.reset_color = QPushButton("Reset selected color")
         self.reset_all = QPushButton("Reset Color Mixer")
+        self.reset_color.setProperty("compact", True)
+        self.reset_all.setProperty("compact", True)
         # Separate rows remain readable in the existing narrow edit panel.
         body.addWidget(self.reset_color)
         body.addWidget(self.reset_all)

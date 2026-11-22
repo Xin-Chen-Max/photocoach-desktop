@@ -18,7 +18,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     source = output/"source"
     source.mkdir()
-    for name in ("pyproject.toml", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
+    for name in ("pyproject.toml", "README.md"):
         shutil.copy2(root/name, source/name)
     shutil.copytree(root/"src"/"photocoach", source/"src"/"photocoach",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -50,11 +50,20 @@ import photocoach
 from importlib.metadata import distributions
 dist = next(d for d in distributions(path=[sys.argv[1]]) if d.metadata["Name"].lower() == "photocoach")
 entry = {e.name: e for e in dist.entry_points if e.group == "console_scripts"}
-for name in ("photocoach", "photocoach-verify"):
+for name in ("photocoach", "photocoach-verify", "photocoach-mcp", "photocoach-eval"):
     assert callable(entry[name].load())
 from photocoach.app import MainWindow, configure_appearance
 from photocoach.settings import SettingsStore
 from photocoach.coach import CoachFeedback
+from photocoach.coach_agent import PLAN_SCHEMA, measure_preview
+from photocoach.agent_runtime import AgentRuntime, RunBudget
+from photocoach.agent_tools import build_default_tool_registry
+from photocoach.agent_memory import PlaybookRAG
+from photocoach.mcp_server import PhotoCoachMCPServer
+from photocoach.telemetry import TraceStore
+assert len(build_default_tool_registry().specs()) >= 6
+assert len(PlaybookRAG().search("sharpening", top_k=2)) >= 1
+assert PhotoCoachMCPServer().handle_request({"jsonrpc": "2.0", "id": 1, "method": "ping"})["result"] == {}
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QFontDatabase
 assert Path(photocoach.__file__).is_relative_to(Path(sys.argv[1]))
@@ -89,9 +98,18 @@ assert not w.coach_model_picker.isEditable()
 assert w.local_ai_button.text() == "Local models"
 assert w.coach_selection.isHidden() and w.goal_panel.isHidden()
 assert hasattr(w.question, "submitRequested") and w.question.limit == 2000
+assert w.coach_response.trial_button.text() == "Preview trial"
+assert w.coach_response.trial_button.isHidden() and not w.coach_response.trial.isModal()
+assert "findings" in PLAN_SCHEMA["required"]
+import numpy as np
+assert measure_preview(np.zeros((9,9,3),np.uint8))["center"]["display_floor_fraction"] == 1.
 assert "Local AI" not in [w.coach_menu_button.menu().actions()[i].text() for i in range(2)]
 assert w.local_budget.call_limit == 20 and w.local_runtime.process is None
-from photocoach.api_coach import ApiConfig, ApiCoach
+from photocoach.api_coach import ApiConfig, ApiCoach, TransportProgress
+loading_progress = TransportProgress()
+for stage in ("local_preparing", "local_running"):
+    loading_progress.advance(stage)
+    assert loading_progress.snapshot()[0] == stage
 from photocoach.ollama_client import ENDPOINT, MODEL
 ApiCoach(ApiConfig(ENDPOINT, MODEL, "ollama", 300, 4096), "")
 current=w.store.activate(Path("package-smoke.ARW"),"package-smoke")

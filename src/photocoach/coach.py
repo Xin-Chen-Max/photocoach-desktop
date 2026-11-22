@@ -1,15 +1,18 @@
 """Bounded coach context and local mock; provider transport lives separately."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import copy
-from typing import Protocol
+from typing import Any, Protocol, TYPE_CHECKING
 from uuid import uuid4
 
 import numpy as np
 
 from .state import EDIT_PIPELINE_VERSION, EditState, EditValues
 from .coach_actions import CoachAction, resolve_actions
+
+if TYPE_CHECKING:
+    from .coach_agent import AgentPlan, AgentReport
 
 
 @dataclass(frozen=True)
@@ -77,15 +80,31 @@ class CoachFeedback:
     question: str = ""
     actions: tuple[CoachAction, ...] = ()
     action_notice: str = ""
+    agent_plan: AgentPlan | None = None
+    agent_report: AgentReport | None = None
+    agent_trace: tuple[Any, ...] = ()
+    inspected_crops: tuple[tuple[str, np.ndarray], ...] = field(default=(), repr=False, compare=False)
 
     def text(self) -> str:
         response = (f"Question: {self.question}\n\n" if self.question else "")
         if self.answer:
             response += f"Answer: {self.answer}\n\n"
+        workflow = ""
+        if self.agent_plan:
+            workflow = (f"\n\nWorkflow: {self.agent_plan.decision} · {self.agent_plan.objective}\n"
+                        + "\n".join(f"{f.region}: {f.observation} ({f.category}, {f.confidence})"
+                                    for f in self.agent_plan.findings)
+                        + f"\nUncertainty: {self.agent_plan.uncertainty}")
+        if self.agent_report:
+            workflow += "\n" + "\n".join(self.agent_report.lines())
+        if self.agent_trace:
+            workflow += "\nTrace: " + " → ".join(
+                f"{getattr(s, 'name', s)}" for s in self.agent_trace
+            )
         return (f"{self.source} · State v{self.state_version}\n\n" + response +
                 f"Change: {self.main_change}\n\nWhy: {self.reason}\n\n"
                 f"Next: {self.next_step_or_stop}\n\nWatch / stop: {self.observe_and_stop_when}\n\n"
-                + "\n".join(self.evidence))
+                + "\n".join(self.evidence) + workflow)
 
 
 class CoachAdapter(Protocol):
@@ -190,7 +209,13 @@ class MockCoach:
                     "Inference: parameter rules cannot identify subjects or assess aesthetic quality.",
                     f"Preference / goal: {request.goal or 'No goal entered.'}",
                     f"Question: {request.question or 'Analyze the current edit.'}")
+        from .coach_agent import AgentPlan, Finding, VerificationCheck
+        plan = AgentPlan("recommend" if proposals else "inspect", "Compare the current edit with your goal.",
+            (Finding("whole", observed, "This demo reads settings and preview measurements only.", "technical", "medium"),),
+            (VerificationCheck("whole", "visual", "visual", "Keep the trial only if it serves your goal."),),
+            "The local mock cannot recognize subjects or judge aesthetic quality.")
         return CoachFeedback(request.photo_id, request.session_id, request.state_version,
                              change, reason, next_step, watch, evidence,
                              answer=answer,
-                             question=request.question, actions=resolve_actions(proposals, EditValues.from_dict(p), request.source_size))
+                             question=request.question, actions=resolve_actions(proposals, EditValues.from_dict(p), request.source_size),
+                             agent_plan=plan)

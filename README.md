@@ -18,12 +18,17 @@ Extract the whole ZIP and run **PhotoCoach/PhotoCoach.exe**. Keep `_internal` be
 
 - Exposure, highlights, shadows, whites, blacks, contrast, saturation, vibrance, and sensor white balance.
 - Natural / As Shot and Neutral base rendering, a shared RGB curve, and an eight-color HSL mixer.
-- Crop, straighten, manual lens distortion/vignetting, and up to four linear or radial masks.
-- Sharpening, edge masking, luminance noise reduction, and color noise reduction.
-- Progressive previews, 100% detail inspection, zoom/pan, histogram, clipping overlays, and a neutral white balance picker.
+- Crop, straighten, manual lens distortion/vignetting, and up to four linear or radial masks (with 3D spotlight rig lighting).
+- Calibrated detail engine: sharpening, edge masking, luminance noise reduction, and color noise reduction running before display reduction.
+- Progressive previews, 100% detail inspection, seamless zoom pyramid, histogram, clipping overlays, and a neutral white balance picker.
 - Grouped undo/redo and local projects that preserve edit history.
 - Full-resolution JPEG and 16-bit TIFF export with an embedded sRGB profile.
-- Manual coaching through OpenAI Responses, Chat Completions compatible services, native Gemini, or a separately prepared local Ollama vision model.
+- Autonomous multimodal coaching agent (Agent v2) with a bounded ReAct state-graph runtime (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`), visual reflexion self-repair, and strict turn/budget limits.
+- Active Vision toolset: 1:1 demosaiced crop inspection (`inspect_region_100pct`), normalized Bayer CFA sensor headroom probing (`probe_sensor_headroom`), and 8-band HSL/CIELAB zoning (`analyze_hsl_zones`).
+- Unified multi-protocol tool calling across Gemini (`thoughtSignature` + `$ref` multimodal `FunctionResponse.parts`), OpenAI Responses, Chat Completions, and local Ollama (`qwen3.6:27b`).
+- Read-only Model Context Protocol (MCP `2025-06-18`) stdio server (`photocoach-mcp`) sharing editing and sensor diagnostic tools with external agents.
+- Zero-dependency bilingual BM25 Playbook RAG (24 pipeline-calibrated recipe cards) and privacy-preserving style memory.
+- 25-scenario evaluation and benchmark harness (`photocoach-eval`) measuring reasoning, reflexion recovery, prompt-injection defense, and tool robustness.
 - Reviewed suggestions with visible target values, explicit application, cancellation and stale-response protection.
 - English and Chinese interface controls; documentation is in English.
 
@@ -65,9 +70,16 @@ Read the [architecture](docs/architecture.md) for processing order, module bound
 ```powershell
 & .\.venv\Scripts\python.exe -m pytest -q
 & .\.venv\Scripts\python.exe scripts\verify_wheel.py --output verification-runs\wheel-check
+& .\.venv\Scripts\python.exe scripts\run_agent_eval.py
 ```
 
 The default suite uses synthetic images, temporary settings and fake provider transports. Real-RAW checks and native UI captures are separate. [Testing and verification](docs/testing.md) records their coverage and limits.
+
+To start the stdio Model Context Protocol (MCP) server for external agent integration:
+
+```powershell
+& .\.venv\Scripts\python.exe -m photocoach.mcp_server
+```
 
 To build a portable executable on Windows:
 

@@ -11,7 +11,7 @@ import re
 import socket
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit, quote, urlencode
 
 import numpy as np
@@ -20,6 +20,7 @@ from PIL import Image
 from .coach import CoachFeedback, CoachRequest
 from .state import EditValues
 from .detail import DetailControls
+from .coach_agent import PLAN_SCHEMA, action_policy, evidence_context, parse_plan
 
 
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -30,19 +31,47 @@ TRANSPORT_STAGES = {
     "sending": "uploading the request",
     "waiting": "waiting for response headers",
     "receiving": "receiving the response body",
+    "local_preparing": "preparing the local engine and model",
+    "local_running": "loading the local model if needed and analyzing the photo",
 }
 from .coach_actions import ACTION_SCHEMA, MaskCapacityError, resolve_actions
 
 FEEDBACK_FIELDS = ("answer", "main_change", "reason", "next_step_or_stop", "observe_and_stop_when",
                    "observed", "inferred", "preference")
 FEEDBACK_SCHEMA = {
-    "type": "object", "properties": {**{name: {"type": "string"} for name in FEEDBACK_FIELDS}, "actions": ACTION_SCHEMA},
-    "required": [*FEEDBACK_FIELDS, "actions"], "additionalProperties": False,
+    "type": "object", "properties": {**{name: {"type": "string"} for name in FEEDBACK_FIELDS},
+                                      "actions": ACTION_SCHEMA, "workflow": PLAN_SCHEMA},
+    "required": [*FEEDBACK_FIELDS, "actions", "workflow"], "additionalProperties": False,
 }
 COACH_INSTRUCTIONS = """You are PhotoCoach, a practical photography editing teacher.
+Follow the bounded Evidence-based Editing workflow in the workflow object (version 1):
+Observe -> Diagnose -> Recommend or Stop/Inspect/Clarify -> Trial -> Verify -> user decision.
+Choose ONE objective. Give 1-3 findings with a specific supplied 3x3 region (or whole),
+visible observation, separate interpretation, technical/preference category, and low/medium/high
+confidence. Confidence is an honest qualitative judgment, not a calibrated probability.
+Use application_evidence for measured facts. A bright histogram or dark subject is not by
+itself a defect. Respect intentional low/high key lighting and the user's style. Do not invent
+subjects, light-source coordinates or a diagnosis from the user's wording. State uncertainty.
+Choose decision stop if the goal is met, inspect for native-detail or missing visual evidence,
+clarify for an ambiguous goal, and recommend only for an evidence-supported reversible trial.
+Stop/inspect/clarify and low-confidence-only findings require actions=[]. Preference-only
+edits require a user goal or explicit user question. Never force numbers, a complete grading recipe or an edit.
+Use at most 6 action items in one undoable transaction. Name 1-3 explicit verification checks:
+mean_luminance (linear display luminance), display_ceiling_fraction (any channel is 255),
+display_floor_fraction (all channels are 0), or visual. Numerical checks must state increase,
+decrease or preserve; visual uses direction visual and names what the user should compare.
+These are tools for testing your hypothesis, not aesthetic scores or ideal exposure targets.
+Do not set checks to meaningless brightness increases simply to make any edit pass.
+Geometry-changing edits require visual checks, since regions no longer correspond.
+Sharpness/noise/focus need a 100% inspection: do not propose Detail changes from these previews.
+The application renders ONE trial through its formal renderer and checks the stated outcome
+before enabling Apply. It may hold a failed or unsupported trial. You do not see that trial
+in this request: NEVER claim it was rendered, verified, improved, or applied. No second
+model request or automatic retry occurs. The user decides whether to keep the trial.
 Answer the user's question FIRST in the answer field. Use the question's language; if it
-is empty, use the goal's language, otherwise English. Keep UI control names in English
-alongside translated explanations so the user can find them. A question is a task to
+is empty, use the goal's language, otherwise English. When answering in a non-English language,
+keep UI control names in English alongside translated explanations so the user can find them.
+In English answers name each control once (write Exposure, never Exposure (exposure_ev)). A question is a task to
 answer, not merely metadata. Do not substitute a generic next adjustment for the answer.
 For a how-to question, explain the requested control and its use on this edit. For a why
 question, explain the likely mechanism and how to check it. If a term is ambiguous, state
@@ -112,7 +141,8 @@ Highlights and Shadows are -1 to +1, neutral 0: positive lifts,
 negative darkens. They are global luminance-weighted linear-light gains before display
 clipping, not masks or RAW reconstruction. The histogram shows sampled whole-photo
 final 8-bit SDR RGB, independent of zoom; its floor/ceiling indicators do not establish
-RAW clipping or recoverability. Histogram data is not included in this request.
+RAW clipping or recoverability. application_evidence includes reduced-preview statistics,
+not the UI's native-image histogram.
 Whites and Blacks are -1 to +1, neutral 0. UI sliders show normalized values.
 They reshape encoded RGB endpoints: clamp(c + .25*whites*c**4 + .25*blacks*(1-c)**4).
 Whites chiefly affects bright tones; Blacks chiefly affects dark tones. Positive lifts,
@@ -162,6 +192,32 @@ nonnegative linear sRGB luminance after exposure; SDR clipping and sRGB encoding
 0.5 with slope 2**contrast; saturation toward/from encoded weighted gray (0.2126, 0.7152,
 0.0722); saturation-aware Vibrance; Color Mixer in encoded HSL; shared piecewise-linear RGB curve; SDR clipping. LibRaw may already have clipped
 highlights. Parameter semantics are specific to this editor, not Lightroom or Kelvin.
+"""
+
+_V1_TRIAL_RULES = """Sharpness/noise/focus need a 100% inspection: do not propose Detail changes from these previews.
+The application renders ONE trial through its formal renderer and checks the stated outcome
+before enabling Apply. It may hold a failed or unsupported trial. You do not see that trial
+in this request: NEVER claim it was rendered, verified, improved, or applied. No second
+model request or automatic retry occurs. The user decides whether to keep the trial."""
+if _V1_TRIAL_RULES not in COACH_INSTRUCTIONS:
+    raise RuntimeError("COACH_INSTRUCTIONS v1 trial rules drifted; update _V1_TRIAL_RULES.")
+
+_AGENT_TRIAL_RULES = """Sharpness/noise/focus need 100% evidence: propose Detail changes only after inspect_region_100pct in this run.
+You may run sandbox trials with propose_and_preview_trial and you will see the rendered trial image and its
+measured checks. Never claim an edit was applied; the user decides with explicit Apply."""
+
+_FINAL_SCHEMA_KEYS = ", ".join((*FEEDBACK_FIELDS, "actions", "workflow"))
+AGENT_INSTRUCTIONS = COACH_INSTRUCTIONS.replace(_V1_TRIAL_RULES, _AGENT_TRIAL_RULES) + f"""
+Multi-step Agent Tools & Visual Self-Critique:
+- You have read-only diagnostic and sandbox trial tools. Use them intentionally rather than guessing.
+- Call inspect_region_100pct before proposing any Detail adjustments (sharpening, masking, luminance_nr, chroma_nr) or answering fine-focus/noise questions.
+- When proposing a large tonal lift (exposure_ev change >= +1.5 EV or shadows >= +0.25), call inspect_region_100pct on the darkest subject area first to check noise; consider detail.luminance_nr / detail.chroma_nr only from that evidence.
+- Call inspect_raw_headroom before claiming RAW highlight recoverability or sensor clipping.
+- Call detect_scene_lighting_anchors before positioning directional radial or linear lighting masks; it returns a numbered [1..N] subject overlay with crest markers and ready-made lighting recipes.
+- When the user asks for artificial/directional lighting, spotlight, sunbeam, backlight, or window light, call detect_scene_lighting_anchors first, then call build_lighting_rig (selecting subject_id or target_box and light_direction) to construct an angled overhead key beam + inverted ambient falloff pair instead of hand-guessing tiny circles, then call propose_and_preview_trial and inspect the Before vs Trial comparison image. If refining an existing mask on a follow-up request, modify local_gradients.<id>.<param> rather than stacking duplicates.
+- Call analyze_color_zones to measure 8-band hue and CIELAB cast statistics, and search_editing_playbook for PhotoCoach-exact editing recipes.
+- When decision is recommend, call propose_and_preview_trial at least once before your final answer and inspect the rendered trial image for flat/grey blacks, color casts, clipping, or halos. If checks fail or visual artifacts appear, refine parameters and call propose_and_preview_trial again within your remaining turn budget.
+- Final answer: emit one JSON object with exactly these top-level keys: {_FINAL_SCHEMA_KEYS}. Keep actions aligned to your verified trial (or [] for stop/inspect/clarify). Emit it directly on the turn after your last tool result with no prose outside JSON.
 """
 
 
@@ -370,6 +426,16 @@ def _json_load(value):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON.")))
 
 
+def _extract_json_text(value: str) -> str:
+    """Strip optional Markdown ```json ... ``` fences around a JSON object reply."""
+    stripped = value.strip()
+    if stripped.startswith("```"):
+        match = re.match(r"^```(?:json)?\s*\r?\n(.*?)\r?\n?```\s*$", stripped, re.DOTALL | re.I)
+        if match:
+            return match.group(1).strip()
+    return stripped
+
+
 def _png_data_uri(pixels: np.ndarray) -> str:
     if (not isinstance(pixels, np.ndarray) or pixels.dtype != np.uint8 or pixels.ndim != 3 or
             pixels.shape[2] != 3 or not 0 < min(pixels.shape[:2]) <= max(pixels.shape[:2]) <= 768):
@@ -416,6 +482,7 @@ def _context(request: CoachRequest, include_before: bool) -> dict:
             "goal": request.goal, "question": request.question,
             "preview_statistics": {"source": "current reduced SDR preview",
                                    "mean_encoded_rgb": request.current_preview.mean(axis=(0, 1)).tolist()},
+            "application_evidence": evidence_context(request, include_before),
             "preview_description": "Reduced SDR sRGB preview(s), maximum 768 pixels per side.",
             "included_previews": ["before", "current"] if include_before else ["current"]}
 
@@ -788,6 +855,40 @@ def _token_count(usage: dict, name: str) -> int | None:
     return count if type(count) is int and count >= 0 else None
 
 
+def _parse_feedback_document(config: ApiConfig, request: CoachRequest, answer: Any,
+                             input_tokens: int | None, output_tokens: int | None) -> ApiResult:
+    if not isinstance(answer, dict) or set(answer) not in (
+            set(FEEDBACK_FIELDS), {*FEEDBACK_FIELDS, "actions"}, {*FEEDBACK_FIELDS, "actions", "workflow"}):
+        raise ValueError
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 1200 for value in (answer[key] for key in FEEDBACK_FIELDS)):
+        raise ValueError
+    notice = ""
+    try:
+        actions = resolve_actions(answer.get("actions", []), EditValues.from_dict(request.parameters), request.source_size)
+    except MaskCapacityError as error:
+        actions, notice = (), str(error)
+    plan = parse_plan(answer["workflow"]) if "workflow" in answer else None
+    if plan is None and actions:
+        actions, notice = (), "Legacy reply: readable only. Analyze again for an evidence-based trial before applying."
+    elif plan is not None:
+        policy = action_policy(plan, actions, request.goal, request.question)
+        if len(answer["actions"]) > 6:
+            policy = "Reduce the proposal to at most six explicit adjustments for one objective."
+        if policy:
+            actions, notice = (), policy
+    feedback = CoachFeedback(
+        photo_id=request.photo_id, session_id=request.session_id, state_version=request.state_version,
+        main_change=answer["main_change"].strip(), reason=answer["reason"].strip(),
+        next_step_or_stop=answer["next_step_or_stop"].strip(),
+        observe_and_stop_when=answer["observe_and_stop_when"].strip(),
+        evidence=("Observed: " + answer["observed"].strip(),
+                  "Inference: " + answer["inferred"].strip(),
+                  "Preference: " + answer["preference"].strip()),
+        source="AI · " + config.model, answer=answer["answer"].strip(), question=request.question,
+        actions=actions, action_notice=notice, agent_plan=plan)
+    return ApiResult(feedback, input_tokens, output_tokens)
+
+
 def _parse_response(config: ApiConfig, request: CoachRequest, body: bytes) -> ApiResult:
     try:
         if not isinstance(body, bytes) or len(body) > MAX_RESPONSE_BYTES:
@@ -854,26 +955,378 @@ def _parse_response(config: ApiConfig, request: CoachRequest, body: bytes) -> Ap
             answer = _json_load(message["content"])
             usage = document.get("usage") or {}
             input_tokens, output_tokens = _token_count(usage, "prompt_tokens"), _token_count(usage, "completion_tokens")
-        if not isinstance(answer, dict) or set(answer) not in (set(FEEDBACK_FIELDS), {*FEEDBACK_FIELDS, "actions"}):
+        return _parse_feedback_document(config, request, answer, input_tokens, output_tokens)
+    except ApiError:
+        raise
+    except (TypeError, ValueError, OverflowError, KeyError, AttributeError, IndexError, UnicodeError):
+        raise ApiError("invalid_response") from None
+
+
+@dataclass(frozen=True)
+class ModelTurnResponse:
+    tool_calls: tuple[Any, ...]
+    final_feedback: CoachFeedback | None
+    raw_assistant_message: dict[str, Any]
+    input_tokens: int | None
+    output_tokens: int | None
+    raw_text: str = ""
+    live_photo_response: bool = False
+
+
+def build_tool_turn_payload(config: ApiConfig, system_prompt: str, messages: list[dict[str, Any]],
+                            tools: list[Any] | tuple[Any, ...] = (), *, force_final_schema: bool = False) -> dict[str, Any]:
+    """Encode canonical multi-turn messages + optional tool schemas for any supported protocol."""
+    try:
+        use_tools = bool(tools) and not force_final_schema
+        if config.protocol == "gemini":
+            contents = []
+            for msg in messages:
+                role = msg["role"]
+                if role == "user":
+                    parts: list[dict[str, Any]] = []
+                    if msg.get("text"):
+                        parts.append({"text": msg["text"]})
+                    for label, pixels in msg.get("images", ()):
+                        parts.append({"text": label})
+                        parts.append({"inlineData": {
+                            "mimeType": "image/png",
+                            "data": _png_data_uri(pixels).split(",", 1)[1],
+                        }})
+                    contents.append({"role": "user", "parts": parts})
+                elif role == "assistant":
+                    contents.append({"role": "model", "parts": msg["raw_parts"]})
+                elif role == "tool_results":
+                    parts = []
+                    fallback_image_parts: list[dict[str, Any]] = []
+                    for r in msg["results"]:
+                        resp_obj = dict(r.payload)
+                        fn_parts = []
+                        if r.images:
+                            if r.call_id:
+                                refs = []
+                                for idx, img in enumerate(r.images):
+                                    ref_name = f"{r.name}_{r.call_id}_{idx}.png"
+                                    refs.append({"label": img.label, "image": {"$ref": ref_name}})
+                                    fn_parts.append({"inlineData": {
+                                        "mimeType": "image/png",
+                                        "data": _png_data_uri(img.pixels).split(",", 1)[1],
+                                        "displayName": ref_name,
+                                    }})
+                                resp_obj["attached_images"] = refs
+                            else:
+                                labels = []
+                                for img in r.images:
+                                    labels.append(img.label)
+                                    fallback_image_parts.append({"text": f"{r.name}: {img.label}"})
+                                    fallback_image_parts.append({"inlineData": {
+                                        "mimeType": "image/png",
+                                        "data": _png_data_uri(img.pixels).split(",", 1)[1],
+                                    }})
+                                resp_obj["attached_images"] = labels
+                        fr: dict[str, Any] = {"name": r.name, "response": resp_obj}
+                        if r.call_id:
+                            fr["id"] = r.call_id
+                        if fn_parts:
+                            fr["parts"] = fn_parts
+                        parts.append({"functionResponse": fr})
+                    parts.extend(fallback_image_parts)
+                    contents.append({"role": "user", "parts": parts})
+                else:
+                    raise ValueError("Unsupported message role.")
+            gen_config: dict[str, Any] = {"maxOutputTokens": config.max_output_tokens}
+            if force_final_schema:
+                gen_config["responseMimeType"] = "application/json"
+                gen_config["responseJsonSchema"] = FEEDBACK_SCHEMA
+            if config.model.startswith(("gemini-3.", "gemini-3-", "gemini-4")):
+                gen_config["thinkingConfig"] = {"thinkingLevel": "LOW"}
+            payload: dict[str, Any] = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": contents,
+                "store": False,
+                "generationConfig": gen_config,
+            }
+            if use_tools:
+                payload["tools"] = [{"functionDeclarations": [
+                    {"name": t.name, "description": t.description, "parametersJsonSchema": t.parameters}
+                    for t in tools
+                ]}]
+            return payload
+
+        if config.protocol == "responses":
+            input_items: list[dict[str, Any]] = []
+            for msg in messages:
+                role = msg["role"]
+                if role == "user":
+                    content = []
+                    if msg.get("text"):
+                        content.append({"type": "input_text", "text": msg["text"]})
+                    detail = "high" if msg.get("high_detail") else "low"
+                    for label, pixels in msg.get("images", ()):
+                        content.append({"type": "input_text", "text": label})
+                        content.append({"type": "input_image", "image_url": _png_data_uri(pixels), "detail": detail})
+                    input_items.append({"role": "user", "content": content})
+                elif role == "assistant":
+                    input_items.extend(msg["raw_output"])
+                elif role == "tool_results":
+                    extra_images = []
+                    for r in msg["results"]:
+                        input_items.append({
+                            "type": "function_call_output",
+                            "call_id": r.call_id,
+                            "output": json.dumps(r.payload, ensure_ascii=False, allow_nan=False),
+                        })
+                        extra_images.extend(r.images)
+                    if extra_images:
+                        img_content: list[dict[str, Any]] = [
+                            {"type": "input_text", "text": "Images returned by the tool calls above:"}
+                        ]
+                        for img in extra_images:
+                            img_content.append({"type": "input_text", "text": img.label})
+                            img_content.append({"type": "input_image", "image_url": _png_data_uri(img.pixels), "detail": "high"})
+                        input_items.append({"role": "user", "content": img_content})
+                else:
+                    raise ValueError("Unsupported message role.")
+            payload = {
+                "model": config.model,
+                "instructions": system_prompt,
+                "store": False,
+                "input": input_items,
+                "max_output_tokens": config.max_output_tokens,
+            }
+            if force_final_schema:
+                payload["text"] = {"format": {"type": "json_schema", "name": "photo_coach_feedback",
+                                              "strict": True, "schema": FEEDBACK_SCHEMA}}
+            if use_tools:
+                payload["tools"] = [
+                    {"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters}
+                    for t in tools
+                ]
+            return payload
+
+        if config.protocol == "ollama":
+            from .ollama_client import chat_payload
+            ollama_msgs: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+            for msg in messages:
+                role = msg["role"]
+                if role == "user":
+                    images = msg.get("images", ())
+                    entry: dict[str, Any] = {
+                        "role": "user",
+                        "content": (msg.get("text", "") +
+                                    ("\nImages in order: " + ", ".join(l for l, _ in images) if images else "")),
+                    }
+                    if images:
+                        entry["images"] = [_png_data_uri(px).split(",", 1)[1] for _, px in images]
+                    ollama_msgs.append(entry)
+                elif role == "assistant":
+                    ollama_msgs.append(msg["raw_message"])
+                elif role == "tool_results":
+                    extra_images = []
+                    for r in msg["results"]:
+                        ollama_msgs.append({
+                            "role": "tool",
+                            "tool_name": r.name,
+                            "content": json.dumps(r.payload, ensure_ascii=False, allow_nan=False),
+                        })
+                        extra_images.extend(r.images)
+                    if extra_images:
+                        ollama_msgs.append({
+                            "role": "user",
+                            "content": "Images returned by tools in order: " + ", ".join(img.label for img in extra_images),
+                            "images": [_png_data_uri(img.pixels).split(",", 1)[1] for img in extra_images],
+                        })
+                else:
+                    raise ValueError("Unsupported message role.")
+            ollama_tools = ([
+                {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}
+                for t in tools
+            ] if use_tools else None)
+            return chat_payload(config.model, ollama_msgs, FEEDBACK_SCHEMA if force_final_schema else None,
+                                output_tokens=config.max_output_tokens, tools=ollama_tools)
+
+        chat_msgs: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        for msg in messages:
+            role = msg["role"]
+            if role == "user":
+                content = []
+                if msg.get("text"):
+                    content.append({"type": "text", "text": msg["text"]})
+                detail = "high" if msg.get("high_detail") else "low"
+                for label, pixels in msg.get("images", ()):
+                    content.append({"type": "text", "text": label})
+                    content.append({"type": "image_url", "image_url": {"url": _png_data_uri(pixels), "detail": detail}})
+                chat_msgs.append({"role": "user", "content": content})
+            elif role == "assistant":
+                chat_msgs.append(msg["raw_message"])
+            elif role == "tool_results":
+                extra_images = []
+                for r in msg["results"]:
+                    chat_msgs.append({
+                        "role": "tool",
+                        "tool_call_id": r.call_id,
+                        "content": json.dumps(r.payload, ensure_ascii=False, allow_nan=False),
+                    })
+                    extra_images.extend(r.images)
+                if extra_images:
+                    img_content = [{"type": "text", "text": "Images returned by the tool calls above:"}]
+                    for img in extra_images:
+                        img_content.append({"type": "text", "text": img.label})
+                        img_content.append({"type": "image_url", "image_url": {"url": _png_data_uri(img.pixels), "detail": "high"}})
+                    chat_msgs.append({"role": "user", "content": img_content})
+            else:
+                raise ValueError("Unsupported message role.")
+        payload = {
+            "model": config.model,
+            "store": False,
+            "messages": chat_msgs,
+            "max_completion_tokens": config.max_output_tokens,
+        }
+        if force_final_schema:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "photo_coach_feedback", "strict": True, "schema": FEEDBACK_SCHEMA}}
+        if use_tools:
+            payload["tools"] = [
+                {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}
+                for t in tools
+            ]
+        return payload
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError):
+        raise ApiError("input") from None
+
+
+def parse_tool_turn_response(config: ApiConfig, request: CoachRequest, body: bytes,
+                             *, allow_tools: bool = True, require_schema: bool = False) -> ModelTurnResponse:
+    """Parse either tool calls or final feedback across all 4 protocols."""
+    from .agent_tools import ToolCall
+    try:
+        if not isinstance(body, bytes) or len(body) > MAX_RESPONSE_BYTES:
             raise ValueError
-        if any(not isinstance(value, str) or not value.strip() or len(value) > 1200 for value in (answer[key] for key in FEEDBACK_FIELDS)):
+        document = _json_load(body)
+        calls: list[ToolCall] = []
+        texts: list[str] = []
+        raw_assistant: dict[str, Any]
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+
+        if config.protocol == "ollama":
+            from .ollama_client import chat_result, LocalError
+            try:
+                document = chat_result(document, allow_tool_calls=allow_tools)
+            except LocalError:
+                raise ValueError from None
+            message = document["message"]
+            raw_assistant = {"role": "assistant", "raw_message": message}
+            if isinstance(message.get("content"), str) and message["content"].strip():
+                texts.append(message["content"])
+            for idx, tc in enumerate(message.get("tool_calls") or ()):
+                fn = tc["function"]
+                raw_args = fn["arguments"]
+                args = _json_load(raw_args) if isinstance(raw_args, str) else raw_args
+                if not isinstance(args, dict):
+                    raise ValueError
+                calls.append(ToolCall(str(tc.get("id") or f"call_{idx}"), fn["name"], args))
+            input_tokens = _token_count(document, "prompt_eval_count")
+            output_tokens = _token_count(document, "eval_count")
+
+        elif config.protocol == "gemini":
+            if document.get("error") or document.get("promptFeedback", {}).get("blockReason"):
+                raise ValueError
+            candidates = document["candidates"]
+            if len(candidates) == 1 and candidates[0].get("finishReason") == "MAX_TOKENS":
+                raise ApiError("output_limit")
+            if len(candidates) != 1 or candidates[0].get("finishReason") != "STOP":
+                raise ValueError
+            parts = candidates[0]["content"]["parts"]
+            raw_assistant = {"role": "assistant", "raw_parts": parts}
+            for idx, part in enumerate(parts):
+                if part.get("thought") is True:
+                    continue
+                if "functionCall" in part:
+                    if not allow_tools:
+                        raise ValueError
+                    fc = part["functionCall"]
+                    name = fc["name"]
+                    args = fc.get("args", {})
+                    if not isinstance(name, str) or not isinstance(args, dict):
+                        raise ValueError
+                    calls.append(ToolCall(str(fc.get("id") or ""), name, args))
+                elif isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+                else:
+                    raise ValueError
+            usage = document.get("usageMetadata") or {}
+            input_tokens = _token_count(usage, "promptTokenCount")
+            candidate_tokens = _token_count(usage, "candidatesTokenCount")
+            thought_tokens = _token_count(usage, "thoughtsTokenCount") if "thoughtsTokenCount" in usage else 0
+            output_tokens = candidate_tokens + thought_tokens if candidate_tokens is not None and thought_tokens is not None else None
+
+        elif config.protocol == "responses":
+            if document.get("status") != "completed" or document.get("error") or document.get("incomplete_details"):
+                raise ValueError
+            output_items = document["output"]
+            raw_assistant = {"role": "assistant", "raw_output": output_items}
+            for idx, item in enumerate(output_items):
+                kind = item.get("type")
+                if kind == "function_call":
+                    if not allow_tools:
+                        raise ValueError
+                    raw_args = item.get("arguments", "{}")
+                    args = _json_load(raw_args) if isinstance(raw_args, str) else raw_args
+                    if not isinstance(item.get("name"), str) or not isinstance(args, dict):
+                        raise ValueError
+                    call_id = str(item.get("call_id") or item.get("id") or f"call_{idx}")
+                    calls.append(ToolCall(call_id, item["name"], args))
+                elif kind == "message":
+                    if item.get("status", "completed") != "completed":
+                        raise ValueError
+                    for part in item["content"]:
+                        if part.get("type") != "output_text" or not isinstance(part.get("text"), str):
+                            raise ValueError
+                        texts.append(part["text"])
+                elif kind != "reasoning":
+                    raise ValueError
+            usage = document.get("usage") or {}
+            input_tokens, output_tokens = _token_count(usage, "input_tokens"), _token_count(usage, "output_tokens")
+
+        else:
+            if len(document["choices"]) != 1:
+                raise ValueError
+            choice = document["choices"][0]
+            message = choice["message"]
+            reasons = ("stop", "tool_calls") if allow_tools else ("stop",)
+            if choice.get("finish_reason") not in reasons or message.get("refusal"):
+                raise ValueError
+            raw_assistant = {"role": "assistant", "raw_message": message}
+            if isinstance(message.get("content"), str) and message["content"].strip():
+                texts.append(message["content"])
+            for idx, tc in enumerate(message.get("tool_calls") or ()):
+                if not allow_tools:
+                    raise ValueError
+                fn = tc["function"]
+                raw_args = fn.get("arguments", "{}")
+                args = _json_load(raw_args) if isinstance(raw_args, str) else raw_args
+                if not isinstance(fn.get("name"), str) or not isinstance(args, dict):
+                    raise ValueError
+                calls.append(ToolCall(str(tc.get("id") or f"call_{idx}"), fn["name"], args))
+            usage = document.get("usage") or {}
+            input_tokens, output_tokens = _token_count(usage, "prompt_tokens"), _token_count(usage, "completion_tokens")
+
+        if calls:
+            return ModelTurnResponse(tuple(calls), None, raw_assistant, input_tokens, output_tokens, "".join(texts))
+
+        joined = "".join(texts).strip()
+        if not joined:
             raise ValueError
-        notice = ""
         try:
-            actions = resolve_actions(answer.get("actions", []), EditValues.from_dict(request.parameters), request.source_size)
-        except MaskCapacityError as error:
-            actions, notice = (), str(error)
-        feedback = CoachFeedback(
-            photo_id=request.photo_id, session_id=request.session_id, state_version=request.state_version,
-            main_change=answer["main_change"].strip(), reason=answer["reason"].strip(),
-            next_step_or_stop=answer["next_step_or_stop"].strip(),
-            observe_and_stop_when=answer["observe_and_stop_when"].strip(),
-            evidence=("Observed: " + answer["observed"].strip(),
-                      "Inference: " + answer["inferred"].strip(),
-                      "Preference: " + answer["preference"].strip()),
-            source="AI · " + config.model, answer=answer["answer"].strip(), question=request.question,
-            actions=actions, action_notice=notice)
-        return ApiResult(feedback, input_tokens, output_tokens)
+            answer = _json_load(_extract_json_text(joined))
+            parsed = _parse_feedback_document(config, request, answer, input_tokens, output_tokens)
+            return ModelTurnResponse((), parsed.feedback, raw_assistant, input_tokens, output_tokens, joined)
+        except (ValueError, TypeError, KeyError):
+            if require_schema:
+                raise
+            return ModelTurnResponse((), None, raw_assistant, input_tokens, output_tokens, joined)
+    except ApiError:
+        raise
     except (TypeError, ValueError, OverflowError, KeyError, AttributeError, IndexError, UnicodeError):
         raise ApiError("invalid_response") from None
 
@@ -892,6 +1345,7 @@ class ApiCoach:
     config: ApiConfig
     api_key: str = field(repr=False)
     transport: Transport | None = field(default=None, repr=False)
+    supports_tools: bool = True
 
     def __post_init__(self):
         if self.config.protocol != "ollama":
@@ -899,13 +1353,8 @@ class ApiCoach:
         elif self.api_key:
             raise ApiError("configuration")
 
-    def analyze(self, request: CoachRequest, *, cancel_event: threading.Event | None = None,
-                include_before: bool = True, progress: TransportProgress | None = None) -> ApiResult:
-        cancel_event = cancel_event if cancel_event is not None else threading.Event()
-        if cancel_event.is_set():
-            raise ApiError("cancelled")
-        payload = json.dumps(build_payload(self.config, request, include_before=include_before),
-                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+    def _dispatch(self, payload: bytes, cancel_event: threading.Event,
+                  progress: TransportProgress | None) -> tuple[int, bytes]:
         try:
             if self.transport is not None:
                 status, body = self.transport(self.config, self.api_key, payload, cancel_event)
@@ -913,7 +1362,7 @@ class ApiCoach:
                 from .ollama_client import exchange
                 if progress:
                     progress.begin()
-                    progress.advance("waiting")
+                    progress.advance("local_running")
                 status, body = 200, json.dumps(exchange("/api/chat", json.loads(payload),
                     cancel=cancel_event, timeout=self.config.timeout_seconds)).encode()
             else:
@@ -930,5 +1379,34 @@ class ApiCoach:
             code = ("authentication" if status in (401, 403) else "rate_limit" if status == 429 else
                     "unavailable" if 500 <= status < 600 else "http_error")
             raise ApiError(code, http_status=status)
+        return status, body
+
+    def analyze(self, request: CoachRequest, *, cancel_event: threading.Event | None = None,
+                include_before: bool = True, progress: TransportProgress | None = None) -> ApiResult:
+        cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        if cancel_event.is_set():
+            raise ApiError("cancelled")
+        payload = json.dumps(build_payload(self.config, request, include_before=include_before),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+        _, body = self._dispatch(payload, cancel_event, progress)
         result = _parse_response(self.config, request, body)
         return replace(result, live_photo_response=self.transport is None and _https_transport is _PRODUCTION_TRANSPORT)
+
+    def step(self, request: CoachRequest, system_prompt: str, messages: list[dict[str, Any]],
+             tools: list[Any] | tuple[Any, ...] = (), *, cancel_event: threading.Event | None = None,
+             progress: TransportProgress | None = None, force_final_schema: bool = False) -> ModelTurnResponse:
+        cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        if cancel_event.is_set():
+            raise ApiError("cancelled")
+        payload = json.dumps(
+            build_tool_turn_payload(self.config, system_prompt, messages, tools,
+                                    force_final_schema=force_final_schema),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        _, body = self._dispatch(payload, cancel_event, progress)
+        response = parse_tool_turn_response(
+            self.config, request, body,
+            allow_tools=bool(tools) and not force_final_schema,
+            require_schema=force_final_schema,
+        )
+        return replace(response, live_photo_response=self.transport is None and _https_transport is _PRODUCTION_TRANSPORT)

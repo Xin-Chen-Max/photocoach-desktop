@@ -18,9 +18,10 @@ class LensEditor(QWidget):
         self.values = LensCorrections()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        note = QLabel('Manual correction')
-        note.setToolTip('No lens profile or automatic calibration. Distortion trims the edges with a centered safe scale; crop output dimensions stay unchanged.')
-        layout.addWidget(note)
+        self.note = QLabel('Manual correction')
+        self.note.setProperty("secondary", True)
+        self.note.setToolTip('No lens profile or automatic calibration. Distortion trims the edges with a centered safe scale; crop output dimensions stay unchanged.')
+        layout.addWidget(self.note)
         self.sliders, self.labels = {}, {}
         for name, title, limit in (('distortion', 'Distortion', 100), ('vignetting_ev', 'Vignetting', 200)):
             label = ParameterLabel()
@@ -36,6 +37,7 @@ class LensEditor(QWidget):
             layout.addWidget(label)
             layout.addWidget(slider)
         self.reset = QPushButton('Reset lens corrections')
+        self.reset.setProperty("compact", True)
         self.reset.clicked.connect(lambda: self.resetRequested.emit(LensCorrections()))
         layout.addWidget(self.reset)
         self.set_values(self.values)

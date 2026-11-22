@@ -16,7 +16,16 @@ from photocoach.app import MainWindow
 from photocoach.budget import SessionBudget
 from photocoach.coach import CoachFeedback
 from photocoach.coach_ui import ApiSettingsDialog, budget_text
-from photocoach.coach_view import CoachOutput, CoachResponsePanel, related_control, usage_summary
+from photocoach.coach_view import (
+    CoachOutput,
+    CoachResponsePanel,
+    _display_text,
+    agent_trace_summary,
+    format_agent_step_line,
+    format_live_agent_step,
+    related_control,
+    usage_summary,
+)
 from photocoach.settings import ApiSettings, SettingsStore
 
 
@@ -490,3 +499,161 @@ def test_switching_known_interfaces_updates_default_endpoint_only(application, t
     assert dialog.endpoint.text() == "https://example.invalid/custom"
     dialog.reject()
     dialog.deleteLater()
+
+
+def test_display_text_collapses_duplicate_control_labels_and_keeps_notes():
+    assert _display_text("Drag Exposure (exposure_ev) up to +2.20 EV") == "Drag Exposure up to +2.20 EV"
+    assert _display_text("Drag Exposure (Exposure) up to +2.20 EV") == "Drag Exposure up to +2.20 EV"
+    assert _display_text("Check White balance (white_balance) warmth") == "Check White balance warmth"
+    assert _display_text("Use RGB curve (RGB curve) gently") == "Use RGB curve gently"
+    assert _display_text("Adjust Exposure (about +0.3 EV)") == "Adjust Exposure (about +0.3 EV)"
+
+
+def test_agent_v2_badge_visible_in_coach_output_and_trial_dialog(application):
+    import numpy as np
+    from photocoach.agent_runtime import TraceSpan
+    from photocoach.coach_agent import AgentPlan, AgentReport, Finding
+
+    spans = (
+        TraceSpan(0, "observe", "context_ready", 0.0, 2.0, "ok"),
+        TraceSpan(1, "reason", "turn_1_tool_plan", 2.0, 120.0, "ok"),
+        TraceSpan(2, "tool_call", "inspect_region_100pct", 122.0, 45.0, "ok"),
+        TraceSpan(3, "reason", "turn_2_tool_plan", 167.0, 110.0, "ok"),
+        TraceSpan(4, "trial_render", "propose_and_preview_trial", 277.0, 35.0, "ok"),
+        TraceSpan(5, "reflect", "trial_1_check", 312.0, 1.0, "blocked"),
+        TraceSpan(6, "reason", "turn_3_tool_plan", 313.0, 115.0, "ok"),
+        TraceSpan(7, "trial_render", "propose_and_preview_trial", 428.0, 32.0, "ok"),
+        TraceSpan(8, "reflect", "trial_2_check", 460.0, 1.0, "ok"),
+        TraceSpan(9, "reason", "turn_4_final", 461.0, 95.0, "ok"),
+        TraceSpan(10, "finalize", "ready_for_user", 556.0, 1.0, "ok"),
+    )
+    summary_en = agent_trace_summary(spans, zh=False)
+    assert "Agent v2" in summary_en and "repaired" in summary_en
+    assert agent_trace_summary((), zh=False) == ""
+
+    preview = np.full((32, 48, 3), 90, dtype=np.uint8)
+    plan = AgentPlan(
+        "recommend", "Lift underexposed seals carefully.",
+        (Finding("center", "Midtones are dim.", "Lift exposure safely.", "technical", "medium"),),
+        (), "Noise increases when lifting shadows.",
+    )
+    report = AgentReport("review", True, (), (("Trial checked.", "试调已校验。"),), ("observe", "trial"), preview, preview)
+
+    panel = CoachResponsePanel()
+    panel.output.show_feedback(feedback(
+        next_step_or_stop="1. Drag Exposure (exposure_ev) up to +2.20 EV.",
+        agent_plan=plan,
+        agent_report=report,
+        agent_trace=spans,
+    ))
+    text_en = panel.output.toPlainText()
+    assert not panel.output.evidence_expanded
+    assert "Agent v2" in text_en
+    assert text_en.index("Agent v2") < text_en.index("Suggestion")
+    assert "Drag Exposure up to +2.20 EV" in text_en
+    assert "Exposure (Exposure)" not in text_en
+
+    panel.open_trial()
+    assert "Agent v2" in panel.trial_report.toPlainText()
+
+    panel.set_language("zh")
+    text_zh = panel.output.toPlainText()
+    assert "智能体 v2" in text_zh and "已自修复" in text_zh
+    assert "智能体 v2" in panel.trial_report.toPlainText()
+
+    panel.output.show_feedback(feedback(agent_trace=()))
+    assert "Agent v2" not in panel.output.toPlainText()
+    panel.trial.hide()
+    panel.deleteLater()
+
+
+def test_agent_trace_tree_collapses_and_expands_on_click_in_en_and_zh(application):
+    from photocoach.agent_runtime import TraceSpan
+
+    spans = (
+        TraceSpan(0, "observe", "context_ready", 0.0, 2.0, "ok", detail={"tools": 6}),
+        TraceSpan(1, "reason", "turn_1_tool_plan", 2.0, 120.0, "ok", detail={"calls": ["inspect_region_100pct"]}),
+        TraceSpan(2, "tool_call", "inspect_region_100pct", 122.0, 45.0, "ok", detail={"x_norm": 0.48, "y_norm": 0.52}),
+        TraceSpan(3, "reason", "turn_2_tool_plan", 167.0, 110.0, "ok", detail={"calls": ["propose_and_preview_trial"]}),
+        TraceSpan(4, "trial_render", "propose_and_preview_trial", 277.0, 35.0, "ok", detail={"params": ["exposure_ev", "shadows"]}),
+        TraceSpan(5, "reflect", "trial_1_check", 312.0, 1.0, "ok", detail={"passed": True, "needs_repair": False}),
+        TraceSpan(6, "reason", "turn_3_final", 313.0, 95.0, "ok"),
+        TraceSpan(7, "finalize", "ready_for_user", 408.0, 2.0, "ok"),
+    )
+    assert "Inspected 100% native RAW crop at (0.48, 0.52)" in format_agent_step_line(spans[2], zh=False)
+    assert "查验 100% 原生局部细节 (0.48, 0.52)" in format_agent_step_line(spans[2], zh=True)
+
+    panel = CoachResponsePanel()
+    panel.output.show_feedback(feedback(agent_trace=spans))
+    assert not panel.output.trace_expanded
+    collapsed_en = panel.output.toPlainText()
+    assert "▸" in collapsed_en and "Worked for" in collapsed_en
+    assert "Inspected 100% native RAW crop" not in collapsed_en
+
+    # Click disclosure link to expand hierarchical timeline
+    panel.output.anchorClicked.emit(QUrl("photocoach:trace"))
+    assert panel.output.trace_expanded
+    expanded_en = panel.output.toPlainText()
+    assert "▾" in expanded_en
+    assert "Prepared photo previews & editing context" in expanded_en
+    assert "Inspected 100% native RAW crop at (0.48, 0.52)" in expanded_en
+    assert "Rendered sandbox trial preview (Exposure, Shadows)" in expanded_en
+    assert "Verified trial quality checks · Passed" in expanded_en
+    assert "Finalized verified coaching advice" in expanded_en
+    assert expanded_en.index("Finalized verified coaching advice") < expanded_en.index("Suggestion")
+
+    # Language switch updates expanded steps in place
+    panel.set_language("zh")
+    expanded_zh = panel.output.toPlainText()
+    assert "耗时" in expanded_zh
+    assert "查验 100% 原生局部细节 (0.48, 0.52)" in expanded_zh
+    assert "渲染沙盒试调预览（Exposure, Shadows）" in expanded_zh
+    assert "核验试调质量指标 · 通过" in expanded_zh
+
+    # Clicking again collapses cleanly
+    panel.output.anchorClicked.emit(QUrl("photocoach:trace"))
+    assert not panel.output.trace_expanded
+    assert "查验 100% 原生局部细节" not in panel.output.toPlainText()
+    panel.deleteLater()
+
+
+def test_live_progress_renders_completed_spans_and_active_step_in_main_window(application, tmp_path):
+    from photocoach.agent_runtime import AgentProgress, TraceSpan
+    from photocoach.app import Job
+    from photocoach.api_coach import ApiConfig, GEMINI_ENDPOINT
+    from photocoach.settings import ApiSettings
+    import threading
+
+    active_step, hint = format_live_agent_step(2, 3, "propose_and_preview_trial", "exposure_ev, shadows", "waiting", zh=False)
+    assert "Turn 2/3 · Running sandbox trial (Exposure, Shadows)" in active_step
+    assert "Executing local diagnostic tool" in hint
+
+    window = MainWindow(settings_store=SettingsStore(tmp_path / "settings.json"), credentials=NoVault())
+    state = window.store.activate(Path("synthetic.ARW"), "photo-a")
+    window._set_controls(True)
+    window.api_settings = ApiSettings(ApiConfig(GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini"), {}, key_source="saved")
+    window.coach_mode.setCurrentIndex(1)
+
+    progress = AgentProgress(max_turns=3)
+    progress.advance("waiting")
+    progress.record_spans((
+        TraceSpan(0, "observe", "context_ready", 0.0, 2.0, "ok"),
+        TraceSpan(1, "reason", "turn_1_tool_plan", 2.0, 90.0, "ok", detail={"calls": ["inspect_region_100pct"]}),
+        TraceSpan(2, "tool_call", "inspect_region_100pct", 92.0, 42.0, "ok", detail={"x_norm": 0.45, "y_norm": 0.55}),
+    ))
+    progress.set_agent_step(2, 3, "propose_and_preview_trial", detail="exposure_ev, shadows")
+    cancel = threading.Event()
+    job = Job("api_prepare", window._generation, lambda: None, state, window._coach_generation)
+    window._network_active = (None, job, cancel, None)
+    window._network_progress = (progress, 60)
+
+    window._update_network_progress()
+    live_text = window.coach_text.toPlainText()
+    assert "Analyzing selected previews" in live_text
+    assert "Inspected 100% native RAW crop at (0.45, 0.55)" in live_text
+    assert "Turn 2/3 · Running sandbox trial (Exposure, Shadows)" in live_text
+
+    window._network_active = window._network_progress = None
+    window._close_approved = True
+    window.close()
+    window.deleteLater()

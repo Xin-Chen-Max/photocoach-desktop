@@ -77,10 +77,11 @@ def test_payload_images_context_and_result_binding(coach_request, protocol, incl
 
 @pytest.mark.parametrize("protocol", ["responses", "chat_completions", "gemini"])
 @pytest.mark.parametrize("question", ["具体怎么调整rgb？", "How do I adjust the RGB curve?"])
-def test_question_and_actionable_answer_survive_all_adapters(coach_request, protocol, question):
+def test_question_and_actionable_answer_survive_all_adapters(coach_request, protocol, question, agent_workflow):
     request = replace(coach_request, question=question)
     answer = {name: "No new visible comparison is established." for name in api.FEEDBACK_FIELDS}
     answer["actions"] = [{"operation": "add", "parameter": "exposure_ev", "value": 0.35}]
+    answer["workflow"] = agent_workflow
     answer["answer"] = "这里先按 RGB 总曲线解释；它同时影响三个通道，不是分通道调色。\n先保留黑白端点，再尝试小幅抬高中间调。"
     answer["next_step_or_stop"] = "1. 在 RGB curve 中双击添加中间控制点。\n2. 向上小幅拖动；如果失去层次，用 Undo 撤销。"
     captured = []
@@ -292,3 +293,64 @@ def test_gemini_3_and_4_models_use_low_thinking_level_to_prevent_timeout(coach_r
     config = api.ApiConfig(endpoint=api.GEMINI_ENDPOINT, model=model, protocol="gemini", max_output_tokens=8192)
     payload = api.build_payload(config, coach_request)
     assert payload["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "LOW"}
+
+
+def test_agent_instructions_strip_v1_single_shot_prohibitions_and_specify_schema():
+    assert "You do not see that trial" in api.COACH_INSTRUCTIONS
+    assert "No second\nmodel request" in api.COACH_INSTRUCTIONS
+    assert "You do not see that trial" not in api.AGENT_INSTRUCTIONS
+    assert "No second\nmodel request" not in api.AGENT_INSTRUCTIONS
+    assert "do not propose Detail changes from these previews" not in api.AGENT_INSTRUCTIONS
+    assert "inspect_region_100pct" in api.AGENT_INSTRUCTIONS
+    assert "propose_and_preview_trial" in api.AGENT_INSTRUCTIONS
+    for key in (*api.FEEDBACK_FIELDS, "actions", "workflow"):
+        assert key in api.AGENT_INSTRUCTIONS
+
+
+def test_parse_tool_turn_response_strips_markdown_json_fences(coach_request):
+    config = api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini")
+    doc = {field: "Observed midtone response." for field in api.FEEDBACK_FIELDS}
+    doc["actions"] = []
+    doc["workflow"] = {
+        "version": 1, "decision": "stop", "objective": "No edit needed.",
+        "findings": [{"region": "whole", "observation": "Balanced.", "interpretation": "Keep as is.",
+                      "category": "technical", "confidence": "high"}],
+        "checks": [{"region": "whole", "metric": "visual", "direction": "visual", "expectation": "Check balance."}],
+        "uncertainty": "Reduced preview only.",
+    }
+    fenced = "```json\n" + json.dumps(doc, ensure_ascii=False) + "\n```"
+    body = json.dumps({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": fenced}]}}]}).encode()
+    resp = api.parse_tool_turn_response(config, coach_request, body, allow_tools=True, require_schema=False)
+    assert resp.final_feedback is not None
+    assert resp.final_feedback.agent_plan is not None
+    assert resp.final_feedback.agent_plan.decision == "stop"
+
+
+def test_gemini_tool_without_id_omits_fake_id_and_uses_standard_inline_parts(coach_request):
+    from photocoach.agent_tools import ToolImage, ToolResult
+    config = api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini")
+    tool_body = json.dumps({
+        "candidates": [{"finishReason": "STOP", "content": {"parts": [
+            {"functionCall": {"name": "inspect_region_100pct", "args": {"x_norm": 0.5, "y_norm": 0.5}}}
+        ]}}],
+    }).encode()
+    parsed = api.parse_tool_turn_response(config, coach_request, tool_body, allow_tools=True)
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].call_id == ""
+
+    crop = np.full((32, 32, 3), 80, dtype=np.uint8)
+    payload = api.build_tool_turn_payload(
+        config, api.AGENT_INSTRUCTIONS,
+        [
+            {"role": "user", "text": "check detail"},
+            parsed.raw_assistant_message,
+            {"role": "tool_results", "results": [
+                ToolResult("", "inspect_region_100pct", True, {"ok": True},
+                           images=(ToolImage("100% crop", crop),)),
+            ]},
+        ],
+    )
+    user_parts = payload["contents"][2]["parts"]
+    fr = user_parts[0]["functionResponse"]
+    assert "id" not in fr and "parts" not in fr
+    assert any("inlineData" in p for p in user_parts[1:])

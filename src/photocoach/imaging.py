@@ -376,6 +376,12 @@ def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
                     0.14,
                     1.42,
                 ).astype(np.float32)
+                # Pointwise shadow-aware blend: when a local mask adds positive local shadow lift
+                # (e.g., 3D spotlight on dark foreground subjects), lift the dark-surface gate floor
+                # without disturbing mountain/snow masks (local_sh == 0) or strip invariance.
+                local_sh = np.maximum(np.float32(0.0), sh_field - np.float32(shadows))
+                sh_boost = np.clip(local_sh * np.float32(2.2), 0.0, 0.85)
+                surf_gate = (surf_gate * (np.float32(1.0) - sh_boost) + np.float32(0.96) * sh_boost).astype(np.float32)
                 light_mask = (sky_gate * hl_guard * surf_gate).astype(np.float32)
                 eff_ev = np.where((ev_field > 0) & (w_block > 0), ev_field * light_mask, ev_field).astype(np.float32)
                 eff_w = np.where(
@@ -531,6 +537,17 @@ class DecodedCache:
         with self._lock:
             while self._entries and self.retained_bytes > max_bytes:
                 self._drop_oldest()
+
+    def peek_loaded(self, photo_id: str, options: RawOptions) -> DecodedPhoto | None:
+        """Return an already-decoded cached entry for (photo_id, options) without disk I/O."""
+        with self._lock:
+            fallback = None
+            for photo in reversed(self._entries.values()):
+                if photo.metadata.get("sha256") == photo_id and photo.options == options:
+                    if photo.half_size:
+                        return photo
+                    fallback = photo
+            return fallback
 
     def get(self, path: str | Path, options: RawOptions = RawOptions(), *, half_size: bool = True,
             expected_bytes: int = 0, before_decode=None) -> DecodedPhoto:

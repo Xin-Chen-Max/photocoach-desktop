@@ -27,6 +27,8 @@ flowchart LR
 | Controls | `curve.py`, `composition_ui.py`, `lens_ui.py`, `detail_ui.py`, `color_mixer_ui.py`, `gradient_ui.py`, `gradient_view.py`, `white_balance.py`, `edit_controls.py` | Parameter interaction and source-coordinate handles/picking |
 | Persistence | `project.py`, `safe_io.py` | Versioned projects, migration/replay, hashing and atomic protected writes |
 | Coach | `coach.py`, `api_coach.py`, `coach_actions.py`, `coach_view.py`, `coach_ui.py`, `auto_coach.py`, `devmode.py` | Context, provider protocols, action validation, display and developer mock |
+| Agent Kernel | `agent_runtime.py`, `coach_agent.py`, `agent_tools.py`, `agent_memory.py`, `agent_eval.py` | Bounded ReAct loop (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`), visual reflexion criticism, active 1:1 and CFA tools, BM25 Playbook RAG, and eval benchmark |
+| MCP & Telemetry | `mcp_server.py`, `telemetry.py` | Model Context Protocol stdio server (`2025-06-18`), structured audit logs, and OpenTelemetry spans |
 | Connections | `connections.py`, `settings.py`, `credentials.py`, `model_catalog.py`, `budget.py`, `text_probe.py`, `models.py` | Nonsecret settings, explicit credential sources, catalogs, budgets and compatibility names |
 | Local AI | `ollama_client.py`, `local_runtime.py`, `local_models_ui.py` | Fixed loopback protocol, owned process, model preparation and cancellation |
 

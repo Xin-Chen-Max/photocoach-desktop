@@ -28,12 +28,12 @@ class DetailEditor(QWidget):
         self.values = DetailControls()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        note = QLabel("Inspect at 100% · Luminance USM and color NR")
-        note.setProperty("secondary", True)
-        note.setToolTip(
-            "Detail controls operate on encoded luminance and opponent chroma with 6-pixel strip halo padding so 100% previews and exports match."
+        self.note = QLabel("Inspect at 100% · Luminance USM and color NR")
+        self.note.setProperty("secondary", True)
+        self.note.setToolTip(
+            "Detail controls operate on encoded luminance and opponent chroma with 20-pixel strip halo padding so 100% previews and exports match."
         )
-        layout.addWidget(note)
+        layout.addWidget(self.note)
         self.sliders: dict[str, EditSlider] = {}
         self.labels: dict[str, ParameterLabel] = {}
         for name, title, tooltip in DETAIL_SLIDERS:
@@ -52,11 +52,13 @@ class DetailEditor(QWidget):
         actions = QHBoxLayout()
         actions.setSpacing(6)
         self.preset = QPushButton("Camera Raw preset")
+        self.preset.setProperty("compact", True)
         self.preset.setToolTip(
             "Apply calibrated baseline detail (Sharpening 40, Edge masking 10, Color NR 25). One Undo step."
         )
         self.preset.clicked.connect(lambda: self.resetRequested.emit(CAMERA_RAW_DETAIL))
         self.reset = QPushButton("Reset detail")
+        self.reset.setProperty("compact", True)
         self.reset.setToolTip("Reset all detail and noise reduction sliders to 0. One Undo step.")
         self.reset.clicked.connect(lambda: self.resetRequested.emit(DetailControls()))
         actions.addWidget(self.preset, 1)

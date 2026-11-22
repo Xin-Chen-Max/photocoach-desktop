@@ -8,7 +8,7 @@ import numpy as np
 
 from .scratch import Scratch
 
-DETAIL_HALO_PX = 6
+DETAIL_HALO_PX = 20
 
 
 @dataclass(frozen=True)
@@ -80,8 +80,65 @@ def _sep_conv_5(plane: np.ndarray) -> np.ndarray:
     return v.astype(np.float32, copy=False)
 
 
+def _box_mean_stack(stack: np.ndarray, radius: int) -> np.ndarray:
+    """Fast shift-invariant edge-clamped 2D box average on a (N, H, W) float32 stack."""
+    if radius <= 0:
+        return stack
+    _, h, w = stack.shape
+    inv = np.float32(1.0 / (2 * radius + 1))
+    px = np.pad(stack, ((0, 0), (0, 0), (radius, radius)), mode="edge")
+    acc = px[:, :, :w].copy()
+    for k in range(1, 2 * radius + 1):
+        acc += px[:, :, k : k + w]
+    acc *= inv
+    py = np.pad(acc, ((0, 0), (radius, radius), (0, 0)), mode="edge")
+    out = py[:, :h, :].copy()
+    for k in range(1, 2 * radius + 1):
+        out += py[:, k : k + h, :]
+    out *= inv
+    return out
+
+
+def _box_mean(plane: np.ndarray, radius: int) -> np.ndarray:
+    return _box_mean_stack(plane[None, ...], radius)[0]
+
+
+def _guided_filter_pair(
+    guide: np.ndarray,
+    src1: np.ndarray,
+    src2: np.ndarray | None,
+    radius: int,
+    eps: float | np.ndarray,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Batched Kaiming He guided filter for 1 or 2 targets sharing a guide (support radius = 2 * radius)."""
+    if src2 is None:
+        means = _box_mean_stack(np.stack([guide, guide * guide, src1, guide * src1], axis=0), radius)
+        mean_i, mean_ii, mean_p1, mean_ip1 = means
+        var_i = np.maximum(np.float32(0.0), mean_ii - mean_i * mean_i)
+        denom = var_i + eps + np.float32(1e-12)
+        a1 = (mean_ip1 - mean_i * mean_p1) / denom
+        b1 = mean_p1 - a1 * mean_i
+        ab = _box_mean_stack(np.stack([a1, b1], axis=0), radius)
+        return (ab[0] * guide + ab[1]).astype(np.float32, copy=False), None, var_i
+    means = _box_mean_stack(
+        np.stack([guide, guide * guide, src1, src2, guide * src1, guide * src2], axis=0),
+        radius,
+    )
+    mean_i, mean_ii, mean_p1, mean_p2, mean_ip1, mean_ip2 = means
+    var_i = np.maximum(np.float32(0.0), mean_ii - mean_i * mean_i)
+    denom = var_i + eps + np.float32(1e-12)
+    a1 = (mean_ip1 - mean_i * mean_p1) / denom
+    b1 = mean_p1 - a1 * mean_i
+    a2 = (mean_ip2 - mean_i * mean_p2) / denom
+    b2 = mean_p2 - a2 * mean_i
+    ab = _box_mean_stack(np.stack([a1, b1, a2, b2], axis=0), radius)
+    out1 = (ab[0] * guide + ab[1]).astype(np.float32, copy=False)
+    out2 = (ab[2] * guide + ab[3]).astype(np.float32, copy=False)
+    return out1, out2, var_i
+
+
 def _detail_patch(srgb: np.ndarray, detail: DetailControls) -> np.ndarray:
-    """Apply opponent chroma NR, wavelet luminance NR, and edge-masked luminance USM on one patch."""
+    """Apply 2-scale chroma NR, shadow-adaptive luma NR, and edge-masked dual-band USM on one patch."""
     r = srgb[..., 0]
     g = srgb[..., 1]
     b = srgb[..., 2]
@@ -90,52 +147,91 @@ def _detail_patch(srgb: np.ndarray, detail: DetailControls) -> np.ndarray:
     cb = (b - y0).astype(np.float32)
     y = y0
 
-    if detail.chroma_nr > 0 or (detail.sharpening > 0 and detail.masking > 0):
-        yp = np.pad(y0, ((1, 1), (1, 1)), mode="edge")
-        gx = (yp[1:-1, 2:] - yp[1:-1, :-2]) * np.float32(0.5)
-        gy = (yp[2:, 1:-1] - yp[:-2, 1:-1]) * np.float32(0.5)
-        grad2 = gx * gx + gy * gy
-    else:
-        grad2 = None
-
     if detail.chroma_nr > 0:
-        sc = np.float32(detail.chroma_nr / 100.0)
-        cr_blur = _sep_conv_5(_sep_conv_5(cr))
-        cb_blur = _sep_conv_5(_sep_conv_5(cb))
-        tau_c2 = np.float32((0.08 + 0.12 * float(sc)) ** 2)
-        assert grad2 is not None
-        w_edge = tau_c2 / (grad2 + tau_c2)
-        blend = sc * w_edge
-        cr = cr + blend * (cr_blur - cr)
-        cb = cb + blend * (cb_blur - cb)
+        sc = float(detail.chroma_nr / 100.0)
+        y_guide = _sep_conv_3(y0)
+        eps_c1 = np.float32((0.025 + 0.095 * sc) ** 2)
+        cr1, cb1, _ = _guided_filter_pair(y_guide, cr, cb, 3, eps_c1)
+        assert cb1 is not None
+
+        # Pass 2: wider support handles 6-16px AHD/low-light purple-green blotches along luma edges.
+        eps_c2 = np.float32((0.018 + 0.080 * sc) ** 2)
+        cr2, cb2, _ = _guided_filter_pair(y_guide, cr1, cb1, 6, eps_c2)
+        assert cb2 is not None
+
+        # Chroma self-guided branch protects genuine isoluminant color edges (where var(y_guide) ~ 0)
+        # across the full r=6 halo without letting Pass 2 bleed color across sharp hue boundaries.
+        cr_s0 = _sep_conv_5(cr)
+        cb_s0 = _sep_conv_5(cb)
+        eps_iso = np.float32((0.018 + 0.024 * sc) ** 2)
+        cr_c, _, var_cr = _guided_filter_pair(cr_s0, cr, None, 3, eps_iso)
+        cb_c, _, var_cb = _guided_filter_pair(cb_s0, cb, None, 3, eps_iso)
+        c_var_wide = _box_mean(var_cr + var_cb, 6)
+        tau_iso2 = np.float32((0.036 + 0.026 * sc) ** 2)
+        cv2 = c_var_wide * c_var_wide
+        w_iso_edge = cv2 / (cv2 + tau_iso2 * tau_iso2 + np.float32(1e-18))
+
+        cr_y = cr1 + np.float32(sc) * (cr2 - cr1)
+        cb_y = cb1 + np.float32(sc) * (cb2 - cb1)
+        cr_clean = cr_y + w_iso_edge * (cr_c - cr_y)
+        cb_clean = cb_y + w_iso_edge * (cb_c - cb_y)
+        chroma_blend = np.float32(min(1.0, sc * 1.45))
+        cr = cr + chroma_blend * (cr_clean - cr)
+        cb = cb + chroma_blend * (cb_clean - cb)
 
     if detail.luminance_nr > 0:
-        sl = np.float32(detail.luminance_nr / 100.0)
-        b1 = _sep_conv_3(y)
-        b2 = _sep_conv_5(b1)
-        d1 = y - b1
-        d2 = b1 - b2
-        t1_sq = np.float32((0.022 * float(sl)) ** 2)
-        t2_sq = np.float32((0.012 * float(sl)) ** 2)
-        d1_keep = d1 * (d1 * d1) / (d1 * d1 + t1_sq + np.float32(1e-12))
-        d2_keep = d2 * (d2 * d2) / (d2 * d2 + t2_sq + np.float32(1e-12))
-        y = np.clip(b2 + d2_keep + d1_keep, 0.0, 1.0)
+        sl = float(detail.luminance_nr / 100.0)
+        s_eff = sl ** 0.92
+        # Mildly smoothed structural guide attenuates 1px uncorrelated shot noise variance by ~3.4x
+        # while preserving thin 1-2px ink strokes, foliage, and edges.
+        b3_y = _sep_conv_3(y)
+        g1 = np.float32(0.35) * y + np.float32(0.65) * b3_y
+        # Photon shot noise in sRGB is stronger in dark shadows; highlights remain gentler.
+        shadow_mult = np.float32(0.65) + np.float32(1.55) * (np.float32(1.0) - np.clip(b3_y, 0.0, 1.0)) ** 2
+        eps1 = np.float32((0.0040 + 0.025 * s_eff) ** 2) * shadow_mult
+        y1, _, var_g1 = _guided_filter_pair(g1, y, None, 2, eps1)
+
+        # Stage 2 (r=4, 9x9) removes 4-8px flat shadow mottle; var_y2 measures denoised structure variance
+        # weighted inversely by shadow_mult so mid/bright texture stays free of milky haze.
+        eps2 = np.float32((0.0025 + 0.014 * (s_eff ** 1.1)) ** 2) * shadow_mult
+        y2, _, var_y2 = _guided_filter_pair(y1, y1, None, 4, eps2)
+
+        macro_keep = np.float32(0.25 + 0.72 * s_eff)
+        struct_keep = var_y2 / (var_y2 + np.float32(0.00008 + 0.00018 * s_eff) * shadow_mult + np.float32(1e-12))
+        y_mottle = y1 + macro_keep * (np.float32(1.0) - struct_keep * np.float32(0.90)) * (y2 - y1)
+        # Restore crisp micro-edge acutance using the noise-suppressed Stage-1 guide variance.
+        crisp_keep = (var_g1 / (var_g1 + np.float32(0.0014) * shadow_mult + np.float32(1e-12))) * np.float32(0.50)
+        y_nr = y_mottle + crisp_keep * (y - y1)
+        luma_blend = np.float32(min(1.0, sl * 2.0))
+        y = np.clip(y + luma_blend * (y_nr - y), np.float32(0.0), np.float32(1.0))
 
     if detail.sharpening > 0:
-        amount = np.float32((detail.sharpening / 100.0) * 2.5)
-        blur = np.float32(0.55) * _sep_conv_3(y) + np.float32(0.45) * _sep_conv_5(y)
-        high = y - blur
-        core_sq = np.float32(0.0020 ** 2)
-        high_cored = high * (high * high) / (high * high + core_sq)
+        amount = np.float32((detail.sharpening / 100.0) * 2.85)
+        b3 = _sep_conv_3(y)
+        b5 = _sep_conv_5(b3)
+        high = np.float32(0.62) * (y - b3) + np.float32(0.38) * (b3 - b5)
+        core_t = 0.0030 + 0.0045 * float(detail.luminance_nr / 100.0)
+        core_sq = np.float32(core_t * core_t)
+        high_sq = high * high
+        high_cored = high * high_sq / (high_sq + core_sq + np.float32(1e-12))
+
         if detail.masking > 0:
-            assert grad2 is not None
-            g2 = _sep_conv_3(grad2)
-            tm_sq = np.float32((0.06 * (detail.masking / 100.0) ** 2) ** 2 + 1e-12)
-            edge_mask = g2 / (g2 + tm_sq)
+            yp = np.pad(b3, ((1, 1), (1, 1)), mode="edge")
+            gx = (yp[1:-1, 2:] - yp[1:-1, :-2]) * np.float32(0.5)
+            gy = (yp[2:, 1:-1] - yp[:-2, 1:-1]) * np.float32(0.5)
+            grad_mag = _sep_conv_3(np.sqrt(gx * gx + gy * gy))
+            m = float(detail.masking / 100.0)
+            tau_m = np.float32(0.0020 + 0.017 * (m ** 1.35))
+            g2 = grad_mag * grad_mag
+            t2 = np.float32(float(tau_m) ** 2 + 1e-12)
+            edge_mask = g2 / (g2 + t2)
         else:
             edge_mask = np.float32(1.0)
-        halo_limited = high_cored / (np.float32(1.0) + np.abs(high_cored) / np.float32(0.14))
-        y = np.clip(y + amount * edge_mask * halo_limited, 0.0, 1.0)
+
+        halo_lim = np.where(high_cored >= 0.0, np.float32(0.14), np.float32(0.18))
+        halo_limited = high_cored / (np.float32(1.0) + np.abs(high_cored) / halo_lim)
+        end_guard = np.clip(np.float32(4.2) * y * (np.float32(1.0) - y) + np.float32(0.25), np.float32(0.25), np.float32(1.0))
+        y = np.clip(y + amount * edge_mask * halo_limited * end_guard, np.float32(0.0), np.float32(1.0))
 
     out = np.empty_like(srgb, dtype=np.float32)
     out[..., 0] = np.clip(y + cr, 0.0, 1.0)
@@ -155,20 +251,20 @@ def apply_detail(
     cancel=None,
     scratch: Scratch | None = None,
 ) -> np.ndarray:
-    """Process an encoded sRGB buffer in bounded 128-row halo strips; neutral is a no-op."""
+    """Process an encoded sRGB buffer in bounded 256-row halo strips; neutral is a no-op."""
     if not detail.active or srgb.size == 0:
         return srgb
     h = srgb.shape[0]
-    if h <= 128:
+    if h <= 256:
         if cancel is not None and cancel.is_set():
             raise CancelledError()
         srgb[:] = _detail_patch(srgb, detail)
         return srgb
     source = srgb.copy()
-    for top in range(0, h, 128):
+    for top in range(0, h, 256):
         if cancel is not None and cancel.is_set():
             raise CancelledError()
-        bottom = min(h, top + 128)
+        bottom = min(h, top + 256)
         pad_top = max(0, top - DETAIL_HALO_PX)
         pad_bottom = min(h, bottom + DETAIL_HALO_PX)
         filtered = _detail_patch(source[pad_top:pad_bottom], detail)

@@ -37,7 +37,7 @@ class Vault:
         pytest.fail("Local request must not read credentials")
 
 
-def test_native_protocol_payload_and_feedback(photo_request):
+def test_native_protocol_payload_and_feedback(photo_request, agent_workflow):
     request = photo_request
     cfg = config()
     assert resolve_api_key(ApiSettings(cfg, {}, key_source="saved"), Vault()) == ""
@@ -47,6 +47,7 @@ def test_native_protocol_payload_and_feedback(photo_request):
     assert "local-test" not in json.dumps(payload) and "Authorization" not in json.dumps(payload)
     answer = {field: "Measured trial" for field in FEEDBACK_FIELDS}
     answer["actions"] = [{"operation": "set", "parameter": "exposure_ev", "value": .35}]
+    answer["workflow"] = agent_workflow
     doc = {"done": True, "done_reason": "stop", "message": {"role": "assistant", "content": json.dumps(answer)},
            "prompt_eval_count": 30, "eval_count": 90}
     result = ApiCoach(cfg, "", transport=lambda *args: (200, json.dumps(doc).encode())).analyze(request)
@@ -59,6 +60,62 @@ def test_native_protocol_payload_and_feedback(photo_request):
     doc["done_reason"] = "length"
     with pytest.raises(ApiError):
         _parse_response(cfg, request, json.dumps(doc).encode())
+
+
+def test_local_inference_marks_model_loading_stage_without_extra_requests(photo_request, agent_workflow, monkeypatch):
+    from photocoach.api_coach import TransportProgress
+    progress = TransportProgress()
+    calls = []
+    def exchange(path, payload, **kwargs):
+        calls.append(path)
+        assert progress.snapshot()[0] == "local_running"
+        answer = {field: "Local test reply." for field in FEEDBACK_FIELDS}
+        answer.update(actions=[], workflow=agent_workflow)
+        return dict(done=True, done_reason="stop", message=dict(role="assistant", content=json.dumps(answer)))
+    monkeypatch.setattr(client, "exchange", exchange)
+    ApiCoach(config(), "").analyze(photo_request, progress=progress)
+    assert calls == ["/api/chat"]
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+@pytest.mark.parametrize("stage", ["local_preparing", "local_running"])
+def test_local_loading_notice_is_bilingual_cancellable_and_stale_safe(tmp_path, language, stage):
+    from photocoach.app import Job, MainWindow
+    from photocoach.api_coach import TransportProgress
+    app = QApplication.instance() or QApplication([])
+    w = MainWindow(settings_store=SettingsStore(tmp_path/"settings.json"), credentials=Vault())
+    cfg = runtime.LocalConfig(model_dir=str(tmp_path/"models"), verified_digest="test", engine_version="test")
+    w._use_local_config(cfg)
+    state = w.store.activate(Path("loading-test.ARW"), "loading-test")
+    w._set_controls(True)
+    w.set_language(language)
+    progress, cancel = TransportProgress(), threading.Event()
+    progress.advance(stage)
+    job = Job("api_prepare", w._generation, lambda: None, state, w._coach_generation)
+    w._network_active = (None, job, cancel, None)
+    w._network_progress = (progress, 300)
+    w._update_network_progress()
+    expected = ("Preparing local model" if stage == "local_preparing" else "Loading local model") if language == "en" else (
+        "正在准备本地模型" if stage == "local_preparing" else "正在加载本地模型")
+    assert expected in w.coach_text.toPlainText()
+    assert ("First use" if language == "en" else "首次使用") in w.coach_hint.text()
+    assert ("First use" if language == "en" else "首次使用") in w.coach_text.toPlainText()
+    assert ("Cancel analysis" if language == "en" else "取消分析") == w.analyze_button.text()
+    assert w.analyze_button.isEnabled()
+    original = w.coach_text.toPlainText()
+    cancel.set()
+    progress.advance("local_running" if stage == "local_preparing" else "local_preparing")
+    w._update_network_progress()
+    assert w.coach_text.toPlainText() == original
+    cancel.clear()
+    w._coach_generation += 1
+    w._update_network_progress()
+    assert w.coach_text.toPlainText() == original
+    w._network_active = w._network_progress = None
+    w._close_approved = True
+    w.close()
+    w.deleteLater()
+    app.processEvents()
 
 
 @pytest.mark.parametrize("endpoint", ["http://127.0.0.1:11434/api/chat", "http://localhost:11435/api/chat",

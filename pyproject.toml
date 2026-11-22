@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,10 +7,7 @@ name = "photocoach"
 version = "0.12.0"
 description = "PhotoCoach: single-photo RAW editor with optional manual AI coaching"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
-authors = [{name = "Xin Chen"}]
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.11,<3.14"
 dependencies = [
   "numpy>=2.0,<3",
   "rawpy>=0.25,<0.28",
@@ -19,16 +16,17 @@ dependencies = [
   "tifffile>=2025.1",
 ]
 
-[project.urls]
-Repository = "https://github.com/Xin-Chen-Max/photocoach-desktop"
-Issues = "https://github.com/Xin-Chen-Max/photocoach-desktop/issues"
-
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
+mcp = ["mcp>=1.0"]
+otel = ["opentelemetry-api>=1.25", "opentelemetry-sdk>=1.25"]
+agent = ["mcp>=1.0", "opentelemetry-api>=1.25", "opentelemetry-sdk>=1.25"]
 
 [project.scripts]
 photocoach = "photocoach.app:main"
 photocoach-verify = "photocoach.cli:main"
+photocoach-mcp = "photocoach.mcp_server:main"
+photocoach-eval = "photocoach.agent_eval:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

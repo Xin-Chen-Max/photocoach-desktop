@@ -236,3 +236,4 @@ def test_surface_selective_rendering():
     crevice_red_gain = float(beam_out[40, 36, 0] / max(1e-5, base_out[40, 36, 0]))
     assert ridge_red_gain > sky_red_gain * 1.18
     assert ridge_red_gain > crevice_red_gain * 1.15
+

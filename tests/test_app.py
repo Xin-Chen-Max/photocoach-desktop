@@ -40,7 +40,7 @@ def application():
 def window(application, monkeypatch):
     view = desktop.MainWindow()
     # No actual RAW, filesystem output, or visible desktop interaction is used.
-    state = view.store.activate(Path("synthetic-a.ARW"), "photo-a")
+    state = view.store.activate(Path("E:/PhotoCoach/synthetic-a.ARW"), "photo-a")
     view.store.mark_preview(state)
     view._set_controls(True)
     view._show_metadata({"visible_size": [6, 4], "photo_id": "photo-a"})
@@ -331,7 +331,7 @@ def test_switching_photo_discards_previous_photos_inflight_preview(window, appli
     started = threading.Event()
     release = threading.Event()
     displayed = []
-    second_path = Path("synthetic-b.ARW")
+    second_path = Path("E:/PhotoCoach/synthetic-b.ARW")
 
     def old_render(state):
         started.set()
@@ -374,7 +374,7 @@ def test_export_uses_latest_parameters_and_restores_dropped_preview(window, appl
     exports = []
     displayed = []
     linear = np.full((8, 12, 3), 0.08, dtype=np.float32)
-    destination = Path("synthetic-never-written.tif")
+    destination = Path("E:/PhotoCoach/synthetic-never-written.tif")
 
     def slow_first_render(state):
         renders.append(state.revision)
@@ -468,7 +468,7 @@ def test_coach_late_result_and_failure_never_block_editing(window, application, 
         elif action == "switch":
             monkeypatch.setattr(window.engine, "load", lambda path: (
                 SimpleNamespace(source_path=path, metadata={"photo_id": "photo-b", "visible_size": [6, 4]}), image))
-            window.open_raw(Path("synthetic-b.ARW"))
+            window.open_raw(Path("E:/PhotoCoach/synthetic-b.ARW"))
     finally:
         release.set()
     spin_until(application, lambda: window._active is None and window._pending is None and not window._render_timer.isActive())
@@ -636,7 +636,7 @@ def test_api_uses_separate_worker_and_stale_results_are_discarded(window, applic
         elif outcome == "switch":
             monkeypatch.setattr(window.engine, "load", lambda path: (
                 SimpleNamespace(source_path=path, metadata={"photo_id": "photo-b", "visible_size": [6, 4]}), image))
-            window.open_raw(Path("synthetic-b.ARW"))
+            window.open_raw(Path("E:/PhotoCoach/synthetic-b.ARW"))
             spin_until(application, lambda: window.store.current.photo_id == "photo-b")
             assert window._network_active is not None
         if outcome in ("edit", "question", "pause", "switch"):
@@ -828,7 +828,7 @@ def test_text_probe_uses_shared_budget_worker_and_stale_result_rules(window, app
             image = np.zeros((4, 6, 3), dtype=np.uint8)
             monkeypatch.setattr(window.engine, "load", lambda path: (
                 SimpleNamespace(source_path=path, metadata={"photo_id": "photo-b", "visible_size": [6, 4]}), image))
-            window.open_raw(Path("synthetic-b.ARW"))
+            window.open_raw(Path("E:/PhotoCoach/synthetic-b.ARW"))
             spin_until(application, lambda: window.store.current.photo_id == "photo-b")
         if outcome in ("edit", "pause", "switch"):
             old_text = window.coach_text.toPlainText()

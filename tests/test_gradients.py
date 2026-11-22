@@ -148,3 +148,28 @@ def test_clipping_is_display_only_and_mask_overlay_uses_weights():
     g=gradient(start=(0,.5),end=(1,.5))
     overlay=overlay_pixels(pixels,geometry,OverlaySpec('mask',g))
     assert np.array_equal(overlay[...,3],np.rint(gradient_weight(g,geometry)*90).astype(np.uint8))
+
+
+def test_shadow_aware_spotlight_preserves_16bit_roi_export_equivalence():
+    from photocoach.gradients import RadialGradient
+    linear = np.random.default_rng(19).uniform(0.01, 0.25, size=(272, 408, 3)).astype(np.float32)
+    # Dark center subject patch inside midtone sand
+    linear[90:180, 120:280] = 0.022
+    linear.setflags(write=False)
+    spotlight = RadialGradient(
+        "spot-1", "Overhead Key Light", (0.20, 0.18), (0.80, 0.72),
+        exposure_ev=0.44, highlights=0.20, shadows=0.38, warmth=0.36, feather=0.80,
+    )
+    values = EditValues(local_gradients=(spotlight,))
+    full = render_photo(linear, values)
+    size = (full.shape[1], full.shape[0])
+    rect = (15, 21, size[0] - 11, size[1] - 17)
+    roi = render_region(linear, values, DetailRequest(0, size, rect, 1), workers=2)
+    assert np.array_equal(roi, quantize_srgb(full)[rect[1]:rect[3], rect[0]:rect[2]])
+
+    # Shadow-aware spotlight lifts dark foreground subjects cleanly in sRGB (>25% gain on dark fur)
+    base_full = quantize_srgb(render_photo(linear, EditValues()))
+    spot_full = quantize_srgb(full)
+    dark_before = float(base_full[135, 200].mean())
+    dark_after = float(spot_full[135, 200].mean())
+    assert dark_after > dark_before * 1.25

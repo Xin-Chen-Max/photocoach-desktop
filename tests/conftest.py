@@ -3,6 +3,16 @@
 import pytest
 
 
+@pytest.fixture
+def agent_workflow():
+    """Minimal valid provider plan for transport tests; no live model judgment."""
+    return dict(version=1, decision="recommend", objective="Compare one reversible brightness trial.",
+        findings=[dict(region="whole", observation="The supplied preview is dark.",
+                       interpretation="Test a modest lift and let the user judge.", category="technical", confidence="medium")],
+        checks=[dict(region="whole", metric="visual", direction="visual", expectation="Compare texture and tonal separation.")],
+        uncertainty="A reduced preview cannot establish RAW recoverability or aesthetic quality.")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def qt_application_session():
     """Own Qt until every GUI fixture has finished, then destroy it explicitly.

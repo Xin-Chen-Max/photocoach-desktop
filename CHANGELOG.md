@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.12.1
+
+- Added Agent v2 bounded ReAct state-graph runtime (`AgentRuntime`: observe -> reason -> tool_call -> trial_render -> reflect -> finalize) with turn/tool/trial/timeout caps and deterministic checkpoint replay.
+- Added Active Vision tools: 1:1 demosaiced crop inspection (`inspect_region_100pct`), normalized Bayer CFA sensor headroom probing (`probe_sensor_headroom`), and 8-band HSL/CIELAB zoning (`analyze_hsl_zones`).
+- Added Visual Reflexion trial criticism loop (`propose_and_preview_trial`): renders trial edits through the live linear pipeline to self-repair overexposure, clipping, or no-op adjustments before final suggestions.
+- Unified multi-protocol tool calling across Gemini (`thoughtSignature` + multimodal `$ref` `FunctionResponse.parts`), OpenAI Responses, Chat Completions, and local Ollama (`qwen3.6:27b`).
+- Added Model Context Protocol (MCP `2025-06-18`) stdio server (`photocoach-mcp`) exposing editing, sensor diagnostics, and playbook tools to external MCP agents.
+- Added 25-scenario evaluation and benchmark harness (`photocoach-eval`) testing reasoning, trial self-repair recovery, prompt-injection resilience, and tool robustness.
+- Added zero-dependency bilingual BM25 Playbook RAG (24 pipeline-calibrated recipe cards) and privacy-preserving user style memory.
+- Added 3D spotlight rig lighting masks, calibrated Detail engine, seamless zoom pyramid, and darkroom UI polish.
+
 ## 0.12.0
 
 - Fixed sharpening and NR previews that used a larger effective radius during dragging than after refinement. Spatial filters now run before display reduction; inspect detail at 100%.
