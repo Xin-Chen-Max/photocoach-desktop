@@ -10,7 +10,7 @@ from contextlib import contextmanager, nullcontext
 import threading
 import time
 
-STAGES = ("geometry", "tones", "hsl", "curve", "reduction", "quantize", "histogram")
+STAGES = ("geometry", "spots", "tones", "color_grading", "hsl", "curve", "detail", "reduction", "quantize", "histogram")
 
 
 class StageTimer:

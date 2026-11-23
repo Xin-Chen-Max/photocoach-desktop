@@ -221,14 +221,18 @@ def test_audit_fixes_reader_preview_slider_focus_and_bilingual_status(tmp_path):
 
 def test_surface_selective_rendering():
     from photocoach.adjustments import render_photo
-    # Verify surface-selective & aerial-perspective range masking in render_photo at equal geometric weight:
-    # Sunlit warm ridge pixels receive strong golden lift while blue sky and deep crevices are protected
+    # Explicit perceptual luminance range gating isolates a sunlit ridge (0.288)
+    # cleanly from brighter blue sky (0.405) and deep shadow crevices (0.091).
     lin = np.zeros((48, 72, 3), dtype=np.float32)
-    lin[:16, :] = (0.08, 0.14, 0.28)     # Blue sky (B > R)
-    lin[16:35, :] = (0.09, 0.06, 0.035)  # Sunlit warm ridge (R > B)
-    lin[35:, :] = (0.004, 0.005, 0.009)  # Deep occluded shadow crevice (low luma, B > R)
-    uniform_beam = RadialGradient("g-test", "Test Beam", (0.0, 0.0), (1.0, 1.0), exposure_ev=0.68, warmth=0.56, feather=0.0)
-    only_beam = EditValues(local_gradients=(uniform_beam,))
+    lin[:16, :] = (0.08, 0.14, 0.28)     # Blue sky
+    lin[16:35, :] = (0.09, 0.06, 0.035)  # Sunlit warm ridge
+    lin[35:, :] = (0.004, 0.005, 0.009)  # Deep occluded shadow crevice
+    ridge_beam = RadialGradient(
+        "g-test", "Test Beam", (0.0, 0.0), (1.0, 1.0),
+        exposure_ev=0.68, warmth=0.35, feather=0.0,
+        luma_min=0.22, luma_max=0.32, luma_feather=0.05, edge_aware=True,
+    )
+    only_beam = EditValues(local_gradients=(ridge_beam,))
     base_out = render_photo(lin, EditValues())
     beam_out = render_photo(lin, only_beam)
     sky_red_gain = float(beam_out[8, 36, 0] / max(1e-5, base_out[8, 36, 0]))
@@ -236,4 +240,31 @@ def test_surface_selective_rendering():
     crevice_red_gain = float(beam_out[40, 36, 0] / max(1e-5, base_out[40, 36, 0]))
     assert ridge_red_gain > sky_red_gain * 1.18
     assert ridge_red_gain > crevice_red_gain * 1.15
+
+
+def test_create_mask_supports_legacy_and_extended_range_edge_schema():
+    values = EditValues()
+    legacy_spec = mask_action()
+    action_legacy, = resolve_actions([legacy_spec], values)
+    mask_legacy = action_legacy.new_value[0]
+    assert mask_legacy.luma_min == 0.0 and mask_legacy.luma_max == 1.0 and mask_legacy.edge_aware is False
+
+    ext_spec = {
+        **mask_action(),
+        "luma_min": 0.0,
+        "luma_max": 0.34,
+        "luma_feather": 0.08,
+        "edge_aware": True,
+    }
+    action_ext, = resolve_actions([ext_spec], values)
+    mask_ext = action_ext.new_value[0]
+    assert mask_ext.luma_max == 0.34 and mask_ext.luma_feather == 0.08 and mask_ext.edge_aware is True
+
+    updated_vals = replace(values, local_gradients=(mask_ext,))
+    action_edit, = resolve_actions([
+        {"operation": "set", "parameter": f"local_gradients.{mask_ext.id}.luma_max", "value": 0.28},
+        {"operation": "add", "parameter": f"local_gradients.{mask_ext.id}.luma_feather", "value": -0.02},
+    ], updated_vals)
+    assert action_edit.new_value[0].luma_max == 0.28
+    assert abs(action_edit.new_value[0].luma_feather - 0.06) < 1e-6
 

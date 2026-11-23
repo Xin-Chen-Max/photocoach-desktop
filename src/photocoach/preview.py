@@ -9,7 +9,7 @@ from concurrent.futures import CancelledError
 from concurrent.futures import ThreadPoolExecutor
 import os
 
-from .adjustments import render_edit
+from .adjustments import render_edit, required_halo
 from .detail import DETAIL_HALO_PX
 from .imaging import quantize_srgb
 from .state import EditValues
@@ -88,8 +88,8 @@ def render_region(linear: np.ndarray, values: EditValues, request: DetailRequest
             raise CancelledError()
         scratch = pool.for_thread()
         count = min(rows, height - offset)
-        if values.detail.active:
-            halo = DETAIL_HALO_PX
+        halo = required_halo(values)
+        if halo > 0:
             p_left = max(0, left - halo)
             p_right = min(request.full_size[0], right + halo)
             p_top = max(0, top + offset - halo)
@@ -100,7 +100,8 @@ def render_region(linear: np.ndarray, values: EditValues, request: DetailRequest
                                             scratch=scratch, distortion=values.lens_corrections.distortion)
             padded = render_edit(region, values, cancel=cancel, timer=timer, scratch=scratch,
                 geometry=RenderGeometry((linear.shape[1],linear.shape[0]),values.composition,
-                                        (p_left,p_top,p_right,p_bottom),(p_right-p_left,p_bottom-p_top),values.lens_corrections.distortion))
+                                        (p_left,p_top,p_right,p_bottom),(p_right-p_left,p_bottom-p_top),values.lens_corrections.distortion),
+                source_linear=linear)
             rendered = padded[top + offset - p_top : top + offset - p_top + count,
                               left - p_left : left - p_left + width]
         else:
@@ -111,7 +112,8 @@ def render_region(linear: np.ndarray, values: EditValues, request: DetailRequest
                           if composed_region is None else composed_region[offset:offset+count])
             rendered = render_edit(region, values, cancel=cancel, timer=timer, scratch=scratch,
                 geometry=RenderGeometry((linear.shape[1],linear.shape[0]),values.composition,
-                                        (left,top+offset,right,top+offset+count),(width,count),values.lens_corrections.distortion))
+                                        (left,top+offset,right,top+offset+count),(width,count),values.lens_corrections.distortion),
+                source_linear=linear)
         if step != 1:
             size = (output_w, math.ceil(count / step))
             with timed(timer, "reduction"):

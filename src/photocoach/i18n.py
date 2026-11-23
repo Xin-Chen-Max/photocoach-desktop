@@ -16,6 +16,13 @@ PARAM_NAMES_ZH: dict[str, str] = {
     "Tint": "色调 Tint",
     "Feather": "羽化 Feather",
     "Angle": "角度 Angle",
+    "Brush size": "画笔大小 Brush size",
+    "Brush feather": "画笔羽化 Brush feather",
+    "Luma min": "亮度下限 Luma min",
+    "Luma max": "亮度上限 Luma max",
+    "Range feather": "范围羽化 Range feather",
+    "Spot size": "污点大小 Spot size",
+    "Opacity": "不透明度 Opacity",
     "Distortion": "畸变 Distortion",
     "Vignetting": "暗角 Vignetting",
     "Sharpening": "锐化 Sharpening",
@@ -24,6 +31,9 @@ PARAM_NAMES_ZH: dict[str, str] = {
     "Color NR": "彩色降噪 Color NR",
     "Hue": "色相 Hue",
     "Lightness": "明度 Lightness",
+    "Luminance": "明度 Luminance",
+    "Blend": "混合 Blend",
+    "Balance": "平衡 Balance",
 }
 
 
@@ -106,6 +116,8 @@ def apply_workspace_language(window, lang: str) -> None:
     window.lens_section.toggle.setText("镜头校正 Lens" if zh else "Lens corrections")
     window.detail_section.toggle.setText("细节与降噪 Detail" if zh else "Detail")
     window.local_section.toggle.setText("局部蒙版与光束 Local" if zh else "Local adjustments")
+    if hasattr(window, "spots_section"):
+        window.spots_section.toggle.setText("污点修复 Spots" if zh else "Spot removal")
     window.color_section.toggle.setText("色彩 Color" if zh else "Color")
     window.curve_section.toggle.setText("曲线 Curve" if zh else "Curve")
 
@@ -129,6 +141,13 @@ def apply_workspace_language(window, lang: str) -> None:
             if zh
             else "Committed actions · Complete audit is saved in the project"
         )
+    if hasattr(window, "snapshots_panel"):
+        window.snapshots_panel.set_language(active)
+    if hasattr(window, "_refresh_view_notice"):
+        window._refresh_view_notice()
+    if window.store.current and window.store.current.compare_snapshot is not None:
+        snap_name = window.store.current.compare_snapshot.name
+        window.status.setText(f"A/B 对比：{snap_name}" if zh else f"Comparing A/B: {snap_name}")
 
     # Sub-editors
     if hasattr(window.detail_editor, "note"):
@@ -151,22 +170,42 @@ def apply_workspace_language(window, lang: str) -> None:
     window.color_mixer.reset_all.setText("重置混色器" if zh else "Reset Color Mixer")
     window.color_mixer.set_values(window.color_mixer.values)
 
+    cg = window.color_grading
+    cg.toggle.setText("色彩分级 Color Grading" if zh else "Color Grading")
+    for zone_key, zh_label, en_label in (
+        ("shadows", "阴影", "Shadows"),
+        ("midtones", "中间调", "Midtones"),
+        ("highlights", "高光", "Highlights"),
+    ):
+        cg.zone_buttons[zone_key].setText(zh_label if zh else en_label)
+    cg.reset_zone.setText("重置当前分区" if zh else "Reset zone")
+    cg.reset_all.setText("重置色彩分级" if zh else "Reset Color Grading")
+    cg.set_values(cg.values)
+
     # Local Gradients Editor
     ge = window.local_gradients
     ge.new_mask_label.setText("新建蒙版" if zh else "New mask")
-    for idx, shape_label in enumerate(("线性 Linear", "径向 Radial") if zh else ("Linear", "Radial")):
+    for idx, shape_label in enumerate(("线性 Linear", "径向 Radial", "画笔 Brush") if zh else ("Linear", "Radial", "Brush")):
         ge.new_shape.setItemText(idx, shape_label)
     ge.name.setPlaceholderText("蒙版名称" if zh else "Gradient name")
     ge.add.setText("添加蒙版" if zh else "Add mask")
     ge.done.setText("完成" if zh else "Done")
+    ge.brush_paint.setText("涂抹" if zh else "Paint")
+    ge.brush_erase.setText("擦除" if zh else "Erase")
     ge.enabled.setText("启用" if zh else "Enabled")
     ge.inverted.setText("反向" if zh else "Invert")
+    ge.edge_aware.setText("边缘贴合" if zh else "Edge-aware")
     ge.redraw.setText("重绘蒙版" if zh else "Redraw mask")
     ge.delete.setText("删除蒙版" if zh else "Delete mask")
     ge.reset.setText("重置蒙版参数" if zh else "Reset adjustments")
     ge.edit_on_photo.setText("在画面上编辑" if zh else "Edit on photo")
     ge.show_mask.setText("显示蒙版范围" if zh else "Show selected mask")
     ge.set_values(ge.values)
+    window.local_controller.sync()
+
+    if hasattr(window, "spots_editor"):
+        window.spots_editor.set_language(active)
+        window.spots_controller.sync()
 
     # Refresh ParameterLabels on MainWindow
     for label in (window.exposure_label, *window.balance_labels, *window.adjustment_labels.values()):
@@ -194,10 +233,12 @@ def apply_workspace_language(window, lang: str) -> None:
         ("下一步建议", "结合当前画面与参数，下一步最该调整什么？什么时候该停下？"),
         ("曲线指导", "这张照片该如何使用 RGB 共享曲线？有充分依据时给出一个可撤销的试调建议。"),
         ("局部布光", "评估画面可见光线，仅在位置和目的有图像依据时建议局部调整。"),
+        ("效果复盘：调整有效吗？", "结合上一轮教练建议和我的编辑目标，这次调整有帮助吗？请区分客观画面变化与主观偏好，并说明是否该停下。"),
     ) if zh else (
         ("Next step", "What should I adjust next, and when should I stop?"),
         ("Curve help", "How should I use the shared RGB curve on this photo? Suggest a reversible trial only if the evidence supports it."),
         ("Local lighting", "Assess the visible light and suggest a local adjustment only if its location and purpose are supported by the photo."),
+        ("Follow-up: Did it help?", "Did my adjustment help relative to your previous advice and my editing goal? Separate objective preview changes from preference, and tell me if I should stop."),
     )
     for action, (title, question) in zip(window.coach_question_actions, questions):
         action.setText(title)
@@ -214,5 +255,7 @@ def apply_workspace_language(window, lang: str) -> None:
     if hasattr(window, "clear_style_memory_button"):
         window.clear_style_memory_button.setText("清空风格记忆" if zh else "Clear style memory")
     window.coach_response.set_language(active)
+    if getattr(window, "_local_dialog", None) is not None and hasattr(window._local_dialog, "set_language"):
+        window._local_dialog.set_language(active)
     window._coach_toggle_text()
     window._update_coach_status()

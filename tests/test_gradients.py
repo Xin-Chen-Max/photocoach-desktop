@@ -122,8 +122,12 @@ def test_v5_migration_all_history_and_strict_current_schema(tmp_path):
     data=snapshot_project(store)
     def strip(value):
         if isinstance(value,dict):
+            value.pop('compare_snapshot_id', None)
+            value.pop('snapshots', None)
             if 'white_balance' in value:
                 value.pop("base_rendering")
+                value.pop("color_grading")
+                value.pop("spots")
                 value.pop('local_gradients')
                 value.pop('lens_corrections')
             for item in value.values():strip(item)
@@ -131,7 +135,7 @@ def test_v5_migration_all_history_and_strict_current_schema(tmp_path):
             for item in value:strip(item)
     strip(data);data['schema_version']=5;data['pipeline_version']='phase1-sdr-srgb-v5'
     old=copy.deepcopy(data);up=upgrade_project(data)
-    assert old==data and up['schema_version']==9
+    assert old==data and up['schema_version']==14
     undo,redo=validate_project(up)
     assert undo==store.undo_stack and redo==store.redo_stack
     broken=copy.deepcopy(up);broken['state']['parameters'].pop('local_gradients')
@@ -173,3 +177,98 @@ def test_shadow_aware_spotlight_preserves_16bit_roi_export_equivalence():
     dark_before = float(base_full[135, 200].mean())
     dark_after = float(spot_full[135, 200].mean())
     assert dark_after > dark_before * 1.25
+
+
+def test_luma_range_and_edge_aware_isolation_and_roi_parity():
+    from photocoach.detail import DetailControls
+    from photocoach.gradients import BrushMask, BrushStroke, RadialGradient, gradient_from_dict
+    from photocoach.lens import LensCorrections
+    from photocoach.spots import SpotRemoval
+
+    for bad in ({"luma_min": 0.6, "luma_max": 0.4}, {"luma_min": -0.1}, {"luma_feather": 1.2}, {"edge_aware": 1}):
+        with pytest.raises(ValueError):
+            gradient(**bad)
+
+    # Neutral defaults omit v14 keys; non-default range/edge fields round-trip cleanly across all 3 mask kinds.
+    plain_d = gradient().to_dict()
+    assert not ({"luma_min", "luma_max", "luma_feather", "edge_aware"} & set(plain_d))
+    for item in (
+        LinearGradient("lg", "L", (0.1, 0.1), (0.9, 0.9), luma_min=0.05, luma_max=0.4, luma_feather=0.1, edge_aware=True),
+        RadialGradient("rg", "R", (0.2, 0.2), (0.8, 0.8), luma_max=0.35, edge_aware=True),
+        BrushMask("bg", "B", strokes=(BrushStroke(((0.3, 0.3), (0.5, 0.5))),), luma_min=0.1, edge_aware=True),
+    ):
+        assert gradient_from_dict(item.to_dict()) == item
+
+    # Dusk silhouette: dark subject [0.012] backed by brighter smooth twilight sky [0.08, 0.10, 0.14].
+    rng = np.random.default_rng(11)
+    lin = rng.uniform(0.02, 0.25, size=(304, 440, 3)).astype(np.float32)
+    lin[:190, :] = np.array([0.08, 0.10, 0.14], dtype=np.float32)
+    lin[70:180, 170:270] = np.array([0.012, 0.011, 0.010], dtype=np.float32)
+    lin.setflags(write=False)
+
+    base = quantize_srgb(render_photo(lin, EditValues()))
+    plain_radial = RadialGradient("p1", "Plain", (0.30, 0.15), (0.70, 0.65), exposure_ev=0.5, warmth=0.2, feather=0.85)
+    plain_out = quantize_srgb(render_photo(lin, EditValues(local_gradients=(plain_radial,))))
+    sky_ring = np.zeros((304, 440), dtype=bool)
+    sky_ring[60:150, 145:166] = True
+    subj = np.zeros((304, 440), dtype=bool)
+    subj[90:150, 190:250] = True
+    # Old surf_gate inversion is gone: unmasked radial no longer boosts sky more than dark subject.
+    assert (plain_out[subj].mean() - base[subj].mean()) >= (plain_out[sky_ring].mean() - base[sky_ring].mean())
+
+    isolated = RadialGradient(
+        "iso", "Isolated", (0.30, 0.15), (0.70, 0.65),
+        exposure_ev=0.45, shadows=0.30, warmth=0.14, feather=0.85,
+        luma_min=0.0, luma_max=0.22, luma_feather=0.08, edge_aware=True,
+    )
+    iso_vals = EditValues(local_gradients=(isolated,))
+    iso_out = quantize_srgb(render_photo(lin, iso_vals))
+    assert abs(float(iso_out[sky_ring].mean() - base[sky_ring].mean())) < 2.0
+    assert float(iso_out[subj].mean()) > float(base[subj].mean()) * 1.20
+
+    # Overlay reflects luminance isolation on sky vs dark subject.
+    geom = RenderGeometry.full((440, 304), Composition(), (440, 304))
+    ov = overlay_pixels(base, geom, OverlaySpec("mask", isolated))
+    assert int(ov[sky_ring, 3].mean()) <= 5 and int(ov[subj, 3].mean()) >= 40
+
+    # 8-bit and 16-bit 0-LSB ROI/strip parity with edge_aware + luma_range + composition + distortion + detail + spots.
+    complex_vals = EditValues(
+        local_gradients=(isolated,),
+        composition=Composition((0.04, 0.04, 0.94, 0.92), -2.0),
+        lens_corrections=LensCorrections(distortion=10.0, vignetting_ev=-0.25),
+        detail=DetailControls(sharpening=35.0, masking=10.0, luminance_nr=15.0, chroma_nr=20.0),
+        spots=(SpotRemoval("s1", (0.25, 0.75), (0.35, 0.75)),),
+    )
+    full_f = render_photo(lin, complex_vals)
+    out_sz = (full_f.shape[1], full_f.shape[0])
+    rect = (19, 27, out_sz[0] - 17, out_sz[1] - 23)
+    roi_u8 = render_region(lin, complex_vals, DetailRequest(0, out_sz, rect, 1), workers=2)
+    assert np.array_equal(roi_u8, quantize_srgb(full_f)[rect[1]:rect[3], rect[0]:rect[2]])
+
+
+def test_schema13_to_14_migration_and_legacy_mask_rejection(tmp_path):
+    from photocoach.spots import SpotRemoval
+
+    src = tmp_path / "photo.ARW"
+    src.write_bytes(b"readonly")
+    digest = sha256_file(src)
+    store = StateStore()
+    store.activate(src, digest, base_rendering="natural_v1")
+    store.set_parameter("spots", (SpotRemoval("s1", (0.3, 0.4), (0.5, 0.4)),))
+    store.set_parameter("local_gradients", (gradient(),))
+    doc = snapshot_project(store)
+    assert doc["schema_version"] == 14
+
+    v13_doc = copy.deepcopy(doc)
+    v13_doc["schema_version"] = 13
+    v13_doc["pipeline_version"] = "phase1-sdr-srgb-v13"
+    v13_doc["source"]["byte_length"] = src.stat().st_size
+    upgraded = upgrade_project(v13_doc)
+    assert upgraded["schema_version"] == 14
+    validate_project(upgraded)
+
+    v14_mask = gradient(luma_max=0.35, edge_aware=True).to_dict()
+    bad_v13 = copy.deepcopy(v13_doc)
+    bad_v13["state"]["parameters"]["local_gradients"] = [v14_mask]
+    with pytest.raises(ValueError):
+        upgrade_project(bad_v13)

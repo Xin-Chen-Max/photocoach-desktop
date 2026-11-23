@@ -56,7 +56,17 @@ class ParameterLabel(QWidget):
         val_text = match[2] if match else ""
         self.name.setText(translate_parameter_name(name_text))
         self.value.setText(val_text)
-        is_neutral = (val_text in _NEUTRAL_VALUES) or (name_text == "Saturation" and val_text == "1.00") or (name_text == "Feather" and val_text == "50%")
+        is_neutral = (
+            (val_text in _NEUTRAL_VALUES)
+            or (name_text == "Saturation" and val_text in ("1.00", "0%"))
+            or (name_text == "Brush size" and val_text == "6.0%")
+            or (name_text == "Spot size" and val_text == "2.5%")
+            or (name_text == "Opacity" and val_text == "100%")
+            or (name_text in ("Feather", "Blend", "Brush feather") and val_text == "50%")
+            or (name_text == "Luma min" and val_text == "0%")
+            or (name_text == "Luma max" and val_text == "100%")
+            or (name_text == "Range feather" and val_text == "15%")
+        )
         self.value.setStyleSheet("color:#9a9a9a;" if is_neutral else "color:#9fc6ff;font-weight:600;")
         self.setAccessibleName(text)
 

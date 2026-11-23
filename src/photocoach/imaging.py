@@ -358,49 +358,51 @@ def render_srgb(linear_rgb: np.ndarray, exposure_ev: float = 0.0, *,
         if local_fields is not None:
             ev_field,hl_field,sh_field=(field[start:start+128] for field in local_fields)
             w_block = local_warmth[start:start+128] if local_warmth is not None else None
-            if w_block is not None and np.any(w_block != 0):
-                lum0 = 0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2]
-                # 1. Aerial-perspective & sky gate: shadowed/hazed/sky surfaces illuminated by the blue sky dome (B > 0.94*R)
-                #    stay cool and receding, while direct-sunlit & neutral surfaces (R >= 0.94*B) receive full golden light
-                blue_ratio = np.clip((out[..., 2] - out[..., 0] * np.float32(0.94)) / (lum0 + np.float32(0.012)), 0.0, 1.0)
-                sky_gate = np.clip(np.float32(1.0) - np.float32(1.45) * blue_ratio, 0.10, 1.0).astype(np.float32)
-                # 2. Highlight rolloff guard: prevent SDR ceiling clipping on already-bright snow/specular highlights
-                hl_guard = (np.float32(1.0) / (np.float32(1.0) + np.power(np.maximum(lum0, 0.0) / np.float32(0.52), 3.0))).astype(np.float32)
-                # 3. 3D surface-reflectance range mask: sun-facing ridges, snow saddles, rock faces, and road/car surfaces
-                #    catch golden light while deep occluded shadow crevices stay dark and three-dimensional
-                surf_norm = np.clip((np.sqrt(np.maximum(lum0, 0.0)) - np.float32(0.075)) / np.float32(0.19), 0.0, 1.0)
-                surf_s = surf_norm * surf_norm * (np.float32(3.0) - np.float32(2.0) * surf_norm)
-                warm_surf = np.clip((out[..., 0] - out[..., 2] * np.float32(0.90)) / (lum0 + np.float32(0.012)), -0.15, 0.65)
-                surf_gate = np.clip(
-                    np.float32(0.16) + np.float32(1.16) * surf_s * (np.float32(1.0) + np.float32(0.45) * warm_surf),
-                    0.14,
-                    1.42,
+            has_warmth = w_block is not None and bool(np.any(w_block != 0))
+            has_pos_ev = bool(np.any(ev_field > 0))
+            if has_warmth or has_pos_ev:
+                lum0 = np.maximum(
+                    np.float32(0.2126) * out[..., 0]
+                    + np.float32(0.7152) * out[..., 1]
+                    + np.float32(0.0722) * out[..., 2],
+                    np.float32(0.0),
+                )
+                # Smooth highlight rolloff prevents blowing out bright sky/specular detail when lifting shadows locally.
+                hl_guard = (
+                    np.float32(1.0)
+                    / (np.float32(1.0) + np.power(lum0 / np.float32(0.65), np.float32(3.0)))
                 ).astype(np.float32)
-                # Pointwise shadow-aware blend: when a local mask adds positive local shadow lift
-                # (e.g., 3D spotlight on dark foreground subjects), lift the dark-surface gate floor
-                # without disturbing mountain/snow masks (local_sh == 0) or strip invariance.
-                local_sh = np.maximum(np.float32(0.0), sh_field - np.float32(shadows))
-                sh_boost = np.clip(local_sh * np.float32(2.2), 0.0, 0.85)
-                surf_gate = (surf_gate * (np.float32(1.0) - sh_boost) + np.float32(0.96) * sh_boost).astype(np.float32)
-                light_mask = (sky_gate * hl_guard * surf_gate).astype(np.float32)
-                eff_ev = np.where((ev_field > 0) & (w_block > 0), ev_field * light_mask, ev_field).astype(np.float32)
-                eff_w = np.where(
-                    w_block > 0,
-                    w_block * sky_gate * hl_guard * (np.float32(0.22) + np.float32(0.92) * surf_gate),
-                    w_block * hl_guard,
+                eff_ev = np.where(
+                    ev_field > 0,
+                    ev_field * (np.float32(0.35) + np.float32(0.65) * hl_guard),
+                    ev_field,
                 ).astype(np.float32)
-                # Pure multiplicative linear-light Planckian chromaticity gain (preserves 100% micro-texture, no fog sticker)
-                out[..., 0] *= np.exp2(eff_ev + np.float32(0.74) * eff_w)
-                out[..., 1] *= np.exp2(eff_ev + np.float32(0.18) * eff_w)
-                out[..., 2] *= np.exp2(eff_ev - np.float32(0.70) * eff_w)
+                if has_warmth:
+                    eff_w = (w_block * hl_guard).astype(np.float32)
+                    out[..., 0] *= np.exp2(eff_ev + np.float32(0.36) * eff_w)
+                    out[..., 1] *= np.exp2(eff_ev + np.float32(0.04) * eff_w)
+                    out[..., 2] *= np.exp2(eff_ev - np.float32(0.38) * eff_w)
+                else:
+                    out *= np.exp2(eff_ev)[..., None]
             else:
-                out *= np.exp2(ev_field)[...,None]
+                out *= np.exp2(ev_field)[..., None]
         elif local_warmth is not None:
             w_block = local_warmth[start:start+128]
             if np.any(w_block != 0):
-                out[..., 0] *= np.exp2(np.float32(0.52) * w_block)
-                out[..., 1] *= np.exp2(np.float32(0.14) * w_block)
-                out[..., 2] *= np.exp2(np.float32(-0.55) * w_block)
+                lum0 = np.maximum(
+                    np.float32(0.2126) * out[..., 0]
+                    + np.float32(0.7152) * out[..., 1]
+                    + np.float32(0.0722) * out[..., 2],
+                    np.float32(0.0),
+                )
+                hl_guard = (
+                    np.float32(1.0)
+                    / (np.float32(1.0) + np.power(lum0 / np.float32(0.65), np.float32(3.0)))
+                ).astype(np.float32)
+                eff_w = (w_block * hl_guard).astype(np.float32)
+                out[..., 0] *= np.exp2(np.float32(0.36) * eff_w)
+                out[..., 1] *= np.exp2(np.float32(0.04) * eff_w)
+                out[..., 2] *= np.exp2(np.float32(-0.38) * eff_w)
         if highlights or shadows or local_fields is not None:
             shape2 = out.shape[:2]
             luminance = scratch.get("srgb_lum", shape2, np.float32)

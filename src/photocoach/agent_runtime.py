@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError
+import copy
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 import json
@@ -14,7 +15,15 @@ from typing import Any, Callable
 import numpy as np
 
 from .agent_tools import ToolCall, ToolContext, ToolRegistry, ToolResult, build_default_tool_registry
-from .api_coach import _FINAL_SCHEMA_KEYS, AGENT_INSTRUCTIONS, ApiCoach, ApiError, TransportProgress, request_context
+from .api_coach import (
+    _FINAL_SCHEMA_KEYS,
+    AGENT_INSTRUCTIONS,
+    RETOUCH_AGENT_INSTRUCTIONS,
+    ApiCoach,
+    ApiError,
+    TransportProgress,
+    request_context,
+)
 from .budget import BudgetExceeded, SessionBudget
 from .coach import CoachFeedback, CoachRequest
 from .coach_actions import analyze_scene_lighting
@@ -29,16 +38,19 @@ class RunBudget:
     max_trial_renders: int = 3
     max_wall_seconds: float = 120.0
     max_run_usd: Decimal | None = None
+    retouch_mode: str = "coach"
 
     def __post_init__(self):
-        if type(self.max_llm_turns) is not int or not 1 <= self.max_llm_turns <= 8:
-            raise ValueError("max_llm_turns must be between 1 and 8.")
-        if type(self.max_tool_calls) is not int or not 0 <= self.max_tool_calls <= 24:
-            raise ValueError("max_tool_calls must be between 0 and 24.")
-        if type(self.max_trial_renders) is not int or not 0 <= self.max_trial_renders <= 8:
-            raise ValueError("max_trial_renders must be between 0 and 8.")
-        if self.max_wall_seconds <= 0 or self.max_wall_seconds > 1200:
-            raise ValueError("max_wall_seconds must be in (0, 1200].")
+        if type(self.max_llm_turns) is not int or not 1 <= self.max_llm_turns <= 16:
+            raise ValueError("max_llm_turns must be between 1 and 16.")
+        if type(self.max_tool_calls) is not int or not 0 <= self.max_tool_calls <= 48:
+            raise ValueError("max_tool_calls must be between 0 and 48.")
+        if type(self.max_trial_renders) is not int or not 0 <= self.max_trial_renders <= 10:
+            raise ValueError("max_trial_renders must be between 0 and 10.")
+        if self.max_wall_seconds <= 0 or self.max_wall_seconds > 3600:
+            raise ValueError("max_wall_seconds must be in (0, 3600].")
+        if self.retouch_mode not in ("coach", "full_retouch"):
+            raise ValueError("retouch_mode must be 'coach' or 'full_retouch'.")
 
 
 @dataclass(frozen=True)
@@ -360,7 +372,8 @@ class AgentRuntime:
             except Exception:
                 pass
         if self.playbook is not None:
-            pb_query = query_text or "exposure tone color balance"
+            pb_query = (f"follow up review {query_text}".strip() if request.follow_up is not None
+                        else (query_text or "exposure tone color balance"))
             hints = self.playbook.search(pb_query, top_k=2)
             if hints:
                 ctx_dict["playbook_hints"] = hints
@@ -373,7 +386,8 @@ class AgentRuntime:
         images.append(("Current effect", request.current_preview))
         messages: list[dict[str, Any]] = [{"role": "user", "text": user_text, "images": images}]
         add_span("observe", "context_ready", obs_start, "ok",
-                 detail={"include_before": include_before, "tools": len(self.registry.specs())})
+                 detail={"include_before": include_before, "tools": len(self.registry.specs()),
+                         "is_follow_up": bool(request.follow_up)})
 
         final_feedback: CoachFeedback | None = None
         live_response = False
@@ -425,9 +439,14 @@ class AgentRuntime:
                 try:
                     try:
                         call_messages = self.compactor(messages) if self.compactor is not None else messages
+                        sys_prompt = (
+                            RETOUCH_AGENT_INSTRUCTIONS
+                            if self.run_budget.retouch_mode == "full_retouch"
+                            else AGENT_INSTRUCTIONS
+                        )
                         response = self.adapter.step(
                             request,
-                            AGENT_INSTRUCTIONS,
+                            sys_prompt,
                             call_messages,
                             () if force_final else tools,
                             cancel_event=cancel,
@@ -524,7 +543,12 @@ class AgentRuntime:
                         has_new_mask = isinstance(raw_acts, list) and any(
                             isinstance(it, dict) and it.get("operation") == "create_mask" for it in raw_acts
                         )
-                        verified_trial_ready = bool((not needs_repair) and (not has_new_mask) and result.payload.get("can_apply"))
+                        verified_trial_ready = bool(
+                            self.run_budget.retouch_mode != "full_retouch"
+                            and (not needs_repair)
+                            and (not has_new_mask)
+                            and result.payload.get("can_apply")
+                        )
                     tool_results.append(result)
                 messages.append({"role": "tool_results", "results": tool_results})
                 continue
@@ -566,6 +590,7 @@ class AgentRuntime:
                 action_notice=aborted_reason,
                 agent_plan=plan,
                 agent_report=report,
+                follow_up_context=copy.deepcopy(request.follow_up) if request.follow_up is not None else None,
             )
 
         if final_feedback is None:
@@ -575,8 +600,18 @@ class AgentRuntime:
         fin_start = time.monotonic()
         if final_feedback.agent_plan is not None:
             if not final_feedback.actions:
-                report = AgentReport("no_edit", trace=("observe", "diagnose", final_feedback.agent_plan.decision))
-                final_feedback = replace(final_feedback, agent_report=report)
+                if (
+                    not final_feedback.action_notice
+                    and final_feedback.agent_plan.decision == "recommend"
+                    and ctx.best_trial is not None
+                    and ctx.best_trial[0]
+                    and ctx.best_trial[2].can_apply
+                ):
+                    best_actions, _, best_report = ctx.best_trial
+                    final_feedback = replace(final_feedback, actions=best_actions, agent_report=best_report)
+                else:
+                    report = AgentReport("no_edit", trace=("observe", "diagnose", final_feedback.agent_plan.decision))
+                    final_feedback = replace(final_feedback, agent_report=report)
             else:
                 matched_report: AgentReport | None = None
                 sig = _actions_signature(final_feedback.actions)

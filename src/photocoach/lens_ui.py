@@ -20,6 +20,7 @@ class LensEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.note = QLabel('Manual correction')
         self.note.setProperty("secondary", True)
+        self.note.setWordWrap(True)
         self.note.setToolTip('No lens profile or automatic calibration. Distortion trims the edges with a centered safe scale; crop output dimensions stay unchanged.')
         layout.addWidget(self.note)
         self.sliders, self.labels = {}, {}

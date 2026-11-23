@@ -12,7 +12,148 @@ import tempfile
 from typing import Any
 
 from .agent_tools import ToolResult
-from .state import EditValues
+from .state import EditState, EditValues
+
+
+def _clean_summary_text(text: Any, limit: int) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or "")).strip()
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:limit]
+
+
+def summarize_parameter_deltas(before_params: dict[str, Any], current_params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return bounded, path-free parameter deltas between two validated EditValues dicts."""
+    before_ev = EditValues.from_dict(before_params)
+    current_ev = EditValues.from_dict(current_params)
+    if before_ev == current_ev:
+        return []
+    b_dict = before_ev.to_dict()
+    c_dict = current_ev.to_dict()
+    deltas: list[dict[str, Any]] = []
+
+    for name in ("exposure_ev", "contrast", "saturation", "highlights", "shadows", "whites", "blacks", "vibrance"):
+        b_val = getattr(before_ev, name)
+        c_val = getattr(current_ev, name)
+        if b_val != c_val:
+            deltas.append({
+                "parameter": name,
+                "before": round(float(b_val), 4),
+                "after": round(float(c_val), 4),
+                "delta": round(float(c_val - b_val), 4),
+            })
+
+    if before_ev.base_rendering != current_ev.base_rendering:
+        deltas.append({
+            "parameter": "base_rendering",
+            "before": before_ev.base_rendering,
+            "after": current_ev.base_rendering,
+        })
+
+    if before_ev.raw_options != current_ev.raw_options:
+        deltas.append({
+            "parameter": "white_balance",
+            "before_mode": before_ev.raw_options.wb_mode,
+            "after_mode": current_ev.raw_options.wb_mode,
+            "before_gains": [round(float(g), 4) for g in before_ev.raw_options.wb_gains],
+            "after_gains": [round(float(g), 4) for g in current_ev.raw_options.wb_gains],
+        })
+
+    if before_ev.composition != current_ev.composition:
+        deltas.append({
+            "parameter": "composition",
+            "before_crop": [round(float(v), 4) for v in before_ev.composition.crop],
+            "after_crop": [round(float(v), 4) for v in current_ev.composition.crop],
+            "before_angle": round(float(before_ev.composition.angle), 3),
+            "after_angle": round(float(current_ev.composition.angle), 3),
+        })
+
+    for field in ("distortion", "vignetting_ev"):
+        b_val = getattr(before_ev.lens_corrections, field)
+        c_val = getattr(current_ev.lens_corrections, field)
+        if b_val != c_val:
+            deltas.append({
+                "parameter": f"lens_corrections.{field}",
+                "before": round(float(b_val), 4),
+                "after": round(float(c_val), 4),
+                "delta": round(float(c_val - b_val), 4),
+            })
+
+    for field in ("sharpening", "masking", "luminance_nr", "chroma_nr"):
+        b_val = getattr(before_ev.detail, field)
+        c_val = getattr(current_ev.detail, field)
+        if b_val != c_val:
+            deltas.append({
+                "parameter": f"detail.{field}",
+                "before": round(float(b_val), 4),
+                "after": round(float(c_val), 4),
+                "delta": round(float(c_val - b_val), 4),
+            })
+
+    b_cm = b_dict["color_mixer"]
+    c_cm = c_dict["color_mixer"]
+    for band in b_cm:
+        if b_cm[band] != c_cm[band]:
+            deltas.append({
+                "parameter": f"color_mixer.{band}",
+                "before": b_cm[band],
+                "after": c_cm[band],
+            })
+
+    b_cg = b_dict["color_grading"]
+    c_cg = c_dict["color_grading"]
+    for zone in ("shadows", "midtones", "highlights"):
+        if b_cg[zone] != c_cg[zone]:
+            deltas.append({
+                "parameter": f"color_grading.{zone}",
+                "before": b_cg[zone],
+                "after": c_cg[zone],
+            })
+    for key in ("blend", "balance"):
+        if b_cg[key] != c_cg[key]:
+            deltas.append({
+                "parameter": f"color_grading.{key}",
+                "before": round(float(b_cg[key]), 4),
+                "after": round(float(c_cg[key]), 4),
+                "delta": round(float(c_cg[key] - b_cg[key]), 4),
+            })
+
+    if before_ev.rgb_curve != current_ev.rgb_curve:
+        deltas.append({
+            "parameter": "rgb_curve",
+            "before_points": len(before_ev.rgb_curve),
+            "after_points": len(current_ev.rgb_curve),
+            "before_black_y": round(float(before_ev.rgb_curve[0][1]), 4),
+            "after_black_y": round(float(current_ev.rgb_curve[0][1]), 4),
+            "before_white_y": round(float(before_ev.rgb_curve[-1][1]), 4),
+            "after_white_y": round(float(current_ev.rgb_curve[-1][1]), 4),
+        })
+
+    if before_ev.local_gradients != current_ev.local_gradients:
+        before_by_id = {g.id: g for g in before_ev.local_gradients}
+        after_by_id = {g.id: g for g in current_ev.local_gradients}
+        deltas.append({
+            "parameter": "local_gradients",
+            "before_count": len(before_ev.local_gradients),
+            "after_count": len(current_ev.local_gradients),
+            "added": [_clean_summary_text(g.name, 40) for gid, g in after_by_id.items() if gid not in before_by_id][:4],
+            "removed": [_clean_summary_text(g.name, 40) for gid, g in before_by_id.items() if gid not in after_by_id][:4],
+            "changed": [_clean_summary_text(g.name, 40) for gid, g in after_by_id.items()
+                        if gid in before_by_id and g != before_by_id[gid]][:4],
+        })
+
+    if before_ev.spots != current_ev.spots:
+        deltas.append({
+            "parameter": "spots",
+            "before_count": len(before_ev.spots),
+            "after_count": len(current_ev.spots),
+            "after_heal": sum(1 for s in current_ev.spots if s.mode == "heal" and s.enabled),
+            "after_clone": sum(1 for s in current_ev.spots if s.mode == "clone" and s.enabled),
+        })
+
+    if before_ev.goal != current_ev.goal:
+        deltas.append({"parameter": "goal", "changed": True})
+
+    return deltas[:16]
 
 
 @dataclass(frozen=True)
@@ -24,6 +165,36 @@ class TurnSummary:
     tools_used: tuple[str, ...] = ()
     action_label: str = ""
     applied: bool = False
+    parameters: dict[str, Any] | None = None
+    proposed_actions: tuple[str, ...] = ()
+    next_step: str = ""
+    watch_stop: str = ""
+    goal: str = ""
+
+
+def _subsequent_edit_events(
+    events: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    photo_id: str,
+    session_id: str,
+    since_version: int,
+) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("photo_id") != photo_id or event.get("session_id") != session_id:
+            continue
+        ver = event.get("state_version")
+        if type(ver) is not int or ver <= since_version:
+            continue
+        etype = event.get("type")
+        if etype in ("parameter", "undo", "redo", "reset", "snapshot_restore"):
+            if event.get("phase") != "update":
+                matched.append(event)
+        elif etype == "gesture":
+            if event.get("phase") == "end" and event.get("history_entry") is not None:
+                matched.append(event)
+    return matched
 
 
 class SessionWorkingMemory:
@@ -33,6 +204,9 @@ class SessionWorkingMemory:
         self.max_turns = max(1, int(max_turns))
         self._binding: tuple[str, str] | None = None
         self._entries: list[TurnSummary] = []
+
+    def is_bound_to(self, photo_id: str, session_id: str) -> bool:
+        return self._binding == (photo_id, session_id)
 
     def bind(self, photo_id: str, session_id: str) -> None:
         key = (photo_id, session_id)
@@ -46,22 +220,140 @@ class SessionWorkingMemory:
 
     def record(self, photo_id: str, session_id: str, summary: TurnSummary) -> None:
         self.bind(photo_id, session_id)
-        self._entries.append(summary)
+        params = EditValues.from_dict(summary.parameters).to_dict() if summary.parameters is not None else None
+        cleaned = TurnSummary(
+            state_version=max(0, int(summary.state_version)),
+            question=_clean_summary_text(summary.question, 400),
+            decision=_clean_summary_text(summary.decision, 400),
+            objective=_clean_summary_text(summary.objective, 400),
+            tools_used=tuple(_clean_summary_text(t, 80) for t in summary.tools_used[:8] if _clean_summary_text(t, 80)),
+            action_label=_clean_summary_text(summary.action_label, 200),
+            applied=bool(summary.applied),
+            parameters=params,
+            proposed_actions=tuple(
+                _clean_summary_text(a, 200) for a in summary.proposed_actions[:6] if _clean_summary_text(a, 200)
+            ),
+            next_step=_clean_summary_text(summary.next_step, 400),
+            watch_stop=_clean_summary_text(summary.watch_stop, 400),
+            goal=_clean_summary_text(summary.goal, 400),
+        )
+        self._entries.append(cleaned)
         if len(self._entries) > self.max_turns:
             self._entries = self._entries[-self.max_turns :]
 
-    def mark_last_applied(self, action_label: str = "") -> None:
+    def mark_last_applied(self, action_label: str = "", *,
+                          photo_id: str | None = None, session_id: str | None = None) -> None:
+        if (photo_id is not None or session_id is not None) and self._binding != (photo_id, session_id):
+            return
         if not self._entries:
             return
         last = self._entries[-1]
+        cleaned_label = _clean_summary_text(action_label, 200) if action_label else ""
         self._entries[-1] = replace(
             last,
             applied=True,
-            action_label=action_label or last.action_label,
+            action_label=cleaned_label or last.action_label,
         )
 
     def entries(self) -> tuple[TurnSummary, ...]:
         return tuple(self._entries)
+
+    def last_advice_for(self, photo_id: str, session_id: str) -> TurnSummary | None:
+        if self._binding != (photo_id, session_id) or not self._entries:
+            return None
+        return self._entries[-1]
+
+    def last_advice_summary(self, photo_id: str | None = None, session_id: str | None = None) -> dict[str, Any] | None:
+        if (photo_id is not None or session_id is not None) and self._binding != (photo_id, session_id):
+            return None
+        if not self._entries:
+            return None
+        last = self._entries[-1]
+        proposed = list(last.proposed_actions[:6]) if last.proposed_actions else (
+            [last.action_label] if last.action_label else []
+        )
+        return {
+            "state_version": last.state_version,
+            "question": last.question,
+            "decision": last.decision,
+            "objective": last.objective,
+            "next_step": last.next_step,
+            "watch_stop": last.watch_stop,
+            "proposed_actions": proposed[:6],
+            "applied": bool(last.applied),
+            "tools_used": list(last.tools_used[:8]),
+            "has_parameters_snapshot": last.parameters is not None,
+        }
+
+    def has_subsequent_edits(
+        self,
+        photo_id: str,
+        session_id: str,
+        current_state_version: int,
+        events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        *,
+        current_values: EditValues | None = None,
+    ) -> bool:
+        last = self.last_advice_for(photo_id, session_id)
+        if last is None:
+            return False
+        if _subsequent_edit_events(events or (), photo_id, session_id, last.state_version):
+            return True
+        if current_values is not None and last.parameters is not None:
+            try:
+                if EditValues.from_dict(last.parameters).to_dict() != current_values.to_dict():
+                    return True
+            except (TypeError, ValueError):
+                pass
+        if not events and last.parameters is None and current_state_version > last.state_version:
+            return True
+        return False
+
+    def follow_up_context(
+        self,
+        events: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        current_state: EditState,
+    ) -> dict[str, Any] | None:
+        last = self.last_advice_for(current_state.photo_id, current_state.session_id)
+        if last is None:
+            return None
+        prior_summary = self.last_advice_summary(current_state.photo_id, current_state.session_id)
+        assert prior_summary is not None
+        sub_events = _subsequent_edit_events(
+            events or (), current_state.photo_id, current_state.session_id, last.state_version
+        )
+        subsequent_actions = [
+            {
+                "sequence": int(event["sequence"]),
+                "state_version": int(event["state_version"]),
+                "type": str(event["type"]),
+                "parameter": _clean_summary_text(str(event.get("parameter") or "all"), 80),
+            }
+            for event in sub_events[-12:]
+        ]
+        undo_count = sum(1 for event in sub_events if event.get("type") == "undo")
+        redo_count = sum(1 for event in sub_events if event.get("type") == "redo")
+        reset_count = sum(1 for event in sub_events if event.get("type") == "reset")
+        curr_dict = current_state.values.to_dict()
+        deltas = summarize_parameter_deltas(last.parameters, curr_dict) if last.parameters is not None else []
+        changed_since = bool(deltas) if last.parameters is not None else bool(sub_events)
+        reverted = bool(last.parameters is not None and not deltas and bool(sub_events))
+        payload = {
+            "version": 1,
+            "kind": "follow_up_review",
+            "prior_advice": prior_summary,
+            "current_state_version": int(current_state.revision),
+            "revisions_elapsed": max(0, int(current_state.revision) - last.state_version),
+            "subsequent_actions": subsequent_actions,
+            "undo_count": undo_count,
+            "redo_count": redo_count,
+            "reset_count": reset_count,
+            "parameter_deltas": deltas,
+            "parameters_changed_since_advice": changed_since,
+            "reverted_to_prior_parameters": reverted,
+        }
+        from .coach import validate_follow_up_context
+        return validate_follow_up_context(payload, state_version=current_state.revision)
 
     def prompt_snippet(self, max_chars: int = 800) -> str:
         if not self._entries:
@@ -238,6 +530,8 @@ class StyleMemoryStore:
             added = after.local_gradients[-1]
             if getattr(added, "warmth", 0.0) >= 0.2:
                 candidates.append("Favors warm directional local lighting masks.")
+        if after.color_grading != before.color_grading and not after.color_grading.is_identity:
+            candidates.append("Uses subtle 3-way Color Grading tonal mood.")
         if not candidates and after != before:
             candidates.append("Applies conservative incremental adjustments.")
         for rule in candidates[:2]:
@@ -434,6 +728,14 @@ PLAYBOOK_CARDS: tuple[PlaybookCard, ...] = (
         "Stop if sky noise or smooth-gradient banding appears.",
     ),
     PlaybookCard(
+        "pb_color_grading",
+        "3-Way Color Grading & Split Toning",
+        "color grading split tone toning teal orange cinematic mood shadows midtones highlights blend balance hue wheel 色彩分级 分离色调 色轮 青橙 电影感 阴影偏冷 高光偏暖 混合 平衡",
+        "Use color_grading.<shadows|midtones|highlights>.<hue|saturation|luminance> (hue 0..359, saturation 0..1, luminance -1..1) plus blend (0..1) and balance (-1..1). Always set saturation > 0 when introducing a hue tint, start subtle (saturation 0.12-0.30), and use visual verification checks for pure luma-neutral tints.",
+        ("color_grading",),
+        "Stop if neutral grays, snow, or skin tones pick up an unintended cast or midtone transitions turn muddy.",
+    ),
+    PlaybookCard(
         "pb_white_balance",
         "Sensor White Balance (Warmth/Tint & Neutral Picker)",
         "white balance wb warmth tint color cast yellow blue magenta green 白平衡 偏色 色温 色调",
@@ -480,6 +782,14 @@ PLAYBOOK_CARDS: tuple[PlaybookCard, ...] = (
         "If current parameters and preview already honor the user's goal (including intentional low-key shadows or silhouettes), choose decision='stop' with actions=[] instead of forcing unnecessary edits.",
         (),
         "Stop cleanly and explain why current tonal separation already works.",
+    ),
+    PlaybookCard(
+        "pb_follow_up_review",
+        "Follow-Up Diagnosis (Did My Adjustment Help?)",
+        "follow up followup did it help adjustment review compare before after undo revert overshoot 复盘 效果 有帮助吗 变好了吗 有效吗 撤销",
+        "When follow_up is present, give a direct verdict first (helped / mixed / neutral or reverted / regressed) comparing prior_advice, actual parameter_deltas, undo/redo history, and before-vs-current application_evidence. Separate measured pixel/histogram changes from subjective preference, and choose decision='stop' with actions=[] when the edit already met the goal or was reverted.",
+        (),
+        "Stop cleanly once the adjustment achieves the goal or was intentionally reverted, rather than stacking redundant edits.",
     ),
 )
 

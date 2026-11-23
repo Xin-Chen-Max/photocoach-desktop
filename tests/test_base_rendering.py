@@ -79,6 +79,10 @@ def test_schema8_migration_keeps_every_legacy_history_and_pixel(tmp_path):
     def remove_mode(value):
         if isinstance(value, dict):
             value.pop("base_rendering", None)
+            value.pop("color_grading", None)
+            value.pop("spots", None)
+            value.pop("compare_snapshot_id", None)
+            value.pop("snapshots", None)
             for child in value.values():
                 remove_mode(child)
         elif isinstance(value, list):
@@ -88,7 +92,7 @@ def test_schema8_migration_keeps_every_legacy_history_and_pixel(tmp_path):
     old.update(schema_version=8, pipeline_version="phase1-sdr-srgb-v8")
     original = copy.deepcopy(old)
     upgraded = upgrade_project(old)
-    assert old == original and upgraded["schema_version"] == 9
+    assert old == original and upgraded["schema_version"] == 14
     undo, redo = validate_project(upgraded)
     assert undo == store.undo_stack and redo == store.redo_stack
     document = tmp_path / "old.photocoach"

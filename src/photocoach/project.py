@@ -12,9 +12,12 @@ from . import __version__
 from .imaging import dependency_versions
 from .safe_io import atomic_write, is_supported_raw_suffix, sha256_file
 from .state import EDIT_PIPELINE_VERSION, EditState, EditValues, HistoryEntry, StateStore
-from .gradients import LinearGradient
+from .gradients import LinearGradient, RadialGradient, gradient_from_dict
+from .snapshots import EditSnapshot, validate_snapshots
 
 MAX_PROJECT_BYTES = 64 * 1024 * 1024
+SCHEMA_VERSION = 14
+_V14_MASK_KEYS = frozenset(("luma_min", "luma_max", "luma_feather", "edge_aware"))
 
 
 class SourceMissing(FileNotFoundError):
@@ -27,12 +30,14 @@ def snapshot_project(store: StateStore) -> dict:
     state = store.current
     if state is None:
         raise ValueError("Open a photo before saving a project.")
-    return {"format": "photocoach-project", "schema_version": 9,
+    return {"format": "photocoach-project", "schema_version": SCHEMA_VERSION,
             "pipeline_version": EDIT_PIPELINE_VERSION, "project_id": store.project_id,
             "created_utc": store.created_utc, "saved_utc": store._now(),
             "source": {"path": str(state.source_path), "sha256": state.photo_id},
             "state": {"revision": state.revision, "parameters": state.values.to_dict(),
-                      "compare_baseline": state.compare_baseline},
+                      "compare_baseline": state.compare_baseline,
+                      "compare_snapshot_id": state.compare_snapshot_id},
+            "snapshots": [snapshot.to_dict() for snapshot in store.snapshots],
             "history": {"events": store.project_events(),
                         "undo": [entry.to_dict() for entry in store.undo_stack],
                         "redo": [entry.to_dict() for entry in store.redo_stack]},
@@ -46,19 +51,34 @@ def _require(condition: bool, message="Project state and operation history disag
 
 
 def upgrade_project(data: dict) -> dict:
-    """Normalize only known v1–v8 contracts, without writing the source project.
+    """Normalize only known v1–v13 contracts, without writing the source project.
 
     Old history is enriched with neutral defaults for newer controls. The rest is still validated
     by full audit replay. New-schema files never get missing parameters filled in.
     """
     _require(isinstance(data, dict), "Invalid project document.")
     version = data.get("schema_version")
-    if version not in (1, 2, 3, 4, 5, 6, 7, 8) or type(version) is not int:
+    if version not in range(1, SCHEMA_VERSION) or type(version) is not int:
         return data
+    expected_pipeline = "phase1-sdr-srgb-v10" if version in (10, 11) else f"phase1-sdr-srgb-v{version}"
     _require(data.get("format") == "photocoach-project" and
-             data.get("pipeline_version") == f"phase1-sdr-srgb-v{version}", "Unsupported legacy rendering pipeline.")
+             data.get("pipeline_version") == expected_pipeline, "Unsupported legacy rendering pipeline.")
+    if version <= 10:
+        _require("snapshots" not in data, "Legacy project cannot already carry v11 snapshots.")
+        _require(isinstance(data.get("state"), dict) and "compare_snapshot_id" not in data["state"],
+                 "Legacy project cannot already carry v11 snapshot comparison.")
+    else:
+        _require("snapshots" in data and isinstance(data["snapshots"], list), "Missing project snapshots.")
+        _require(isinstance(data.get("state"), dict) and "compare_snapshot_id" in data["state"],
+                 "Missing snapshot comparison state.")
     data = copy.deepcopy(data)
-    additions = {"base_rendering": "legacy_v1"}
+    additions: dict = {}
+    if version <= 12:
+        additions["spots"] = []
+    if version <= 9:
+        additions["color_grading"] = EditValues().color_grading.to_dict()
+    if version <= 8:
+        additions["base_rendering"] = "legacy_v1"
     if version <= 7:
         additions["lens_corrections"] = EditValues().lens_corrections.to_dict()
     if version <= 5:
@@ -73,17 +93,38 @@ def upgrade_project(data: dict) -> dict:
         additions.update(highlights=0.0, shadows=0.0)
     legacy_keys = set(EditValues().to_dict()) - set(additions)
     def parameters(value):
-        _require(isinstance(value, dict) and legacy_keys <= set(value) <= (legacy_keys | ({"detail"} if version == 8 else set())), "Invalid legacy editing parameters.")
-        if version==6:
-            _require(isinstance(value['local_gradients'],list),'Invalid legacy gradient collection.')
+        _require(isinstance(value, dict) and legacy_keys <= set(value) <= (legacy_keys | ({"detail"} if version in (8, 9, 10, 11, 12, 13) else set())), "Invalid legacy editing parameters.")
+        if isinstance(value.get("local_gradients"), list):
+            if any(isinstance(gradient, dict) and (_V14_MASK_KEYS & set(gradient)) for gradient in value["local_gradients"]):
+                raise ValueError("Legacy project cannot carry v14 mask range/edge fields.")
+        if version == 6:
+            _require(isinstance(value['local_gradients'], list), 'Invalid legacy gradient collection.')
             for gradient in value['local_gradients']:
                 LinearGradient.from_dict(gradient)
+        elif version in (7, 8, 9, 10, 11):
+            _require(isinstance(value['local_gradients'], list), 'Invalid legacy gradient collection.')
+            for gradient in value['local_gradients']:
+                if isinstance(gradient, dict) and gradient.get('kind') == 'radial':
+                    RadialGradient.from_dict(gradient)
+                else:
+                    LinearGradient.from_dict(gradient)
+        elif version in (12, 13):
+            _require(isinstance(value['local_gradients'], list), 'Invalid legacy gradient collection.')
+            for gradient in value['local_gradients']:
+                gradient_from_dict(gradient)
         return dict(value, **copy.deepcopy(additions))
     def entry(item):
         item["before"] = parameters(item["before"])
         item["after"] = parameters(item["after"])
     try:
         data["state"]["parameters"] = parameters(data["state"]["parameters"])
+        if version <= 10:
+            data["state"]["compare_snapshot_id"] = None
+            data["snapshots"] = []
+        else:
+            for snap in data["snapshots"]:
+                _require(isinstance(snap, dict) and "values" in snap, "Malformed legacy snapshot.")
+                snap["values"] = parameters(snap["values"])
         for event in data["history"]["events"]:
             event["edit_before"] = parameters(event["edit_before"])
             event["edit_after"] = parameters(event["edit_after"])
@@ -95,7 +136,7 @@ def upgrade_project(data: dict) -> dict:
             entry(item)
     except (KeyError, TypeError, IndexError, AttributeError) as error:
         raise ValueError("Malformed legacy project.") from error
-    data["schema_version"] = 9
+    data["schema_version"] = SCHEMA_VERSION
     data["pipeline_version"] = EDIT_PIPELINE_VERSION
     return data
 
@@ -104,7 +145,7 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
     """Reconstruct undo/redo from audit events instead of trusting stored stacks."""
     data = upgrade_project(data)
     _require(data.get("format") == "photocoach-project" and type(data.get("schema_version")) is int
-             and data["schema_version"] == 9, "Unsupported project format or schema version. Newer projects require a newer PhotoCoach.")
+             and data["schema_version"] == SCHEMA_VERSION, "Unsupported project format or schema version. Newer projects require a newer PhotoCoach.")
     _require(data.get("pipeline_version") == EDIT_PIPELINE_VERSION, "This project uses an unsupported rendering pipeline.")
     try:
         photo_id = data["source"]["sha256"]
@@ -113,11 +154,20 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
         _require(isinstance(data["project_id"], str) and bool(data["project_id"]), "Invalid project identity.")
         _require(isinstance(data["created_utc"], str), "Invalid project creation time.")
         target = EditValues.from_dict(data["state"]["parameters"])
+        _require("snapshots" in data and isinstance(data["snapshots"], list), "Missing project snapshots.")
+        snapshots = validate_snapshots([EditSnapshot.from_dict(item) for item in data["snapshots"]])
+        snapshot_ids = {snap.id for snap in snapshots}
+        _require("compare_snapshot_id" in data["state"], "Missing snapshot comparison state.")
+        target_compare_snapshot = data["state"]["compare_snapshot_id"]
+        _require(
+            target_compare_snapshot is None or (isinstance(target_compare_snapshot, str) and bool(target_compare_snapshot)),
+            "Invalid snapshot comparison reference.",
+        )
         events = data["history"]["events"]
         _require(isinstance(events, list) and 1 <= len(events) <= 200000, "Invalid operation history length.")
         values = EditValues.from_dict(events[0]["edit_before"])
         _require(values == EditValues(base_rendering=values.base_rendering), "Invalid initial editing state.")
-        revision, comparison = 0, False
+        revision, comparison, compared_snapshot = 0, False, None
         undo: list[HistoryEntry] = []
         redo: list[HistoryEntry] = []
         gesture = None
@@ -139,7 +189,7 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
             entry_before = None
             if index == 0:
                 _require(kind == "photo_switch" and event["after"] == photo_id and after == EditValues(base_rendering=before.base_rendering))
-            elif kind in ("parameter", "reset", "cancel", "undo", "redo"):
+            elif kind in ("parameter", "reset", "cancel", "undo", "redo", "snapshot_restore"):
                 _require(after != before)
                 revision += 1
                 if kind in ("parameter", "cancel"):
@@ -152,6 +202,9 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
                     _require(event["parameter"] == "all" and event["before"] == before.to_dict() and event["after"] == after.to_dict())
                 if kind == "reset":
                     _require(after == EditValues(goal=before.goal, base_rendering=before.base_rendering) and gesture is None)
+                    entry_before = before
+                elif kind == "snapshot_restore":
+                    _require(gesture is None and event["transaction_id"] is None and event["phase"] == "end")
                     entry_before = before
                 elif kind == "parameter":
                     if gesture is None:
@@ -174,8 +227,29 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
             elif kind == "compare":
                 _require(gesture is None and before == after and type(event["after"]) is bool)
                 _require(event["before"] == comparison and event["after"] != comparison)
+                _require(not event["after"] or compared_snapshot is None)
                 comparison = event["after"]
                 revision += 1
+            elif kind == "compare_snapshot":
+                _require(gesture is None and before == after and event["parameter"] == "compare_snapshot_id")
+                _require(event["before"] == compared_snapshot and event["after"] != compared_snapshot)
+                _require(event["after"] is None or (isinstance(event["after"], str) and bool(event["after"])))
+                _require(event["after"] is None or not comparison)
+                compared_snapshot = event["after"]
+                revision += 1
+            elif kind in ("snapshot_save", "snapshot_delete"):
+                _require(gesture is None and before == after and event["parameter"] == "snapshots")
+                meta = event["after"] if kind == "snapshot_save" else event["before"]
+                other = event["before"] if kind == "snapshot_save" else event["after"]
+                _require(
+                    other is None
+                    and isinstance(meta, dict)
+                    and set(meta) == {"id", "name"}
+                    and isinstance(meta["id"], str)
+                    and bool(meta["id"])
+                    and isinstance(meta["name"], str)
+                    and bool(meta["name"])
+                )
             elif kind == "gesture":
                 _require(before == after)
                 if event["phase"] == "begin":
@@ -213,6 +287,9 @@ def validate_project(data: dict) -> tuple[list[HistoryEntry], list[HistoryEntry]
         _require(gesture is None, "Project contains an unfinished editing gesture.")
         _require(type(data["state"]["revision"]) is int and data["state"]["revision"] == revision and target == values)
         _require(type(data["state"]["compare_baseline"]) is bool and data["state"]["compare_baseline"] == comparison)
+        _require(target_compare_snapshot == compared_snapshot)
+        _require(not (comparison and compared_snapshot is not None))
+        _require(compared_snapshot is None or compared_snapshot in snapshot_ids)
         _require(data["history"]["undo"] == [entry.to_dict() for entry in undo])
         _require(data["history"]["redo"] == [entry.to_dict() for entry in redo])
         return undo, redo
@@ -243,9 +320,11 @@ def read_project(path: Path, *, source_override: Path | None = None) -> StateSto
     def invalid_constant(value):
         raise ValueError(f"Invalid JSON number: {value}")
     data = json.loads(path.read_text(encoding="utf-8"), parse_constant=invalid_constant)
-    legacy = isinstance(data, dict) and data.get("schema_version") in (1, 2, 3, 4, 5, 6, 7, 8)
+    legacy = isinstance(data, dict) and type(data.get("schema_version")) is int and data.get("schema_version") in range(1, SCHEMA_VERSION)
     data = upgrade_project(data)
     undo, redo = validate_project(data)
+    snapshots = list(validate_snapshots([EditSnapshot.from_dict(item) for item in data["snapshots"]]))
+    compare_snapshot = next((snap for snap in snapshots if snap.id == data["state"]["compare_snapshot_id"]), None)
     source = source_override or Path(data["source"]["path"])
     if not source.is_absolute():
         source = path.parent / source
@@ -257,7 +336,9 @@ def read_project(path: Path, *, source_override: Path | None = None) -> StateSto
     _require(data["source"].get("byte_length") == source.stat().st_size, "The source file size does not match the project.")
     store = StateStore()
     if legacy:
-        store.load_warnings.append("Legacy project restored; existing edits are preserved. Saving uses format v9, which older PhotoCoach versions cannot open.")
+        store.load_warnings.append(
+            f"Legacy project restored; existing edits are preserved. Saving uses format v{SCHEMA_VERSION}, which older PhotoCoach versions cannot open."
+        )
     recorded = data.get("provenance", {}).get("dependencies", {})
     current_versions = dependency_versions()
     changed = [name for name in ("rawpy", "libraw", "numpy") if recorded.get(name) != current_versions.get(name)]
@@ -266,8 +347,11 @@ def read_project(path: Path, *, source_override: Path | None = None) -> StateSto
                                    ". Parameters were restored; pixel-identical rendering across versions is not guaranteed.")
     store.project_id = data["project_id"]
     store.created_utc = data["created_utc"]
+    store.snapshots = snapshots
+    store._saved_snapshots = tuple(snapshots)
     store.current = EditState(data["source"]["sha256"], source, str(uuid4()),
-                              revision=data["state"]["revision"], compare_baseline=data["state"]["compare_baseline"])
+                              revision=data["state"]["revision"], compare_baseline=data["state"]["compare_baseline"],
+                              compare_snapshot=compare_snapshot)
     store.current = store.current.with_values(EditValues.from_dict(data["state"]["parameters"]))
     store.events = copy.deepcopy(data["history"]["events"])
     store.undo_stack, store.redo_stack = undo, redo

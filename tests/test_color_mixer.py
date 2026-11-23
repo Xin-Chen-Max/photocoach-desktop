@@ -153,9 +153,13 @@ def test_legacy_history_migration_is_complete_strict_and_read_only(tmp_path, ver
     data = snapshot_project(store)
     def strip(value):
         if isinstance(value, dict):
+            value.pop("compare_snapshot_id", None)
+            value.pop("snapshots", None)
             if "white_balance" in value:
                 value.pop("base_rendering")
                 value.pop("color_mixer")
+                value.pop("color_grading")
+                value.pop("spots")
                 value.pop("local_gradients")
                 value.pop("lens_corrections")
                 for name in ("whites", "blacks", "vibrance"): value.pop(name)
@@ -172,7 +176,7 @@ def test_legacy_history_migration_is_complete_strict_and_read_only(tmp_path, ver
     original = copy.deepcopy(data)
     upgraded = upgrade_project(data)
     undo, redo = validate_project(upgraded)
-    assert data == original and upgraded["schema_version"] == 9
+    assert data == original and upgraded["schema_version"] == 14
     assert undo == store.undo_stack and redo == store.redo_stack
     bad = copy.deepcopy(data)
     bad["state"]["parameters"]["color_mixer"] = {}
@@ -191,7 +195,7 @@ def test_ten_edits_history_restore_and_ai_context(tmp_path):
     write_project(target, snapshot_project(store))
     loaded = read_project(target)
     assert loaded.current.values == final and loaded.undo_stack == store.undo_stack
-    assert json.loads(target.read_text())["schema_version"] == 9
+    assert json.loads(target.read_text())["schema_version"] == 14
     pixels = np.zeros((4, 6, 3), np.uint8)
     request = build_request(store.current, before, store.events, pixels, pixels)
     assert request.parameters["color_mixer"]["yellow"]["lightness"] == 10

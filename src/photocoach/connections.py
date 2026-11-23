@@ -124,7 +124,7 @@ class ConnectionBook:
         endpoint, model, protocol, label = defaults.get(provider, defaults["custom"])
         config = ApiConfig(endpoint=endpoint, model=model, protocol=protocol,
                            timeout_seconds=300 if protocol == "ollama" else 60 if protocol == "gemini" else 30,
-                           max_output_tokens=4096 if protocol == "ollama" else 8192 if protocol == "gemini" else 1500)
+                           max_output_tokens=0 if protocol == "ollama" else 8192 if protocol == "gemini" else 1500)
         return Connection(new_connection_id(), provider, label, config)
 
     def with_connection(self, connection: Connection, *, activate=True) -> "ConnectionBook":

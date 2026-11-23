@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from photocoach.color_grading import ColorGrading, ColorWheel
 from photocoach.imaging import RawOptions
 from photocoach.models import ProbeStore
 
@@ -74,3 +75,20 @@ def test_invalid_exposure_does_not_change_state(value):
         store.set_exposure(value)
     assert store.current == initial
     assert len(store.events) == 1
+
+
+def test_color_grading_drag_rejection_and_stale_snapshot():
+    store = ProbeStore()
+    initial = store.activate(Path('example.ARW'), 'digest-a')
+    with pytest.raises(ValueError):
+        store.set_parameter('color_grading', ColorGrading(blend=2.0))
+    assert store.current == initial
+    assert len(store.events) == 1
+
+    store.begin_drag('color_grading')
+    store.set_parameter('color_grading', ColorGrading(shadows=ColorWheel(210.0, 0.3, 0.0)))
+    store.set_parameter('color_grading', ColorGrading(shadows=ColorWheel(210.0, 0.5, 0.0)))
+    store.end_drag()
+    assert not store.accepts(initial)
+    assert len(store.undo_stack) == 1
+    assert store.current.color_grading.shadows.saturation == 0.5

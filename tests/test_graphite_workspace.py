@@ -118,3 +118,50 @@ def test_crop_straighten_entry_points_summary_and_undoable_reset(window):
     window._set_controls(False)
     assert not window.crop_open_button.isEnabled() and not window.crop_reset_button.isEnabled()
     assert window.api_budget.attempts == window.coach.calls == 0
+
+
+def test_edit_sections_toggle_without_horizontal_or_zoom_jitter(window):
+    import numpy as np
+    from PySide6.QtCore import Qt
+    app = QApplication.instance()
+    assert window.detail_editor.note.wordWrap()
+    assert window.lens_editor.note.wordWrap()
+    assert window.edit_scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+    assert window.edit_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+    window.preview.configure_photo((6000, 4000))
+    window.preview.display(np.full((400, 600, 3), 120, dtype=np.uint8))
+    sections = (
+        window.light_section,
+        window.crop_section,
+        window.lens_section,
+        window.detail_section,
+        window.local_section,
+        window.spots_section,
+        window.color_section,
+        window.curve_section,
+    )
+    for size in ((1280, 800), (1920, 1080)):
+        window.resize(*size)
+        for lang in ("en", "zh"):
+            if (lang == "zh") != window.lang_button.isChecked():
+                window.toggle_language()
+            for _ in range(3):
+                app.processEvents()
+            baseline_vp_w = window.edit_scroll.viewport().width()
+            baseline_splitter = window.editor_splitter.sizes()
+            baseline_preview_size = window.preview.size()
+            baseline_zoom = window.preview.zoom
+            for section in sections:
+                section.toggle.click()
+                for _ in range(3):
+                    app.processEvents()
+                assert window.edit_scroll.viewport().width() == baseline_vp_w
+                assert window.editor_splitter.sizes() == baseline_splitter
+                assert window.preview.size() == baseline_preview_size
+                assert abs(window.preview.zoom - baseline_zoom) < 1e-9
+                section.toggle.click()
+                for _ in range(3):
+                    app.processEvents()
+    if window.lang_button.isChecked():
+        window.toggle_language()

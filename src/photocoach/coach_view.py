@@ -2,9 +2,9 @@
 from html import escape
 import re
 
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QTextOption, QColorSpace, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QHBoxLayout,
+from PySide6.QtCore import Qt, Signal, QTimer, QPointF, QRectF
+from PySide6.QtGui import QTextOption, QColorSpace, QImage, QPixmap, QPainter, QPen, QColor, QFontMetrics
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QDialogButtonBox, QHBoxLayout,
                               QLabel, QPushButton, QSizePolicy, QTextBrowser,
                               QVBoxLayout, QWidget, QPlainTextEdit, QMenu, QToolButton)
 
@@ -12,6 +12,7 @@ from .coach import CoachFeedback
 from .coach_agent import region_label
 from .budget import SessionBudget
 from .color_mixer import COLOR_KEYS, COLOR_NAMES
+from .color_grading import WHEEL_FIELDS, WHEEL_NAMES
 
 
 class QuestionInput(QPlainTextEdit):
@@ -88,7 +89,15 @@ CONTROL_NAMES.update({'lens_corrections': 'Lens corrections',
                       'detail.chroma_nr': 'Color NR'})
 CONTROL_NAMES["color_mixer"] = "Color Mixer"
 CONTROL_NAMES['local_gradients']='Local adjustments'
+CONTROL_NAMES["spots"] = "Spot removal"
 CONTROL_NAMES.update({f"color_mixer.{key}": f"Color Mixer · {name}" for key, name in zip(COLOR_KEYS, COLOR_NAMES)})
+CONTROL_NAMES["color_grading"] = "Color Grading"
+CONTROL_NAMES["color_grading.blend"] = "Color Grading · Blend"
+CONTROL_NAMES["color_grading.balance"] = "Color Grading · Balance"
+for _zone in WHEEL_NAMES:
+    CONTROL_NAMES[f"color_grading.{_zone}"] = f"Color Grading · {_zone.title()}"
+    for _field in WHEEL_FIELDS:
+        CONTROL_NAMES[f"color_grading.{_zone}.{_field}"] = f"Color Grading · {_zone.title()} {_field.title()}"
 
 
 _DUP_LABEL = re.compile(
@@ -201,8 +210,12 @@ def format_agent_step_line(span, zh: bool = False, *, include_duration: bool = T
         tools_n = detail.get("tools")
         if zh:
             text = "已准备照片预览与编辑上下文" + (f"（{tools_n} 个可用工具）" if tools_n else "")
+            if detail.get("is_follow_up"):
+                text += " · 效果复盘"
         else:
             text = "Prepared photo previews & editing context" + (f" ({tools_n} tools)" if tools_n else "")
+            if detail.get("is_follow_up"):
+                text += " · follow-up"
     elif node == "reason":
         t_num = _turn_number(name)
         prefix = (f"第 {t_num} 轮 · " if t_num else "") if zh else (f"Turn {t_num} · " if t_num else "")
@@ -378,6 +391,90 @@ def agent_trace_summary(trace, zh: bool = False) -> str:
     return " · ".join(parts)
 
 
+def _friendly_follow_up_param(param: str, zh: bool) -> str:
+    extra = {
+        "base_rendering": ("Base rendering", "基础渲染 Base rendering"),
+        "goal": ("Editing goal", "编辑目标"),
+        "white_balance": ("White balance", "白平衡 White balance"),
+        "composition": ("Crop / Straighten", "裁剪与拉直 Crop"),
+        "rgb_curve": ("RGB curve", "RGB 曲线"),
+        "local_gradients": ("Local adjustments", "局部蒙版 Local"),
+        "spots": ("Spot removal", "污点修复 Spots"),
+        "color_mixer": ("Color Mixer", "混色器 Color Mixer"),
+        "color_grading": ("Color Grading", "色彩分级 Color Grading"),
+    }
+    if param in extra:
+        return extra[param][1 if zh else 0]
+    en_label = CONTROL_NAMES.get(param)
+    if en_label is None:
+        return param.replace("_", " ").title()
+    if zh:
+        from .i18n import translate_parameter_name
+        return translate_parameter_name(en_label, "zh")
+    return en_label
+
+
+def _format_follow_up_banner(follow_up: dict | None, zh: bool) -> tuple[str, str]:
+    if not isinstance(follow_up, dict):
+        return "", ""
+    prior = follow_up.get("prior_advice") or {}
+    prior_v = prior.get("state_version", 0)
+    curr_v = follow_up.get("current_state_version", prior_v)
+    deltas = follow_up.get("parameter_deltas") or []
+    changed_names: list[str] = []
+    for item in deltas:
+        if isinstance(item, dict) and item.get("parameter"):
+            label = _friendly_follow_up_param(str(item["parameter"]), zh)
+            if label not in changed_names:
+                changed_names.append(label)
+    undo_n = int(follow_up.get("undo_count", 0) or 0)
+    redo_n = int(follow_up.get("redo_count", 0) or 0)
+    reset_n = int(follow_up.get("reset_count", 0) or 0)
+    reverted = bool(follow_up.get("reverted_to_prior_parameters"))
+
+    if zh:
+        title = f"效果复盘 · v{prior_v} → v{curr_v}"
+        if reverted:
+            status = "已撤回至上一轮建议前参数"
+        elif changed_names:
+            more = f" (+{len(changed_names) - 3})" if len(changed_names) > 3 else ""
+            status = "变更：" + "、".join(changed_names[:3]) + more
+        else:
+            status = "无净参数变化"
+        ops = []
+        if undo_n:
+            ops.append(f"撤销 {undo_n} 次")
+        if redo_n:
+            ops.append(f"重做 {redo_n} 次")
+        if reset_n:
+            ops.append(f"重置 {reset_n} 次")
+        if ops:
+            status += " · " + " / ".join(ops)
+        prior_desc = str(prior.get("objective") or prior.get("next_step") or "").strip()
+        prior_line = f"上一轮建议 (v{prior_v})：{prior_desc}" if prior_desc else ""
+    else:
+        title = f"Follow-up review · v{prior_v} → v{curr_v}"
+        if reverted:
+            status = "reverted to prior parameters"
+        elif changed_names:
+            more = f" (+{len(changed_names) - 3})" if len(changed_names) > 3 else ""
+            status = "changed: " + ", ".join(changed_names[:3]) + more
+        else:
+            status = "no net parameter change"
+        ops = []
+        if undo_n:
+            ops.append(f"{undo_n} undo")
+        if redo_n:
+            ops.append(f"{redo_n} redo")
+        if reset_n:
+            ops.append(f"{reset_n} reset")
+        if ops:
+            status += " · " + ", ".join(ops)
+        prior_desc = str(prior.get("objective") or prior.get("next_step") or "").strip()
+        prior_line = f"Prior advice (v{prior_v}): {prior_desc}" if prior_desc else ""
+    return f"{title} · {status}", prior_line
+
+
 def _body(value: str) -> str:
     return _text(_display_text(value))
 
@@ -385,13 +482,19 @@ def _body(value: str) -> str:
 def related_control(next_step: str, gradients=()) -> str | None:
     """Offer navigation only for one unambiguous, supported control name."""
     if re.search(
-        r'\b(?:gradient|mask|radial|local adjustment|spotlight|key light|sunbeam|window light|backlight glow|sky filter|foreground fill)s?\b|'
-        r'渐变|蒙版|局部|径向|椭圆|人造光|聚光|主光|丁达尔|耶稣光|窗户光|侧光|逆光',
+        r'\b(?:gradient|mask|radial|brush|local adjustment|spotlight|key light|sunbeam|window light|backlight glow|sky filter|foreground fill)s?\b|'
+        r'渐变|蒙版|局部|径向|椭圆|画笔|人造光|聚光|主光|丁达尔|耶稣光|窗户光|侧光|逆光',
         next_step, re.I
     ):
         matches=[g for g in gradients if re.search(r'(?<!\w)'+re.escape(g.name)+r'(?!\w)',next_step,re.I) or
                  re.search(r'(?<!\w)'+re.escape(g.id)+r'(?!\w)',next_step)]
         return f'local_gradients.{matches[0].id}' if len(matches)==1 else 'local_gradients'
+    if re.search(
+        r"\b(?:spot[ _](?:removal|size|feather|opacity)|heal(?:ing)?|sensor[ _]dust|blemish(?:es)?|clone[ _]spot)s?\b|污点|瑕疵",
+        next_step,
+        re.I,
+    ):
+        return "spots"
     lens_targets = [name for name, pattern in (
         ('distortion', r'\bdistortion\b|畸变'), ('vignetting_ev', r'\bvignett(?:e|ing)(?:_ev)?\b|暗角'))
         if re.search(pattern, next_step, re.I)]
@@ -410,6 +513,27 @@ def related_control(next_step: str, gradients=()) -> str | None:
         chinese_colors = dict(zip(COLOR_KEYS, ("红色", "橙色", "黄色", "绿色", "青色", "蓝色", "紫色", "洋红")))
         colors = list(dict.fromkeys(colors + [key for key, text in chinese_colors.items() if text in next_step]))
         return f"color_mixer.{colors[0]}" if len(colors) == 1 else "color_mixer"
+    if re.search(r"\b(?:color[ _]grading|split[ _]ton(?:e|ing))\b|色彩分级|分离色调", next_step, re.I):
+        zones = [
+            zone for zone, pat in (
+                ("shadows", r"\bshadows?\b|阴影|暗部"),
+                ("midtones", r"\bmidtones?\b|中间调|中灰"),
+                ("highlights", r"\bhighlights?\b|高光|亮部"),
+            )
+            if re.search(pat, next_step, re.I)
+        ]
+        shared = [
+            key for key, pat in (
+                ("blend", r"\bblend\b|混合"),
+                ("balance", r"(?<!white[ _])\bbalance\b|(?<!白)平衡"),
+            )
+            if re.search(pat, next_step, re.I)
+        ]
+        if len(zones) == 1 and not shared:
+            return f"color_grading.{zones[0]}"
+        if len(shared) == 1 and not zones:
+            return f"color_grading.{shared[0]}"
+        return "color_grading"
     patterns = {"composition": r"\b(?:crop|straighten|composition)\b",
                 "exposure_ev": r"\bexposure(?:_ev)?\b",
                 "white_balance": r"\b(?:white[ _]balance|wb)\b",
@@ -632,6 +756,11 @@ class CoachOutput(QTextBrowser):
                          f"Current edit is v{self.reference_revision}; this advice has not been rechecked.")
         if self._question_changed() or self._superseded_question:
             lines.append("Edit or question changed. This reply answers the question shown below.")
+        follow_up_banner, prior_line = _format_follow_up_banner(getattr(feedback, "follow_up_context", None), self._lang == "zh")
+        if follow_up_banner:
+            lines.append(follow_up_banner)
+        if prior_line:
+            lines.append(prior_line)
         lines.extend([f"Question sent: {feedback.question}" if feedback.question else "Current edit review · No question was sent."])
         for heading, value in (("ANSWER", feedback.answer), ("NEXT STEP", feedback.next_step_or_stop),
                                ("WATCH / STOP", feedback.observe_and_stop_when),
@@ -667,6 +796,11 @@ class CoachOutput(QTextBrowser):
             warning = label("Edit or question changed. Analyze again before applying suggestions.",
                             "编辑或提问已变化，请重新分析后再应用建议。")
         notice = f'<p style="color:#f1c58c;">{warning}</p>' if warning else ""
+        follow_up_banner, prior_line = _format_follow_up_banner(getattr(feedback, "follow_up_context", None), zh)
+        follow_up_html = (
+            f'<p style="color:#9fc6ff; font-size:12px;"><b>{_text(follow_up_banner)}</b></p>'
+            if follow_up_banner else ""
+        )
         question = (f'<p style="color:#bcbcbc;">{_text(feedback.question)}</p>'
                     if feedback.question and (self._reading or not feedback.agent_plan) else "")
         answer = (f'<a name="answer"></a><p style="font-size:14px;">{_body(feedback.answer)}</p>'
@@ -696,7 +830,8 @@ class CoachOutput(QTextBrowser):
             navigation = f'<p><a href="photocoach:locate/{control}">{label("Go to", "定位到")} {_text(title)} →</a></p>'
         details = ""
         if self.evidence_expanded:
-            details = (f'<a name="why"></a><p>{_body(feedback.reason)}</p>'
+            prior_html = f'<p style="color:#9fc6ff;">{_text(prior_line)}</p>' if prior_line else ""
+            details = (f'<a name="why"></a>{prior_html}<p>{_body(feedback.reason)}</p>'
                        f'<p>{_body(feedback.main_change)}</p>'
                        + "".join(f'<p style="color:#bcbcbc;">{_body(item)}</p>' for item in feedback.evidence)
                        + f'<p style="color:#9a9a9a;">{_text(feedback.source)} · v{feedback.state_version}</p>')
@@ -735,7 +870,7 @@ class CoachOutput(QTextBrowser):
         self.setHtml(f"""
             <style>body, p {{ color:#e4e4e4; margin:{p_margin}; }} a {{ color:#9fc6ff; text-decoration:none; }}
             ul {{ margin-top:2px; margin-bottom:4px; }}</style>
-            {notice}{question}{agent_badge}{answer}{workflow}
+            {notice}{question}{agent_badge}{follow_up_html}{answer}{workflow}
             <a name="steps"></a><p style="color:#9fc6ff;"><b>{label("Suggestion", "调整建议")}</b></p>
             <p>{_body(feedback.next_step_or_stop)}</p>{targets}{navigation}
             <a name="stop"></a><p style="color:#9fc6ff;"><b>{label("Check after editing", "调整后检查")}</b></p>
@@ -745,10 +880,236 @@ class CoachOutput(QTextBrowser):
         self.contentChanged.emit()
 
 
+def _rgb_qimage(pixels) -> QImage:
+    h, w = pixels.shape[:2]
+    image = QImage(pixels.data, w, h, pixels.strides[0], QImage.Format.Format_RGB888).copy()
+    image.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
+    return image
+
+
+class TrialCompareWidget(QWidget):
+    """Darkroom-grade Before/Trial comparison viewer with Split Wipe, Hold Before, Side-by-Side, and Zoom/Pan."""
+
+    splitMoved = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._before: QImage | None = None
+        self._trial: QImage | None = None
+        self._before_title = "Before"
+        self._trial_title = "Trial"
+        self._mode = "split"  # split | hold | side_by_side
+        self._split_ratio = 0.5
+        self._zoom_factor = 1.0  # relative to Fit (1.0 == Fit)
+        self._pan = QPointF(0.0, 0.0)
+        self._holding_before = False
+        self._drag_kind = None  # "split" | "pan" | None
+        self._last_pos = QPointF(0.0, 0.0)
+        self.setMinimumSize(480, 320)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+
+    def set_images(self, before_pixels, trial_pixels, before_title: str = "Before", trial_title: str = "Trial") -> None:
+        self._before = _rgb_qimage(before_pixels) if before_pixels is not None else None
+        self._trial = _rgb_qimage(trial_pixels) if trial_pixels is not None else None
+        self._before_title = str(before_title or "Before")
+        self._trial_title = str(trial_title or "Trial")
+        self._holding_before = False
+        self.update()
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in ("split", "hold", "side_by_side"):
+            raise ValueError("Unknown trial comparison mode.")
+        self._mode = mode
+        if mode == "split":
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+        elif mode == "hold":
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._zoom_factor > 1.01 else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_zoom(self, zoom_factor: float) -> None:
+        self._zoom_factor = max(1.0, min(4.0, float(zoom_factor)))
+        if self._zoom_factor <= 1.01:
+            self._pan = QPointF(0.0, 0.0)
+        if self._mode == "side_by_side":
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._zoom_factor > 1.01 else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_split_ratio(self, ratio: float) -> None:
+        self._split_ratio = max(0.0, min(1.0, float(ratio)))
+        self.update()
+        self.splitMoved.emit(self._split_ratio)
+
+    def set_holding_before(self, holding: bool) -> None:
+        self._holding_before = bool(holding)
+        self.update()
+
+    def _fit_rect(self, box: QRectF, img: QImage) -> QRectF:
+        iw, ih = max(1, img.width()), max(1, img.height())
+        base_scale = min(max(1.0, box.width() - 8.0) / iw, max(1.0, box.height() - 8.0) / ih)
+        scale = base_scale * self._zoom_factor
+        dw, dh = iw * scale, ih * scale
+        max_px = max(0.0, (dw - box.width()) / 2.0 + 24.0)
+        max_py = max(0.0, (dh - box.height()) / 2.0 + 24.0)
+        px = max(-max_px, min(max_px, self._pan.x()))
+        py = max(-max_py, min(max_py, self._pan.y()))
+        if self._zoom_factor <= 1.01:
+            px = py = 0.0
+        cx, cy = box.center().x() + px, box.center().y() + py
+        return QRectF(cx - dw / 2.0, cy - dh / 2.0, dw, dh)
+
+    @staticmethod
+    def _draw_pill(painter: QPainter, x: float, y: float, text: str, *, accent: bool = False) -> None:
+        fm = QFontMetrics(painter.font())
+        tw, th = fm.horizontalAdvance(text), fm.height()
+        rect = QRectF(x, y, tw + 14.0, th + 6.0)
+        painter.save()
+        painter.setPen(QPen(QColor(110, 175, 255, 210) if accent else QColor(180, 180, 180, 150), 1.0))
+        painter.setBrush(QColor(22, 34, 48, 215) if accent else QColor(18, 18, 18, 210))
+        painter.drawRoundedRect(rect, 4.0, 4.0)
+        painter.setPen(QColor(190, 224, 255) if accent else QColor(235, 235, 235))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        outer = QRectF(self.rect())
+        painter.fillRect(outer, QColor(20, 20, 20))
+        painter.setPen(QPen(QColor(52, 52, 52), 1.0))
+        painter.drawRect(outer.adjusted(0.5, 0.5, -0.5, -0.5))
+
+        before_img = self._before or self._trial
+        trial_img = self._trial or self._before
+        if before_img is None or trial_img is None:
+            return
+
+        canvas = outer.adjusted(6.0, 6.0, -6.0, -6.0)
+        if self._mode == "side_by_side":
+            gap = 8.0
+            pane_w = max(40.0, (canvas.width() - gap) / 2.0)
+            left_box = QRectF(canvas.left(), canvas.top(), pane_w, canvas.height())
+            right_box = QRectF(canvas.left() + pane_w + gap, canvas.top(), pane_w, canvas.height())
+            for box, img, title, is_trial in (
+                (left_box, before_img, self._before_title, False),
+                (right_box, trial_img, self._trial_title, True),
+            ):
+                painter.save()
+                painter.setClipRect(box)
+                painter.fillRect(box, QColor(15, 15, 15))
+                painter.drawImage(self._fit_rect(box, img), img)
+                self._draw_pill(painter, box.left() + 8.0, box.top() + 8.0, title, accent=is_trial)
+                painter.restore()
+            return
+
+        if self._mode == "hold":
+            showing_before = self._holding_before
+            img = before_img if showing_before else trial_img
+            painter.save()
+            painter.setClipRect(canvas)
+            painter.drawImage(self._fit_rect(canvas, img), img)
+            self._draw_pill(
+                painter,
+                canvas.left() + 10.0,
+                canvas.top() + 10.0,
+                self._before_title if showing_before else self._trial_title,
+                accent=not showing_before,
+            )
+            painter.restore()
+            return
+
+        # Default "split" wipe comparison over one full-sized canvas.
+        b_rect = self._fit_rect(canvas, before_img)
+        t_rect = self._fit_rect(canvas, trial_img)
+        split_x = canvas.left() + canvas.width() * self._split_ratio
+        split_x = max(canvas.left(), min(canvas.right(), split_x))
+
+        painter.save()
+        painter.setClipRect(QRectF(canvas.left(), canvas.top(), max(0.0, split_x - canvas.left()), canvas.height()))
+        painter.drawImage(b_rect, before_img)
+        painter.restore()
+
+        painter.save()
+        painter.setClipRect(QRectF(split_x, canvas.top(), max(0.0, canvas.right() - split_x), canvas.height()))
+        painter.drawImage(t_rect, trial_img)
+        painter.restore()
+
+        painter.save()
+        painter.setClipRect(canvas)
+        painter.setPen(QPen(QColor(255, 255, 255, 225), 1.5))
+        painter.drawLine(QPointF(split_x, canvas.top()), QPointF(split_x, canvas.bottom()))
+        mid_y = canvas.center().y()
+        painter.setBrush(QColor(28, 32, 38, 235))
+        painter.drawEllipse(QPointF(split_x, mid_y), 11.0, 11.0)
+        painter.setPen(QPen(QColor(240, 240, 240), 1.4))
+        painter.drawLine(QPointF(split_x - 5.0, mid_y), QPointF(split_x - 2.0, mid_y - 3.0))
+        painter.drawLine(QPointF(split_x - 5.0, mid_y), QPointF(split_x - 2.0, mid_y + 3.0))
+        painter.drawLine(QPointF(split_x + 5.0, mid_y), QPointF(split_x + 2.0, mid_y - 3.0))
+        painter.drawLine(QPointF(split_x + 5.0, mid_y), QPointF(split_x + 2.0, mid_y + 3.0))
+        self._draw_pill(painter, canvas.left() + 10.0, canvas.top() + 10.0, self._before_title, accent=False)
+        fm = QFontMetrics(painter.font())
+        trial_w = fm.horizontalAdvance(self._trial_title) + 14.0
+        self._draw_pill(painter, max(canvas.left() + 10.0, canvas.right() - trial_w - 10.0), canvas.top() + 10.0,
+                        self._trial_title, accent=True)
+        painter.restore()
+
+    def mousePressEvent(self, event) -> None:
+        pos = event.position()
+        self._last_pos = pos
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._mode == "split":
+                self._drag_kind = "split"
+                canvas_left, canvas_w = 6.0, max(1.0, float(self.width()) - 12.0)
+                self.set_split_ratio((pos.x() - canvas_left) / canvas_w)
+            elif self._mode == "hold":
+                self._drag_kind = "hold"
+                self.set_holding_before(True)
+            else:
+                self._drag_kind = "pan"
+                if self._zoom_factor > 1.01:
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton):
+            self._drag_kind = "pan"
+
+    def mouseMoveEvent(self, event) -> None:
+        pos = event.position()
+        if self._drag_kind == "split":
+            canvas_left, canvas_w = 6.0, max(1.0, float(self.width()) - 12.0)
+            self.set_split_ratio((pos.x() - canvas_left) / canvas_w)
+        elif self._drag_kind == "pan" and self._zoom_factor > 1.01:
+            self._pan += pos - self._last_pos
+            self.update()
+        self._last_pos = pos
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._drag_kind == "hold":
+            self.set_holding_before(False)
+        self._drag_kind = None
+        if self._mode == "side_by_side":
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._zoom_factor > 1.01 else Qt.CursorShape.ArrowCursor)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self._pan = QPointF(0.0, 0.0)
+        self.set_zoom(1.0)
+        if self._mode == "split":
+            self.set_split_ratio(0.5)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta:
+            step = 1.18 if delta > 0 else (1.0 / 1.18)
+            self.set_zoom(self._zoom_factor * step)
+            event.accept()
+
+
 class CoachResponsePanel(QWidget):
     """Reading, copying, and explicit 1-click applying of coach suggestions."""
     locateRequested = Signal(str)
     applyRequested = Signal(int)
+    applyOverrideRequested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -769,6 +1130,9 @@ class CoachResponsePanel(QWidget):
         self.changes_label = ElidedLabel()
         self.changes_label.setAccessibleName("Suggested edit targets")
         actions.addWidget(self.changes_label, 1)
+        self._actions_filler = QWidget()
+        self._actions_filler.setFixedHeight(1)
+        actions.addWidget(self._actions_filler, 1)
         self.more_button = QToolButton()
         self.more_button.setText("More")
         self.more_button.setProperty("compact", True)
@@ -817,26 +1181,64 @@ class CoachResponsePanel(QWidget):
         reader_layout.addWidget(buttons)
         self.output.contentChanged.connect(self._sync_reader)
         self._trial_feedback = None
+        self._trial_sized_once = False
         self.trial = QDialog(self)
+        self.trial.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         self.trial.setWindowTitle("PhotoCoach · Proposed edit")
         trial_layout = QVBoxLayout(self.trial)
+        trial_layout.setContentsMargins(10, 8, 10, 10)
+        trial_layout.setSpacing(6)
         self.trial_notice = QLabel()
         self.trial_notice.setWordWrap(True)
         trial_layout.addWidget(self.trial_notice)
-        image_row = QHBoxLayout()
-        self.trial_titles, self.trial_images = [], []
-        for _ in range(2):
-            column = QVBoxLayout()
-            title, image = QLabel(), QLabel()
-            image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            image.setMinimumSize(100, 80)
-            image.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-            column.addWidget(title)
-            column.addWidget(image, 1)
-            image_row.addLayout(column, 1)
-            self.trial_titles.append(title)
-            self.trial_images.append(image)
-        trial_layout.addLayout(image_row, 1)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(6)
+        self._trial_mode_group = QButtonGroup(self.trial)
+        self.trial_mode_buttons = {}
+        for mode_id, mode_label in (("split", "Split wipe"), ("hold", "Hold Before"), ("side_by_side", "Side by side")):
+            btn = QPushButton(mode_label)
+            btn.setCheckable(True)
+            btn.setProperty("compact", True)
+            btn.setChecked(mode_id == "split")
+            btn.clicked.connect(lambda checked=False, m=mode_id: self._set_trial_mode(m))
+            self._trial_mode_group.addButton(btn)
+            top_bar.addWidget(btn)
+            self.trial_mode_buttons[mode_id] = btn
+
+        self.trial_hold_toggle = QPushButton("Show Before")
+        self.trial_hold_toggle.setCheckable(True)
+        self.trial_hold_toggle.setProperty("compact", True)
+        self.trial_hold_toggle.toggled.connect(lambda on: self.trial_compare.set_holding_before(on))
+        self.trial_hold_toggle.hide()
+        top_bar.addWidget(self.trial_hold_toggle)
+
+        top_bar.addStretch()
+
+        self._trial_zoom_group = QButtonGroup(self.trial)
+        self.trial_zoom_buttons = {}
+        for factor, zlabel in ((1.0, "Fit"), (2.0, "2x"), (3.0, "3x")):
+            zbtn = QPushButton(zlabel)
+            zbtn.setCheckable(True)
+            zbtn.setProperty("compact", True)
+            zbtn.setChecked(factor == 1.0)
+            zbtn.clicked.connect(lambda checked=False, z=factor: self.trial_compare.set_zoom(z))
+            self._trial_zoom_group.addButton(zbtn)
+            top_bar.addWidget(zbtn)
+            self.trial_zoom_buttons[factor] = zbtn
+        trial_layout.addLayout(top_bar)
+
+        self.trial_compare = TrialCompareWidget(self.trial)
+        trial_layout.addWidget(self.trial_compare, 1)
+
+        # Compatibility holders for scripts/tests inspecting labels directly
+        self.trial_titles = [QLabel(), QLabel()]
+        self.trial_images = [QLabel(), QLabel()]
+
         self.trial_crop_box = QWidget()
         crop_layout = QHBoxLayout(self.trial_crop_box)
         crop_layout.setContentsMargins(0, 0, 0, 0)
@@ -850,12 +1252,20 @@ class CoachResponsePanel(QWidget):
         self.trial_crop_box.hide()
         trial_layout.addWidget(self.trial_crop_box)
         self.trial_report = QTextBrowser()
-        self.trial_report.setMaximumHeight(150)
+        self.trial_report.setMaximumHeight(96)
         trial_layout.addWidget(self.trial_report)
+
+        trial_footer = QHBoxLayout()
+        trial_footer.setSpacing(8)
+        self.trial_apply = QPushButton("Apply suggestion (1 Undo)")
+        self.trial_apply.clicked.connect(self._apply_from_trial)
+        trial_footer.addWidget(self.trial_apply)
+        trial_footer.addStretch()
         self.trial_close = QPushButton("Close")
         self.trial_close.clicked.connect(self.trial.hide)
-        trial_layout.addWidget(self.trial_close)
-        self.trial.resize(900, 580)
+        trial_footer.addWidget(self.trial_close)
+        trial_layout.addLayout(trial_footer)
+        self.trial.resize(1280, 820)
         self._copied_timer = QTimer(self)
         self._copied_timer.setSingleShot(True)
         self._copied_timer.timeout.connect(self._reset_copy_label)
@@ -869,6 +1279,7 @@ class CoachResponsePanel(QWidget):
         actions = output._actions if available else ()
         self.changes_label.setText(" · ".join(_display_text(action.label) for action in actions))
         self.changes_label.setVisible(bool(actions))
+        self._actions_filler.setVisible(available and not bool(actions))
         self.more_button.setVisible(available)
         self.changes_action.setEnabled(bool(actions))
         applied = bool(actions) and output._values is not None and all(a.is_applied(output._values) for a in actions)
@@ -891,6 +1302,8 @@ class CoachResponsePanel(QWidget):
                            "Apply the coach's recommended adjustment or local lighting mask in one undoable step.")
         self._copied_timer.stop()
         self._reset_copy_label()
+        if hasattr(self, "trial_apply"):
+            self._sync_trial_apply_button()
         # Editing can invalidate a reply many times per gesture. Do not lay
         # out a second long document until the reader is actually being used.
         # Clearing/changing photos still clears any hidden old response.
@@ -916,6 +1329,76 @@ class CoachResponsePanel(QWidget):
             reader._render_feedback()
         reader.verticalScrollBar().setValue(scroll)
 
+    def _set_trial_mode(self, mode: str) -> None:
+        self.trial_compare.set_mode(mode)
+        self.trial_hold_toggle.setVisible(mode == "hold")
+        if mode != "hold":
+            self.trial_hold_toggle.setChecked(False)
+            self.trial_compare.set_holding_before(False)
+
+    def _update_trial_chrome_texts(self) -> None:
+        zh = getattr(self, "_lang", "en") == "zh"
+        mode_labels = {
+            "split": ("卷帘对比" if zh else "Split wipe"),
+            "hold": ("按住对比" if zh else "Hold Before"),
+            "side_by_side": ("左右并排" if zh else "Side by side"),
+        }
+        for mode_id, btn in self.trial_mode_buttons.items():
+            btn.setText(mode_labels[mode_id])
+        self.trial_hold_toggle.setText("显示原图" if zh else "Show Before")
+        self.trial_zoom_buttons[1.0].setText("适配" if zh else "Fit")
+        self.trial_close.setText("关闭" if zh else "Close")
+
+    def _sync_trial_apply_button(self) -> None:
+        output = self.output
+        feedback = output._feedback
+        zh = getattr(self, "_lang", "en") == "zh"
+        if feedback is None:
+            self.trial_apply.hide()
+            return
+        actions = output._actions
+        report = feedback.agent_report
+        plan = feedback.agent_plan
+        applied = bool(actions) and output._values is not None and all(a.is_applied(output._values) for a in actions)
+        stale = (
+            output.reference_revision is not None
+            or output._superseded_question
+            or output._superseded_coach
+            or output._question_changed()
+        )
+        blocked_by_policy = bool(feedback.action_notice) or (plan is not None and plan.decision != "recommend")
+        if not actions or blocked_by_policy or report is None or report.trial_preview is None:
+            self.trial_apply.hide()
+            return
+        self.trial_apply.show()
+        if applied:
+            self.trial_apply.setEnabled(False)
+            self.trial_apply.setStyleSheet("")
+            self.trial_apply.setText("已应用 ✓" if zh else "Applied ✓")
+            return
+        self.trial_apply.setEnabled(not stale)
+        if report.can_apply:
+            self.trial_apply.setStyleSheet("")
+            self.trial_apply.setText("应用建议（可撤销）" if zh else "Apply suggestion (1 Undo)")
+        else:
+            self.trial_apply.setStyleSheet(
+                "QPushButton { background:#4b3316; border:1px solid #d48b35; color:#ffe0b3; padding:4px 10px; font-weight:600; }"
+                "QPushButton:hover { background:#63431c; }"
+                "QPushButton:disabled { opacity:0.45; }"
+            )
+            self.trial_apply.setText("仍要应用（可一步撤销）" if zh else "Apply anyway (1 Undo)")
+
+    def _apply_from_trial(self) -> None:
+        feedback = self.output._feedback
+        if feedback is None:
+            return
+        report = feedback.agent_report
+        self.trial.hide()
+        if report is not None and not report.can_apply:
+            self.applyOverrideRequested.emit(0)
+        else:
+            self.applyRequested.emit(0)
+
     def open_trial(self):
         if not self.trial_button.isEnabled():
             return
@@ -925,27 +1408,40 @@ class CoachResponsePanel(QWidget):
             return
         zh = self._lang == "zh"
         self._trial_feedback = feedback
+        self._update_trial_chrome_texts()
         available = self.screen().availableGeometry()
-        width, height = min(900, available.width()-40), min(580, available.height()-60)
-        self.trial.resize(max(320, width), max(300, height))
+        if not self._trial_sized_once:
+            width = min(1440, max(640, available.width() - 48))
+            height = min(900, max(480, available.height() - 64))
+            self.trial.resize(width, height)
+            self._trial_sized_once = True
+        else:
+            self.trial.resize(
+                min(self.trial.width(), max(480, available.width() - 32)),
+                min(self.trial.height(), max(380, available.height() - 48)),
+            )
         self.trial.setWindowTitle("PhotoCoach · 试调对比" if zh else "PhotoCoach · Proposed edit")
-        self.trial_notice.setText(("试调尚未应用。统计不代表审美评分；比较后由你决定是否应用。" if zh else
-                                  "This trial has not been applied. Measurements are not aesthetic scores; compare before deciding."))
-        self.trial_titles[0].setText(("当前编辑" if zh else "Current edit") + f" · v{feedback.state_version}")
-        self.trial_titles[1].setText("试调 · 尚未应用" if zh else "Trial · Not applied")
-        for label, pixels in zip(self.trial_images, (report.current_preview, report.trial_preview)):
-            h, w = pixels.shape[:2]
-            image = QImage(pixels.data, w, h, pixels.strides[0], QImage.Format.Format_RGB888).copy()
-            image.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
-            label.setPixmap(QPixmap.fromImage(image).scaled(max(100, (width-60)//2), max(80, height-250),
-                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.trial_notice.setText(
+            ("试调尚未应用。拖拽分割线或切换并排/按住对比（滚轮可缩放），比较后由你决定是否应用。" if zh else
+             "This trial has not been applied. Drag divider, hold Before, or zoom to compare before deciding.")
+        )
+        before_title = ("当前编辑" if zh else "Current edit") + f" · v{feedback.state_version}"
+        trial_title = "试调 · 尚未应用" if zh else "Trial · Not applied"
+        self.trial_titles[0].setText(before_title)
+        self.trial_titles[1].setText(trial_title)
+        before_px = report.current_preview if report.current_preview is not None else report.trial_preview
+        self.trial_compare.set_images(before_px, report.trial_preview, before_title, trial_title)
+        for label, pixels in zip(self.trial_images, (before_px, report.trial_preview)):
+            label.setPixmap(QPixmap.fromImage(_rgb_qimage(pixels)).scaled(
+                max(100, (self.trial.width() - 60) // 2),
+                max(80, self.trial.height() - 250),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ))
         crops = getattr(feedback, "inspected_crops", ())
         if crops:
             crop_title, crop_pixels = crops[-1]
-            ch, cw = crop_pixels.shape[:2]
-            c_img = QImage(crop_pixels.data, cw, ch, crop_pixels.strides[0], QImage.Format.Format_RGB888).copy()
-            c_img.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
-            self.trial_crop_image.setPixmap(QPixmap.fromImage(c_img).scaled(
+            self.trial_crop_image.setPixmap(QPixmap.fromImage(_rgb_qimage(crop_pixels)).scaled(
                 128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             prefix = "智能体核验的 100% 原生局部图" if zh else "100% native crop inspected by agent"
             self.trial_crop_label.setText(f"{prefix}: {crop_title}")
@@ -957,7 +1453,7 @@ class CoachResponsePanel(QWidget):
         if summary:
             report_lines.insert(0, summary)
         self.trial_report.setPlainText("\n".join(report_lines))
-        self.trial_close.setText("关闭" if zh else "Close")
+        self._sync_trial_apply_button()
         self.trial.show()
         self.trial.raise_()
 
@@ -999,6 +1495,8 @@ class CoachResponsePanel(QWidget):
         self.changes_action.setText("查看修改清单" if zh else "View changes")
         self.reader_button.setText("阅读窗口" if zh else "Open reader")
         self.trial_button.setText("预览试调" if zh else "Preview trial")
+        self._update_trial_chrome_texts()
+        self._sync_trial_apply_button()
         self.output.set_language(lang)
         self.reader_output.set_language(lang)
         self._sync_reader(force=True)

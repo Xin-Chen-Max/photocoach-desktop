@@ -10,11 +10,14 @@ from .preview_view import ImageView, PhotoToolbar
 from .histogram import HistogramView
 from .edit_controls import EditSlider, DraftGainSpinBox
 from .color_mixer_ui import ColorMixerEditor
+from .color_grading_ui import ColorGradingEditor
 from .curve import CurveEditor
 from .lens_ui import LensEditor
 from .detail_ui import DetailEditor
 from .state import IDENTITY_CURVE
 from .gradient_ui import GradientEditor,GradientController
+from .spots_ui import SpotEditor, SpotController
+from .snapshots_ui import SnapshotsPanel
 
 
 def build_workspace(self) -> None:
@@ -157,7 +160,7 @@ def build_workspace(self) -> None:
     splitter.addWidget(image_panel)
     panel = QFrame()
     panel.setObjectName("editPanel")
-    panel.setMinimumWidth(300)
+    panel.setMinimumWidth(0)
     side = QVBoxLayout(panel)
     self.metadata_label = QLabel("Dimensions and shooting information appear after decoding.")
     self.metadata_label.setWordWrap(True)
@@ -234,9 +237,13 @@ def build_workspace(self) -> None:
     self.local_gradients=GradientEditor()
     self.local_section.content.addWidget(self.local_gradients)
     self.local_controller=GradientController(self,self.local_gradients)
+    self.spots_section = ToolSection("Spot removal")
+    self.spots_editor = SpotEditor()
+    self.spots_section.content.addWidget(self.spots_editor)
+    self.spots_controller = SpotController(self, self.spots_editor)
     self.color_section = ToolSection("Color")
     self.curve_section = ToolSection("Curve")
-    for section in (self.light_section, self.crop_section, self.lens_section, self.detail_section, self.local_section, self.color_section, self.curve_section):
+    for section in (self.light_section, self.crop_section, self.lens_section, self.detail_section, self.local_section, self.spots_section, self.color_section, self.curve_section):
         side.addWidget(section)
     light = self.light_section.content
     color = self.color_section.content
@@ -252,6 +259,8 @@ def build_workspace(self) -> None:
     form = QFormLayout()
     self.wb_form = form
     self.wb_mode = QComboBox()
+    self.wb_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    self.wb_mode.setMinimumContentsLength(10)
     self.wb_mode.addItems(["Camera", "Custom · sensor RGB gains"])
     self.wb_mode.currentIndexChanged.connect(self._wb_mode_changed)
     self.wb_label = QLabel("White balance")
@@ -339,6 +348,12 @@ def build_workspace(self) -> None:
     self.color_mixer.valuesChanged.connect(lambda values: self.change_parameter("color_mixer", values))
     self.color_mixer.resetRequested.connect(lambda values: self.change_parameter("color_mixer", values, sync=True))
     color.addWidget(self.color_mixer)
+    self.color_grading = ColorGradingEditor()
+    self.color_grading.gestureStarted.connect(lambda: self._begin_parameter_gesture("color_grading"))
+    self.color_grading.gestureEnded.connect(self._finish_gesture)
+    self.color_grading.valuesChanged.connect(lambda values: self.change_parameter("color_grading", values))
+    self.color_grading.resetRequested.connect(lambda values: self.change_parameter("color_grading", values, sync=True))
+    color.addWidget(self.color_grading)
     self.curve_label = QLabel("Shared RGB curve")
     self.curve_label.setToolTip("Double-click to add a point; drag to adjust; Delete to remove. Hover for Input / Output values.")
     curve.addWidget(self.curve_label)
@@ -382,18 +397,32 @@ def build_workspace(self) -> None:
     side.addLayout(side_footer)
     self.edit_scroll = QScrollArea()
     self.edit_scroll.setWidgetResizable(True)
+    self.edit_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+    self.edit_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     self.edit_scroll.setWidget(panel)
     self.tabs = QTabWidget()
     self.tabs.setMinimumWidth(320)
     self.tabs.addTab(self.edit_scroll, "Edit")
     history_panel = QWidget()
     history_layout = QVBoxLayout(history_panel)
+    history_layout.setContentsMargins(6, 6, 6, 6)
+    history_layout.setSpacing(6)
+    self.snapshots_panel = SnapshotsPanel()
+    self.snapshots_panel.saveRequested.connect(self.save_named_snapshot)
+    self.snapshots_panel.restoreRequested.connect(self.restore_named_snapshot)
+    self.snapshots_panel.deleteRequested.connect(self.delete_named_snapshot)
+    self.snapshots_panel.compareToggled.connect(self.change_compare_snapshot)
+    history_layout.addWidget(self.snapshots_panel)
+    history_divider = QFrame()
+    history_divider.setFrameShape(QFrame.Shape.HLine)
+    history_divider.setStyleSheet("color:#383838;")
+    history_layout.addWidget(history_divider)
     history_note = self.history_note = QLabel("Committed actions · Complete audit is saved in the project")
     history_note.setWordWrap(True)
     history_note.setProperty("secondary", True)
     history_layout.addWidget(history_note)
     self.history_list = QListWidget()
-    history_layout.addWidget(self.history_list)
+    history_layout.addWidget(self.history_list, 1)
     self.history_summary = QLabel("No edits")
     self.history_summary.setProperty("secondary", True)
     history_layout.addWidget(self.history_summary)
@@ -471,6 +500,7 @@ def build_coach(self) -> QWidget:
     self.coach_text.feedbackAvailable.connect(self._coach_feedback_changed)
     self.coach_response.locateRequested.connect(self._locate_control)
     self.coach_response.applyRequested.connect(self._apply_coach_suggestion)
+    self.coach_response.applyOverrideRequested.connect(lambda index: self._apply_coach_suggestion(index, allow_previewed_override=True))
     self.coach_text.setPlainText("Open a photo to ask your coach.")
     body.addWidget(self.coach_response, 1)
     self.goal_panel = QWidget()
@@ -498,22 +528,41 @@ def build_coach(self) -> QWidget:
     self.analyze_button.setObjectName("askCoach")
     self.analyze_button.clicked.connect(self._coach_primary_action)
     buttons.addWidget(self.analyze_button)
+    secondary_row = QHBoxLayout()
+    secondary_row.setContentsMargins(0, 0, 0, 0)
+    secondary_row.setSpacing(4)
+    self.followup_button = QPushButton("Did it help?")
+    self.followup_button.setProperty("compact", True)
+    self.followup_button.setEnabled(False)
+    self.followup_button.setToolTip(
+        "Ask the coach whether your adjustments since its last advice helped. Requires prior advice and a subsequent edit or Undo."
+    )
+    self.followup_button.clicked.connect(self.ask_follow_up)
+    secondary_row.addWidget(self.followup_button)
     self.coach_questions_button = QToolButton()
     self.coach_questions_button.setText("Common questions")
     self.coach_questions_button.setProperty("compact", True)
     self.coach_questions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
     questions = QMenu(self.coach_questions_button)
     self.coach_question_actions = []
-    for title, text in (
-        ("Next step", "What should I adjust next, and when should I stop?"),
-        ("Curve help", "How should I use the shared RGB curve on this photo? Suggest a reversible trial only if the evidence supports it."),
-        ("Local lighting", "Assess the visible light and suggest a local adjustment only if its location and purpose are supported by the photo.")):
+    for title, text, is_follow_up in (
+        ("Next step", "What should I adjust next, and when should I stop?", False),
+        ("Curve help", "How should I use the shared RGB curve on this photo? Suggest a reversible trial only if the evidence supports it.", False),
+        ("Local lighting", "Assess the visible light and suggest a local adjustment only if its location and purpose are supported by the photo.", False),
+        ("Follow-up: Did it help?", "Did my adjustment help relative to your previous advice and my editing goal? Separate objective preview changes from preference, and tell me if I should stop.", True),
+    ):
         action = questions.addAction(title)
         action.setProperty("question_text", text)
-        action.triggered.connect(lambda checked=False, item=action: self._use_coach_question(item.property("question_text")))
+        action.setProperty("is_follow_up", is_follow_up)
+        action.triggered.connect(
+            lambda checked=False, item=action: self._use_coach_question(
+                item.property("question_text"), follow_up=bool(item.property("is_follow_up"))
+            )
+        )
         self.coach_question_actions.append(action)
     self.coach_questions_button.setMenu(questions)
-    buttons.addWidget(self.coach_questions_button)
+    secondary_row.addWidget(self.coach_questions_button)
+    buttons.addLayout(secondary_row)
     composer.addLayout(buttons)
     body.addLayout(composer)
     coach_layout.addWidget(self.coach_body, 1)
@@ -606,6 +655,8 @@ def build_coach(self) -> QWidget:
     usage_layout = QVBoxLayout(self.coach_details)
     usage_scroll = QScrollArea()
     usage_scroll.setWidgetResizable(True)
+    usage_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+    usage_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     details_content = QWidget()
     details_layout = QVBoxLayout(details_content)
     details_layout.addWidget(self.coach_usage)

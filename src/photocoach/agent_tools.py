@@ -17,7 +17,7 @@ from .coach_agent import (PLAN_SCHEMA, REGIONS, AgentPlan, AgentReport,
                           _region, build_reflexion_prompt_summary,
                           evaluate_trial_candidate, parse_plan)
 from .color_mixer import COLOR_KEYS
-from .gradients import LinearGradient, RadialGradient
+from .gradients import BrushMask, LinearGradient, RadialGradient
 from .state import EditState, EditValues
 
 
@@ -348,10 +348,47 @@ def _draw_mask_outline(draw: ImageDraw.ImageDraw, mask: Any, x_off: int, y_off: 
             pts.append((px, py))
         for k in range(0, steps, 2):
             draw.line([pts[k], pts[k + 1]], fill=color, width=2)
+    elif isinstance(mask, BrushMask):
+        for stroke in mask.strokes:
+            if stroke.erase or not stroke.points:
+                continue
+            pts = [(x_off + p[0] * pw, y_off + p[1] * ph) for p in stroke.points]
+            if len(pts) == 1:
+                px, py = pts[0]
+                draw.ellipse([px - 3, py - 3, px + 3, py + 3], outline=color, width=2)
+            else:
+                draw.line(pts, fill=color, width=2)
     else:
         p0 = (x_off + mask.start[0] * pw, y_off + mask.start[1] * ph)
         p1 = (x_off + mask.end[0] * pw, y_off + mask.end[1] * ph)
         draw.line([p0, p1], fill=color, width=2)
+
+
+def _render_single_trial_preview(
+    trial: np.ndarray,
+    new_masks: tuple[Any, ...],
+    trial_index: int = 1,
+) -> np.ndarray:
+    """Create a full <=768px TRIAL preview with optional mask outlines so models see fine tone/color clearly."""
+    h, w = trial.shape[:2]
+    t_img = Image.fromarray(trial).convert("RGB")
+    scale = min(1.0, 768.0 / max(1, w, h))
+    pw = max(16, min(768, int(round(w * scale))))
+    ph = max(16, min(768, int(round(h * scale))))
+    if (pw, ph) != (w, h):
+        t_img = t_img.resize((pw, ph), Image.Resampling.LANCZOS)
+
+    draw = ImageDraw.Draw(t_img)
+    tag = f"TRIAL #{int(trial_index)}"
+    draw.rectangle([2, 2, 6 + len(tag) * 6, 15], fill=(16, 16, 16))
+    draw.text((5, 3), tag, fill=(140, 220, 255))
+    for mask in new_masks:
+        if isinstance(mask, LinearGradient):
+            _draw_mask_outline(draw, mask, 0, 0, pw, ph)
+
+    out = np.asarray(t_img, dtype=np.uint8)
+    out.setflags(write=False)
+    return out
 
 
 def _render_trial_comparison_image(
@@ -428,6 +465,9 @@ def _handle_build_lighting_rig(args: dict[str, Any], ctx: ToolContext) -> ToolRe
     src = (float(anchors.get("source_x", 0.35)), float(anchors.get("source_y", 0.14)))
     is_dark = True
     chosen_id: int | None = None
+    sky_backed = False
+    subj_luma_p85 = None
+    bg_luma_p25 = None
     target_box = args.get("target_box")
     if target_box is not None:
         bbox = [float(v) for v in target_box]
@@ -450,6 +490,9 @@ def _handle_build_lighting_rig(args: dict[str, Any], ctx: ToolContext) -> ToolRe
             bbox = cand["bbox"]
             is_dark = bool(cand.get("is_dark_subject", True))
             chosen_id = int(cand["id"])
+            sky_backed = bool(cand.get("sky_backed_silhouette", False))
+            subj_luma_p85 = cand.get("subject_luma_p85")
+            bg_luma_p25 = cand.get("backdrop_luma_p25")
         else:
             tx = float(anchors.get("target_x", 0.5))
             ty = float(anchors.get("target_y", 0.5))
@@ -460,6 +503,9 @@ def _handle_build_lighting_rig(args: dict[str, Any], ctx: ToolContext) -> ToolRe
         actions = build_overhead_spotlight_actions(
             bbox, src, is_dark_subject=is_dark, direction=direction,
             strength=strength, recipe=recipe, max_masks=free_slots,
+            sky_backed_silhouette=sky_backed,
+            subject_luma_p85=subj_luma_p85,
+            backdrop_luma_p25=bg_luma_p25,
         )
     except (ValueError, MaskCapacityError) as exc:
         return ToolResult("", "build_lighting_rig", False, {"error": str(exc)}, error="invalid_rig")
@@ -468,6 +514,7 @@ def _handle_build_lighting_rig(args: dict[str, Any], ctx: ToolContext) -> ToolRe
         "recipe": recipe,
         "subject_id": chosen_id,
         "subject_box": bbox,
+        "sky_backed_silhouette": sky_backed,
         "light_direction": direction,
         "strength": strength,
         "actions": actions,
@@ -501,9 +548,9 @@ def _handle_propose_trial(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                           {"error": f"Per-run trial render limit ({ctx.max_trials}) reached. Deliver your final answer."},
                           error="trial_limit")
     raw_actions = args["actions"]
-    if len(raw_actions) > 6:
+    if len(raw_actions) > 18:
         return ToolResult("", "propose_and_preview_trial", False,
-                          {"error": "Reduce the proposal to at most six explicit adjustments for one objective."},
+                          {"error": "Reduce the proposal to at most eighteen explicit adjustments for one objective."},
                           error="too_many_actions")
     try:
         plan = parse_plan(args["workflow"])
@@ -556,14 +603,11 @@ def _handle_propose_trial(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                         break
             if isinstance(candidate, tuple):
                 new_masks = tuple(g for g in candidate if getattr(g, "id", None) not in old_ids)
-        if report.current_preview is not None:
-            comp_img = _render_trial_comparison_image(report.current_preview, report.trial_preview, new_masks)
-            images = (ToolImage(
-                f"Before vs Rendered trial #{ctx.trial_count} (with cyan/amber mask outline on TRIAL — diagnostic only)",
-                comp_img,
-            ),)
-        else:
-            images = (ToolImage(f"Rendered trial #{ctx.trial_count} preview (not applied)", report.trial_preview),)
+        trial_img = _render_single_trial_preview(report.trial_preview, new_masks, ctx.trial_count)
+        images = (ToolImage(
+            f"Rendered trial #{ctx.trial_count} preview (full 768px — compare with initial Before preview; not applied)",
+            trial_img,
+        ),)
     return ToolResult("", "propose_and_preview_trial", True, record, images=images)
 
 

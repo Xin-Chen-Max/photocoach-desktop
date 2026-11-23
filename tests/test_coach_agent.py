@@ -401,3 +401,53 @@ def test_pinhole_hard_radial_spotlight_triggers_reflexion_repair_warning():
     assert reflex["needs_repair"] is True
     joined = " ".join(delta["warnings"]).lower()
     assert "small" in joined and "feather" in joined and "shadows" in joined
+
+
+def test_halo_bleed_detector_flags_unmasked_orb_and_passes_isolated_mask():
+    from photocoach.adjustments import render_edit
+    from photocoach.coach import build_request
+    from photocoach.coach_actions import resolve_actions
+    from photocoach.coach_agent import build_reflexion_prompt_summary, evaluate_trial_candidate
+    from photocoach.composition import Composition
+    from photocoach.gradients import RenderGeometry
+    from photocoach.imaging import quantize_srgb
+
+    h, w = 140, 210
+    linear = np.empty((h, w, 3), dtype=np.float32)
+    linear[:, :] = (0.04, 0.055, 0.085)  # twilight sky
+    linear[45:125, 70:140] = (0.010, 0.009, 0.008)  # dark foreground silhouette
+    geom = RenderGeometry.full((w, h), Composition(), (w, h))
+    before = quantize_srgb(render_edit(linear, EditValues(), geometry=geom))
+
+    store = StateStore()
+    state = store.activate(Path("silhouette.ARW"), "sil-id")
+    req = build_request(state, state, [], before, before, question="Make the silhouette pop naturally.", source_size=(w, h))
+    plan = parse_plan(workflow(decision="recommend"))
+
+    def render_trial(values):
+        return quantize_srgb(render_edit(linear, values, geometry=geom))
+
+    # 1. Unmasked bright warm radial orb over sky + silhouette bleeds a glowing halo -> flagged!
+    unmasked = [{
+        "operation": "create_mask", "kind": "radial", "name": "Glowing Orb",
+        "start": [0.22, 0.16], "end": [0.78, 0.86],
+        "exposure_ev": 1.15, "warmth": 0.45, "highlights": 0.1, "shadows": 0.25,
+        "inverted": False, "angle": 0.0, "feather": 0.55,
+    }]
+    rep_bad, delta_bad = evaluate_trial_candidate(req, plan, resolve_actions(unmasked, EditValues(), (w, h)), render_trial)
+    ref_bad = build_reflexion_prompt_summary(rep_bad, delta_bad)
+    assert ref_bad["needs_repair"] is True
+    assert any("halo_bleed" in w_msg for w_msg in delta_bad["warnings"])
+
+    # 2. Range-isolated + edge-aware radial mask keeps sky untouched -> passes cleanly!
+    isolated = [{
+        "operation": "create_mask", "kind": "radial", "name": "Subject Lift",
+        "start": [0.22, 0.16], "end": [0.78, 0.86],
+        "exposure_ev": 0.32, "warmth": 0.12, "highlights": 0.08, "shadows": 0.28,
+        "inverted": False, "angle": 0.0, "feather": 0.88,
+        "luma_min": 0.0, "luma_max": 0.20, "luma_feather": 0.06, "edge_aware": True,
+    }]
+    rep_ok, delta_ok = evaluate_trial_candidate(req, plan, resolve_actions(isolated, EditValues(), (w, h)), render_trial)
+    ref_ok = build_reflexion_prompt_summary(rep_ok, delta_ok)
+    assert not any("halo_bleed" in w_msg for w_msg in delta_ok["warnings"])
+    assert not ref_ok["needs_repair"]

@@ -79,7 +79,7 @@ def test_missing_or_relative_local_folder_has_safe_error(monkeypatch, value):
     (None, "key_source", "fallback"),
     (None, "key_environment", "invalid name"),
     ("config", "timeout_seconds", True),
-    ("config", "max_output_tokens", 8193),
+    ("config", "max_output_tokens", 65537),
     ("config", "endpoint", "http://unsafe.invalid"),
     ("config", "endpoint", "https://user:secret@unsafe.invalid/path"),
     ("config", "endpoint", "https://api.invalid/path?key=secret"),

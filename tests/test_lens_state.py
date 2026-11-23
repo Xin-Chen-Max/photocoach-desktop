@@ -75,7 +75,7 @@ def test_lens_ten_grouped_edits_resets_restore_and_ai(tmp_path):
 
 
 def legacy_shape(data, version):
-    removed = {'lens_corrections', 'base_rendering'}
+    removed = {'lens_corrections', 'base_rendering', 'color_grading', 'spots'}
     if version <= 5: removed.add('local_gradients')
     if version <= 4: removed.update(('whites', 'blacks', 'vibrance'))
     if version <= 3: removed.add('color_mixer')
@@ -83,6 +83,8 @@ def legacy_shape(data, version):
     if version == 1: removed.update(('highlights', 'shadows'))
     def walk(value):
         if isinstance(value, dict):
+            value.pop('compare_snapshot_id', None)
+            value.pop('snapshots', None)
             if 'white_balance' in value:
                 for name in removed: value.pop(name)
             for child in value.values(): walk(child)
@@ -105,8 +107,8 @@ def test_all_legacy_snapshots_migrate_neutrally_without_writing(tmp_path, versio
     data['source']['byte_length'] = store.current.source_path.stat().st_size
     original = copy.deepcopy(data)
     up = upgrade_project(data)
-    assert data == original and up['schema_version'] == 9
-    assert up['pipeline_version'] == 'phase1-sdr-srgb-v9'
+    assert data == original and up['schema_version'] == 14
+    assert up['pipeline_version'] == 'phase1-sdr-srgb-v14'
     undo, redo = validate_project(up)
     assert undo == store.undo_stack and redo == store.redo_stack
     assert EditValues.from_dict(up['state']['parameters']) == store.current.values
@@ -117,7 +119,7 @@ def test_all_legacy_snapshots_migrate_neutrally_without_writing(tmp_path, versio
     assert sha256_file(path) == before_hash
     assert loaded.current.values == store.current.values
     assert loaded.undo_stack == undo and loaded.redo_stack == redo
-    assert 'format v9' in loaded.load_warnings[0]
+    assert 'format v14' in loaded.load_warnings[0]
     bad = copy.deepcopy(data)
     bad['state']['parameters']['lens_corrections'] = LensCorrections().to_dict()
     with pytest.raises(ValueError): upgrade_project(bad)

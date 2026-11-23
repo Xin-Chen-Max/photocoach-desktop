@@ -122,7 +122,7 @@ def test_direct_answer_is_required_bounded_and_cannot_replace_question(coach_req
     elif problem == "empty":
         answer["answer"] = "  "
     elif problem == "oversized":
-        answer["answer"] = "x" * 1201
+        answer["answer"] = "x" * 2401
     else:
         answer["question"] = "A different question invented by the model"
     config = (api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-test", "gemini") if protocol == "gemini"
@@ -354,3 +354,23 @@ def test_gemini_tool_without_id_omits_fake_id_and_uses_standard_inline_parts(coa
     fr = user_parts[0]["functionResponse"]
     assert "id" not in fr and "parts" not in fr
     assert any("inlineData" in p for p in user_parts[1:])
+
+
+def test_lifted_output_token_limits_and_ollama_unlimited_mode():
+    for proto, ep, mdl in (
+        ("responses", "https://api.openai.com/v1/responses", "gpt-4o"),
+        ("chat_completions", "https://api.openai.com/v1/chat/completions", "gpt-4o"),
+        ("gemini", api.GEMINI_ENDPOINT, "gemini-3.5-flash"),
+        ("ollama", "http://127.0.0.1:11435/api/chat", "qwen3.6:27b"),
+    ):
+        assert api.ApiConfig(ep, mdl, proto, 60, 65536).max_output_tokens == 65536
+        with pytest.raises(api.ApiError):
+            api.ApiConfig(ep, mdl, proto, 60, 65537)
+    assert api.ApiConfig("http://127.0.0.1:11435/api/chat", "qwen3.6:27b", "ollama", 300, 0).max_output_tokens == 0
+    for cloud_proto, ep, mdl in (
+        ("responses", "https://api.openai.com/v1/responses", "gpt-4o"),
+        ("chat_completions", "https://api.openai.com/v1/chat/completions", "gpt-4o"),
+        ("gemini", api.GEMINI_ENDPOINT, "gemini-3.5-flash"),
+    ):
+        with pytest.raises(api.ApiError):
+            api.ApiConfig(ep, mdl, cloud_proto, 60, 0)

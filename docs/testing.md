@@ -1,8 +1,12 @@
 # Testing and verification
 
+## Schema 14 Local Masking, Darkroom Tools & Full Retouch checks
+
+The public source completed **1,486 tests passed with 3 skips** on Windows / Python 3.12 (`PYTHONPATH=src`, exit 0), covering Color Grading, Named Snapshots & A/B comparison, Brush Masks, Spot Removal/Healing, manual Coach follow-up review (`Did it help?`), Local LLM Multi-Model Manager, Full Retouch & Darkroom `TrialCompareWidget`, UI anti-jitter scrollbar hardening, and Schema 14 perceptual luminance-range + edge-aware guided local masking (`0`-LSB strip/100% ROI parity). The 3 skips are the opt-in Windows credential test and symlink/hardlink tests requiring elevated client privileges on this Windows account. The isolated wheel build and smoke test (`verify_wheel.py`) also passed (`exit 0`).
+
 ## 0.12.1 Agent & Pipeline checks
 
-The public source completed **1,317 tests passed with 3 skips** on Windows / Python 3.12.14, exit 0, covering the desktop workspace, linear RAW pipeline, and Agent v2 subsystem. It requires no camera files or network API calls.
+Earlier **0.12.1** public source baseline completed **1,317 tests passed with 3 skips** on Windows / Python 3.12.14, exit 0, covering the desktop workspace, linear RAW pipeline, and Agent v2 subsystem. It requires no camera files or network API calls.
 
 ```powershell
 & .\.venv\Scripts\python.exe -m pytest -q -rs

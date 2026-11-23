@@ -101,6 +101,7 @@ class ImageView(QWidget):
         self.picking_neutral = False
         self._dpr = self.devicePixelRatioF()
         self.gradient_layer = None
+        self.spot_layer = None
         self.overlay_generation = 0
         self._overlay = QImage()
         self._overlay_rect = (0,0,0,0)
@@ -491,6 +492,8 @@ class ImageView(QWidget):
             painter.drawImage(QRectF(l,t,r-l,b-t),self._overlay)
         if self.gradient_layer is not None:
             self.gradient_layer.paint(painter)
+        if self.spot_layer is not None:
+            self.spot_layer.paint(painter)
         painter.resetTransform()
         painter.setClipping(False)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
@@ -568,7 +571,7 @@ class ImageView(QWidget):
             event.ignore()
 
     def mouseDoubleClickEvent(self, event):
-        if self.picking_neutral:
+        if self.picking_neutral or (self.spot_layer is not None and self.spot_layer.is_active()):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -600,10 +603,16 @@ class ImageView(QWidget):
             self.pan(delta.x(), delta.y())
             event.accept()
 
+    def _active_tool_cursor(self):
+        if self._space:
+            return Qt.CursorShape.OpenHandCursor
+        if self.picking_neutral or (self.spot_layer is not None and self.spot_layer.is_active()):
+            return Qt.CursorShape.CrossCursor
+        return Qt.CursorShape.ArrowCursor
+
     def mouseReleaseEvent(self, event):
         self._drag = None
-        self.setCursor(Qt.CursorShape.OpenHandCursor if self._space else
-                       Qt.CursorShape.CrossCursor if self.picking_neutral else Qt.CursorShape.ArrowCursor)
+        self.setCursor(self._active_tool_cursor())
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self.picking_neutral:
@@ -627,7 +636,7 @@ class ImageView(QWidget):
     def _stop_pan(self):
         self._space = False
         self._drag = None
-        self.setCursor(Qt.CursorShape.CrossCursor if self.picking_neutral else Qt.CursorShape.ArrowCursor)
+        self.setCursor(self._active_tool_cursor())
 
     def set_neutral_picker(self, enabled):
         self.picking_neutral = bool(enabled)

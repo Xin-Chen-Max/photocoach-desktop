@@ -12,12 +12,14 @@ from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QColorSpace, QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QScrollArea,
-    QSpinBox, QTextEdit, QVBoxLayout, QWidget, QPushButton)
+    QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout, QWidget, QPushButton)
 
-from .api_coach import (ApiConfig, ApiCoach, ApiError, request_context, request_endpoint, COACH_INSTRUCTIONS,
+from .api_coach import (ApiConfig, ApiCoach, ApiError, request_context, request_endpoint,
+                        COACH_INSTRUCTIONS, RETOUCH_AGENT_INSTRUCTIONS,
                         GEMINI_ENDPOINT, check_gemini_model, ModelCheckError, ModelCheckResult,
                         GeminiModelsConfig, ProviderModelsConfig, GeminiModelsPage, list_gemini_models)
 from .budget import SessionBudget
+from .i18n import tr
 from .text_probe import build_text_probe_payload
 from .settings import (ApiSettings, SettingsStore, SettingsError, credential_target,
                        resolve_api_key, resolve_key_source)
@@ -110,6 +112,8 @@ class ApiSettingsDialog(QDialog):
         scroll = QScrollArea()
         self.settings_scroll = scroll
         scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
         form = QFormLayout(content)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -220,7 +224,8 @@ class ApiSettingsDialog(QDialog):
         self.timeout.setToolTip("Total connection, upload and response deadline. Increasing it only affects future manually sent requests; it never retries a failed request.")
         connection_form.addRow("Timeout · seconds", self.timeout)
         self.output_tokens = QSpinBox()
-        self.output_tokens.setRange(256, 8192)
+        self.output_tokens.setRange(0 if config.protocol == "ollama" else 256, 65536)
+        self.output_tokens.setSpecialValueText(tr("Unlimited", "不限"))
         self.output_tokens.setValue(config.max_output_tokens)
         connection_form.addRow("Maximum output tokens", self.output_tokens)
         connection_form.addRow(self.model_check_button)
@@ -728,14 +733,16 @@ class SendReviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Ask coach")
         available = self.screen().availableGeometry()
-        self.resize(min(600, available.width() - 40), min(490, available.height() - 60))
+        self.resize(min(600, available.width() - 40), min(540, available.height() - 60))
         outer = QVBoxLayout(self)
         self.body_scroll = QScrollArea()
         self.body_scroll.setWidgetResizable(True)
         self.body_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.body_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 0, 6, 0)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.body_scroll.setWidget(content)
         outer.addWidget(self.body_scroll, 1)
@@ -759,42 +766,94 @@ class SendReviewDialog(QDialog):
         image.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
         current.setPixmap(QPixmap.fromImage(image).scaled(160, 120, Qt.AspectRatioMode.KeepAspectRatio,
                                                         Qt.TransformationMode.SmoothTransformation))
+        current.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         overview.addWidget(current)
+        follow_up = getattr(request, "follow_up", None)
+        self.follow_up_note = QLabel()
+        self.follow_up_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.follow_up_note.setWordWrap(True)
+        self.follow_up_note.setStyleSheet("color:#9fc6ff;")
+        if isinstance(follow_up, dict):
+            prior = follow_up.get("prior_advice") or {}
+            prior_v = prior.get("state_version", request.before_state_version)
+            deltas_n = len(follow_up.get("parameter_deltas") or ())
+            undo_n = int(follow_up.get("undo_count", 0) or 0)
+            self.follow_up_note.setText(
+                f"Follow-up review: compares prior advice (v{prior_v}) with current edit (v{request.state_version}), "
+                f"including {deltas_n} parameter delta(s) and {undo_n} undo step(s)."
+            )
+        else:
+            self.follow_up_note.hide()
+        layout.addWidget(self.follow_up_note)
         self.include_before = QCheckBox("Also send the before preview")
         self.include_before.setChecked(True)
         layout.addWidget(self.include_before)
         agent_row = QHBoxLayout()
-        self.agent_loop_enabled = QCheckBox("Multi-step agent loop")
+        tools_supported = True
+        if config.protocol == "ollama":
+            from .ollama_client import DEFAULT_PORT, model_supports_tools, parse_ollama_endpoint_port
+            port = parse_ollama_endpoint_port(config.endpoint) or DEFAULT_PORT
+            parent_local_cfg = getattr(parent, "local_config", None)
+            if parent_local_cfg is not None and getattr(parent_local_cfg, "model", None) == config.model:
+                tools_supported = bool(parent_local_cfg.supports_tools) and model_supports_tools(config.model, port=port)
+            else:
+                tools_supported = model_supports_tools(config.model, port=port)
+        self._tools_supported = tools_supported
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel(tr("Mode", "模式")))
+        self.retouch_mode = QComboBox()
+        self.retouch_mode.addItem(tr("Full retouch (multi-pass look)", "完整出片（多轮看图精修）"), "full_retouch")
+        self.retouch_mode.addItem(tr("Teaching coach (single step)", "教学微调（单步指导）"), "coach")
+        self.retouch_mode.setEnabled(tools_supported)
+        mode_row.addWidget(self.retouch_mode, 1)
+        layout.addLayout(mode_row)
+        self.agent_loop_enabled = QCheckBox(tr("Multi-step agent loop", "多轮看图工具循环"))
         self.agent_loop_enabled.setToolTip(
             "Allow active 100% crop inspection, color/sensor diagnostics, and visual trial self-check within the selected turn budget."
+            if tools_supported
+            else "Single-turn mode only: this local model does not support multi-step agent tool calls."
         )
-        self.agent_loop_enabled.setChecked(True)
+        self.agent_loop_enabled.setChecked(tools_supported)
+        self.agent_loop_enabled.setEnabled(tools_supported)
         agent_row.addWidget(self.agent_loop_enabled, 1)
-        agent_row.addWidget(QLabel("Max turns"))
+        agent_row.addWidget(QLabel(tr("Max turns", "最大轮次")))
         self.agent_max_turns = QSpinBox()
-        self.agent_max_turns.setRange(1, 5)
+        self.agent_max_turns.setRange(1, 12 if tools_supported else 1)
         default_turns = 1
-        for candidate_turns in (3, 2, 1):
-            if budget.can_authorize_turns(candidate_turns) is None:
-                default_turns = candidate_turns
-                break
+        if tools_supported:
+            turn_candidates = (6, 5, 4, 3, 2, 1) if config.protocol == "ollama" else (3, 2, 1)
+            for candidate_turns in turn_candidates:
+                if budget.can_authorize_turns(candidate_turns) is None:
+                    default_turns = candidate_turns
+                    break
         self.agent_max_turns.setValue(default_turns)
+        self.agent_max_turns.setEnabled(tools_supported)
+        self.agent_max_turns.setFixedWidth(84)
         agent_row.addWidget(self.agent_max_turns)
         layout.addLayout(agent_row)
         self._summary_label = QLabel()
         self._summary_label.setTextFormat(Qt.TextFormat.PlainText)
         self._summary_label.setWordWrap(True)
+        self._summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._summary_label.setMinimumHeight(self._summary_label.fontMetrics().lineSpacing() * 3 + 6)
         outer.addWidget(self._summary_label)
 
         def _refresh_summary():
             turns = self.selected_max_turns()
-            self.agent_max_turns.setEnabled(self.agent_loop_enabled.isChecked())
-            turn_note = f" · Up to {turns} agent turns" if turns > 1 else " · Single-shot mode"
+            loop_active = self._tools_supported and self.agent_loop_enabled.isChecked()
+            if self.agent_max_turns.isEnabled() != loop_active:
+                self.agent_max_turns.setEnabled(loop_active)
+            if self.retouch_mode.isEnabled() != loop_active:
+                self.retouch_mode.setEnabled(loop_active)
+            turn_note = f"Up to {turns} turns" if turns > 1 else "Single-shot"
             if config.protocol == "ollama":
-                cost_line = f"Local analysis on this PC · No API charges. Local attempts: {budget.attempts}{turn_note}."
+                out_note = "Unlimited output" if config.max_output_tokens <= 0 else f"Max {config.max_output_tokens} tok"
+                line2 = f"Local · No API charges · Attempts: {budget.attempts}"
+                line3 = f"{turn_note} · {out_note}"
             else:
-                cost_line = f"May incur charges. Session attempts: {budget.attempts}/{budget.call_limit}{turn_note}."
-            self._summary_label.setText(f"{config.model} · {urlsplit(config.endpoint).hostname}\n{cost_line}")
+                line2 = f"May incur charges · Attempts: {budget.attempts}/{budget.call_limit}"
+                line3 = turn_note
+            self._summary_label.setText(f"{config.model} · {urlsplit(config.endpoint).hostname}\n{line2}\n{line3}")
 
         self._refresh_summary = _refresh_summary
         self.agent_loop_enabled.toggled.connect(lambda *_: _refresh_summary())
@@ -813,6 +872,8 @@ class SendReviewDialog(QDialog):
         layout.addWidget(self.details_button)
         self.details = QScrollArea()
         self.details.setWidgetResizable(True)
+        self.details.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.details.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.details.setFixedHeight(190)
         detail_content = QWidget()
         detail_layout = QVBoxLayout(detail_content)
@@ -845,6 +906,8 @@ class SendReviewDialog(QDialog):
         detail_layout.addWidget(self.context)
         self.request = request
         self.include_before.toggled.connect(self.update_context)
+        self.retouch_mode.currentIndexChanged.connect(lambda *_: self.update_context())
+        self.agent_loop_enabled.toggled.connect(lambda *_: self.update_context())
         self.update_context()
         disclosure = QLabel("Only selected reduced sRGB previews and the editing information shown above are sent, with photography-coach instructions. No RAW file (.ARW / .NEF), source path or source EXIF/GPS is attached. Review your own goal/question text for private details. Small previews cannot establish noise, sharpness or RAW highlight recoverability. Provider retention rules still apply; store=false is requested where supported.")
         disclosure.setWordWrap(True)
@@ -855,6 +918,7 @@ class SendReviewDialog(QDialog):
         self.details.setWidget(detail_content)
         self.details.hide()
         layout.addWidget(self.details)
+        layout.addStretch(1)
         self.details_button.toggled.connect(self.details.setVisible)
         self.details_button.toggled.connect(lambda expanded: self.details_button.setText("Hide details" if expanded else "Details"))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -870,10 +934,18 @@ class SendReviewDialog(QDialog):
         outer.addWidget(buttons)
 
     def selected_max_turns(self) -> int:
+        if not getattr(self, "_tools_supported", True):
+            return 1
         return int(self.agent_max_turns.value()) if self.agent_loop_enabled.isChecked() else 1
+
+    def selected_retouch_mode(self) -> str:
+        if self.selected_max_turns() <= 1:
+            return "coach"
+        return str(self.retouch_mode.currentData() or "full_retouch")
 
     def update_context(self):
         include = self.include_before.isChecked()
         self.before_label.setVisible(include)
+        instructions = RETOUCH_AGENT_INSTRUCTIONS if self.selected_retouch_mode() == "full_retouch" else COACH_INSTRUCTIONS
         self.context.setPlainText(json.dumps(request_context(self.request, include_before=include), indent=2, ensure_ascii=False)
-                                  + "\n\nPhotography coach instructions:\n" + COACH_INSTRUCTIONS)
+                                  + "\n\nPhotography coach instructions:\n" + instructions)

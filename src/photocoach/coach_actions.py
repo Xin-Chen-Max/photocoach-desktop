@@ -10,8 +10,10 @@ from uuid import uuid4
 import numpy as np
 
 from .color_mixer import AXES, COLOR_KEYS
+from .color_grading import WHEEL_FIELDS, WHEEL_NAMES
 from .composition import output_size
-from .gradients import LinearGradient, RadialGradient, validate_gradients, source_point
+from .gradients import (DEFAULT_LUMA_FEATHER, LinearGradient, RadialGradient,
+                        validate_gradients, source_point)
 from .state import EditValues, validate_curve
 from .imaging import RawOptions
 
@@ -152,6 +154,23 @@ def _detect_foreground_subjects(
             dist_center = math.hypot(cx - 0.5, cy - 0.52)
             score = (len(cells) ** 0.75) * contrast * max(0.35, 1.30 - 0.75 * dist_center)
             crest_y = min(bottom - 0.01, top + 0.18 * bh)
+            y0_px = max(0, min(h - 1, int(round(top * h))))
+            y1_px = max(y0_px + 1, min(h, int(round(bottom * h))))
+            x0_px = max(0, min(w - 1, int(round(left * w))))
+            x1_px = max(x0_px + 1, min(w, int(round(right * w))))
+            subj_patch = luma[y0_px:y1_px, x0_px:x1_px]
+            subject_luma_p85 = float(np.percentile(subj_patch, 85))
+            ring_x = max(2, int(round(0.10 * w)))
+            ring_y = max(2, int(round(0.10 * h)))
+            rx0, rx1 = max(0, x0_px - ring_x), min(w, x1_px + ring_x)
+            ry0, ry1 = max(0, y0_px - ring_y), y1_px
+            ring = np.zeros((h, w), dtype=bool)
+            ring[ry0:ry1, rx0:rx1] = True
+            ring[y0_px:y1_px, x0_px:x1_px] = False
+            smooth_ring = ring & (edge_energy < 0.045)
+            bg_sel = smooth_ring if int(smooth_ring.sum()) >= 8 else ring
+            backdrop_luma_p25 = float(np.percentile(luma[bg_sel], 25)) if bool(bg_sel.any()) else m_bg
+            sky_backed_silhouette = bool(backdrop_luma_p25 > subject_luma_p85 + 0.04)
             scored.append((score, {
                 "center": [round(cx, 3), round(cy, 3)],
                 "bbox": [round(max(0.01, left), 3), round(max(0.01, top), 3),
@@ -160,6 +179,9 @@ def _detect_foreground_subjects(
                 "size": [round(bw, 3), round(bh, 3)],
                 "mean_luma": round(m_lum, 3),
                 "bg_luma": round(m_bg, 3),
+                "subject_luma_p85": round(subject_luma_p85, 3),
+                "backdrop_luma_p25": round(backdrop_luma_p25, 3),
+                "sky_backed_silhouette": sky_backed_silhouette,
                 "is_dark_subject": bool(m_lum < m_bg - 0.025),
             }))
 
@@ -179,8 +201,11 @@ def build_overhead_spotlight_actions(
     strength: str = "moderate",
     recipe: str = "spotlight",
     max_masks: int = 4,
+    sky_backed_silhouette: bool = False,
+    subject_luma_p85: float | None = None,
+    backdrop_luma_p25: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Construct ACTION_SCHEMA-compliant create_mask actions anchored to a subject crest & overhead beam."""
+    """Construct ACTION_SCHEMA-compliant create_mask actions anchored inside the subject with halo guards."""
     left, top, right, bottom = [float(v) for v in bbox]
     if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
         raise ValueError("Invalid target_box coordinates.")
@@ -216,13 +241,17 @@ def build_overhead_spotlight_actions(
             "name": "Window Key Light",
             "start": k_start,
             "end": k_end,
-            "exposure_ev": round(_clamp((0.48 if is_dark_subject else 0.54) * scale, 0.20, 1.20), 2),
-            "highlights": round(_clamp(0.18 * scale, 0.05, 0.45), 2),
-            "shadows": round(_clamp((0.34 if is_dark_subject else 0.22) * scale, 0.05, 0.65), 2),
-            "warmth": round(_clamp(0.34 * scale, 0.10, 0.65), 2),
+            "exposure_ev": round(_clamp((0.36 if is_dark_subject else 0.42) * scale, 0.15, 0.75), 2),
+            "highlights": round(_clamp(0.14 * scale, 0.04, 0.32), 2),
+            "shadows": round(_clamp((0.28 if is_dark_subject else 0.18) * scale, 0.05, 0.50), 2),
+            "warmth": round(_clamp(0.18 * scale, 0.05, 0.35), 2),
             "inverted": False,
             "angle": 0.0,
             "feather": 0.0,
+            "luma_min": 0.0,
+            "luma_max": 1.0,
+            "luma_feather": DEFAULT_LUMA_FEATHER,
+            "edge_aware": True,
         }]
         if max_masks >= 2:
             actions.append({
@@ -231,13 +260,17 @@ def build_overhead_spotlight_actions(
                 "name": "Shadow Falloff",
                 "start": [round(max(0.04, 1.0 - k_start[0]), 3), round(min(0.94, bottom + 0.16), 3)],
                 "end": [round(cx, 3), round(crest_y, 3)],
-                "exposure_ev": round(_clamp(-0.26 * scale, -0.60, -0.10), 2),
-                "highlights": -0.10,
-                "shadows": -0.14,
-                "warmth": -0.12,
+                "exposure_ev": round(_clamp(-0.20 * scale, -0.45, -0.10), 2),
+                "highlights": -0.08,
+                "shadows": -0.10,
+                "warmth": -0.06,
                 "inverted": False,
                 "angle": 0.0,
                 "feather": 0.0,
+                "luma_min": 0.0,
+                "luma_max": 1.0,
+                "luma_feather": DEFAULT_LUMA_FEATHER,
+                "edge_aware": False,
             })
         return actions
 
@@ -250,36 +283,52 @@ def build_overhead_spotlight_actions(
         span_w = max(0.32, min(0.64, bw * 1.9))
         span_h = max(0.22, min(0.48, bh * 1.9))
         beam_cx = cx
-        beam_cy = max(0.08, top + 0.06 * bh)
+        beam_cy = max(0.08, top + 0.16 * bh)
     elif recipe == "mountain_beam":
         span_w = max(0.48, min(0.88, bw * 2.4))
         span_h = max(0.30, min(0.62, bh * 2.2))
         beam_cx = cx
-        beam_cy = max(0.14, min(0.78, crest_y + 0.12 * bh))
+        beam_cy = max(0.14, min(0.78, crest_y + 0.18 * bh))
     else:
-        # Overhead 3D spotlight: anchor upper-crest core slightly above subject spine so the
-        # top surface gets peak illumination, side slopes roll off gently, and ground shadows hold.
-        span_w = max(0.24, min(0.50, bw * 1.65))
-        span_h = max(0.18, min(0.42, bh * 2.10))
-        beam_cx = max(0.10, min(0.90, cx + (sx - cx) * 0.10))
-        beam_cy = max(0.10, min(0.84, top + 0.18 * bh - min(0.012, 0.08 * bh)))
+        # Center the soft radial key inside the subject body rather than floating above it in the sky.
+        span_w = max(0.24, min(0.50, bw * 1.45))
+        span_h = max(0.18, min(0.42, bh * 1.45))
+        beam_cx = max(0.10, min(0.90, cx + (sx - cx) * 0.08))
+        beam_cy = max(0.10, min(0.84, top + 0.44 * bh))
 
     b_x0 = round(_clamp(beam_cx - span_w / 2.0, 0.02, 0.74), 3)
     b_y0 = round(_clamp(beam_cy - span_h / 2.0, 0.02, 0.80), 3)
     b_x1 = round(_clamp(b_x0 + span_w, min(0.98, b_x0 + 0.22), 0.98), 3)
     b_y1 = round(_clamp(b_y0 + span_h, min(0.98, b_y0 + 0.18), 0.98), 3)
 
-    key_ev = round(_clamp((0.40 if is_dark_subject else 0.48) * scale, 0.24, 1.10), 2)
-    key_hl = round(_clamp((0.20 if recipe != "sunbeam" else 0.24) * scale, 0.06, 0.45), 2)
-    key_sh = round(_clamp((0.36 if is_dark_subject else 0.22) * scale, 0.12, 0.65), 2)
-    key_warmth = round(_clamp((0.32 if recipe == "spotlight" else 0.44) * scale, 0.15, 0.65), 2)
-    key_feather = 0.84 if recipe in ("sunbeam", "mountain_beam") else 0.82
+    key_ev = round(_clamp((0.28 if is_dark_subject else 0.32) * scale, 0.16, 0.58), 2)
+    key_hl = round(_clamp(0.12 * scale, 0.04, 0.25), 2)
+    key_sh = round(_clamp((0.28 if is_dark_subject else 0.16) * scale, 0.08, 0.48), 2)
+    key_warmth = round(_clamp((0.14 if recipe == "spotlight" else 0.24) * scale, 0.06, 0.32), 2)
+    key_feather = 0.88
+
+    luma_min = 0.0
+    if sky_backed_silhouette or (subject_luma_p85 is not None and subject_luma_p85 < 0.35):
+        if sky_backed_silhouette and subject_luma_p85 is not None and backdrop_luma_p25 is not None:
+            gap = max(0.03, float(backdrop_luma_p25) - float(subject_luma_p85))
+            luma_max = round(_clamp(float(subject_luma_p85) + 0.35 * gap, 0.16, 0.42), 2)
+            luma_feather = round(_clamp(0.55 * gap, 0.04, 0.12), 2)
+        else:
+            base_p85 = 0.22 if subject_luma_p85 is None else float(subject_luma_p85)
+            luma_max = round(_clamp(base_p85 + 0.04, 0.18, 0.42), 2)
+            luma_feather = 0.12
+        if sky_backed_silhouette:
+            key_warmth = min(key_warmth, 0.12)
+            key_ev = min(key_ev, 0.38)
+    else:
+        luma_max = 1.0
+        luma_feather = DEFAULT_LUMA_FEATHER
 
     key_name = {
         "sunbeam": "Sunbeam Shaft",
         "rim_backlight": "Rim Backlight",
         "mountain_beam": "Overhead Ridge Beam",
-    }.get(recipe, "Overhead Key Light")
+    }.get(recipe, "Subject Key Light")
 
     actions = [{
         "operation": "create_mask",
@@ -294,6 +343,10 @@ def build_overhead_spotlight_actions(
         "inverted": False,
         "angle": beam_angle,
         "feather": key_feather,
+        "luma_min": luma_min,
+        "luma_max": luma_max,
+        "luma_feather": luma_feather,
+        "edge_aware": True,
     }]
     if max_masks >= 2 and recipe != "rim_backlight":
         f_x0 = round(_clamp(b_x0 - 0.06, 0.01, 0.70), 3)
@@ -306,37 +359,17 @@ def build_overhead_spotlight_actions(
             "name": "Ambient Falloff",
             "start": [f_x0, f_y0],
             "end": [f_x1, f_y1],
-            "exposure_ev": round(_clamp(-0.28 * scale, -0.55, -0.14), 2),
-            "highlights": -0.14,
-            "shadows": -0.12,
-            "warmth": -0.10,
+            "exposure_ev": round(_clamp(-0.20 * scale, -0.45, -0.10), 2),
+            "highlights": -0.10,
+            "shadows": -0.08,
+            "warmth": -0.06,
             "inverted": True,
             "angle": beam_angle,
-            "feather": 0.78,
-        })
-    if max_masks >= 3 and recipe == "spotlight":
-        # Focused upper-crest rim catch light: peaks on the upward-facing top surface and fades
-        # cleanly across the side slope without illuminating the ground beneath.
-        c_w = max(0.18, min(0.36, bw * 1.25))
-        c_h = max(0.08, min(0.22, bh * 1.15))
-        c_cy = max(0.06, min(0.88, top + 0.22 * bh))
-        c_x0 = round(_clamp(cx - c_w / 2.0, 0.03, 0.78), 3)
-        c_y0 = round(_clamp(c_cy - c_h / 2.0, 0.03, 0.86), 3)
-        c_x1 = round(_clamp(c_x0 + c_w, min(0.97, c_x0 + 0.18), 0.97), 3)
-        c_y1 = round(_clamp(c_y0 + c_h, min(0.97, c_y0 + 0.08), 0.97), 3)
-        actions.append({
-            "operation": "create_mask",
-            "kind": "radial",
-            "name": "Top Crest Highlight",
-            "start": [c_x0, c_y0],
-            "end": [c_x1, c_y1],
-            "exposure_ev": round(_clamp((0.30 if is_dark_subject else 0.24) * scale, 0.14, 0.65), 2),
-            "highlights": round(_clamp(0.26 * scale, 0.08, 0.45), 2),
-            "shadows": round(_clamp((0.32 if is_dark_subject else 0.16) * scale, 0.10, 0.55), 2),
-            "warmth": round(_clamp(0.22 * scale, 0.08, 0.45), 2),
-            "inverted": False,
-            "angle": beam_angle,
             "feather": 0.85,
+            "luma_min": 0.0,
+            "luma_max": 1.0,
+            "luma_feather": DEFAULT_LUMA_FEATHER,
+            "edge_aware": False,
         })
     return actions
 
@@ -523,6 +556,9 @@ def analyze_scene_lighting(preview: np.ndarray, question: str = "", goal: str = 
         target_y = _clamp(primary["center"][1], 0.14, 0.90)
         primary_box = tuple(primary["bbox"])
         primary_dark = bool(primary["is_dark_subject"])
+        primary_sky_backed = bool(primary.get("sky_backed_silhouette", False))
+        primary_luma_p85 = primary.get("subject_luma_p85")
+        primary_bg_p25 = primary.get("backdrop_luma_p25")
     else:
         primary_box = (
             _clamp(target_x - 0.16, 0.05, 0.72),
@@ -531,18 +567,27 @@ def analyze_scene_lighting(preview: np.ndarray, question: str = "", goal: str = 
             _clamp(target_y + 0.12, 0.28, 0.92),
         )
         primary_dark = bool(mean_luma < 0.35)
+        primary_sky_backed = False
+        primary_luma_p85 = None
+        primary_bg_p25 = None
     recommended_recipes = {
         "spotlight": build_overhead_spotlight_actions(
             primary_box,
             (round(source_x, 2), round(source_y, 2)),
             is_dark_subject=primary_dark,
             recipe="spotlight",
+            sky_backed_silhouette=primary_sky_backed,
+            subject_luma_p85=primary_luma_p85,
+            backdrop_luma_p25=primary_bg_p25,
         ),
         "sunbeam": build_overhead_spotlight_actions(
             primary_box,
             (round(source_x, 2), round(source_y, 2)),
             is_dark_subject=primary_dark,
             recipe="sunbeam",
+            sky_backed_silhouette=primary_sky_backed,
+            subject_luma_p85=primary_luma_p85,
+            backdrop_luma_p25=primary_bg_p25,
         ),
     }
 
@@ -975,7 +1020,9 @@ ACTION_SCHEMA = {"type": "array", "items": {"anyOf": [
                    "kind": {"type": "string", "enum": ["radial", "linear"]},
                    "name": {"type": "string"}, "start": POINT, "end": POINT,
                    "exposure_ev": NUMBER, "warmth": NUMBER, "highlights": NUMBER, "shadows": NUMBER,
-                   "inverted": {"type": "boolean"}, "angle": NUMBER, "feather": NUMBER}),
+                   "inverted": {"type": "boolean"}, "angle": NUMBER, "feather": NUMBER,
+                   "luma_min": NUMBER, "luma_max": NUMBER, "luma_feather": NUMBER,
+                   "edge_aware": {"type": "boolean"}}),
 ]}}
 
 
@@ -1014,15 +1061,34 @@ def resolve_actions(items, baseline, size=None):
                 result = target(bands[parts[1]][parts[2]])
                 bands[parts[1]][parts[2]] = result
                 value = type(values.color_mixer).from_dict(bands)
+            elif len(parts) == 2 and name == "color_grading" and parts[1] in ("blend", "balance"):
+                result = target(getattr(values.color_grading, parts[1]))
+                value = replace(values.color_grading, **{parts[1]: result})
+            elif len(parts) == 3 and name == "color_grading" and parts[1] in WHEEL_NAMES and parts[2] in WHEEL_FIELDS:
+                wheel = getattr(values.color_grading, parts[1])
+                current = getattr(wheel, parts[2])
+                if op == "add" and parts[2] == "hue":
+                    if not (-360.0 < float(number) < 360.0):
+                        raise ValueError("Hue delta must be in (-360, 360).")
+                    result = (current + float(number)) % 360.0
+                    if result == 0.0 or result >= 360.0:
+                        result = 0.0
+                else:
+                    result = target(current)
+                value = values.color_grading.with_wheel(parts[1], replace(wheel, **{parts[2]: result}))
             elif len(parts) == 3 and name == "local_gradients":
                 mask = next((g for g in baseline.local_gradients if g.id == parts[1]), None)
-                if mask is None or parts[2] not in ("exposure_ev","warmth","highlights","shadows","angle","feather") or not hasattr(mask, parts[2]):
+                if mask is None or parts[2] not in ("exposure_ev", "warmth", "highlights", "shadows", "angle", "feather", "luma_min", "luma_max", "luma_feather") or not hasattr(mask, parts[2]):
                     raise ValueError("Unknown mask control.")
                 result = target(getattr(mask, parts[2]))
                 value = tuple(replace(g, **{parts[2]: result}) if g.id == mask.id else g for g in values.local_gradients)
             else:
                 raise ValueError("Unsupported editing control.")
-            unit = " EV" if parts[-1] in ("exposure_ev", "vignetting_ev") else ""
+            unit = (
+                "°" if name == "color_grading" and parts[-1] == "hue"
+                else " EV" if parts[-1] in ("exposure_ev", "vignetting_ev")
+                else ""
+            )
             label = f"{path} → {result:g}{unit}"
         elif op == "set_curve" and set(item) == {"operation", "points"}:
             name, value = "rgb_curve", validate_curve(item["points"])
@@ -1034,9 +1100,16 @@ def resolve_actions(items, baseline, size=None):
             name, value = "raw_options", RawOptions(item["mode"], tuple(item["gains"]))
             control = "white_balance"
             label = f"White balance → {value.wb_mode} {value.wb_gains}"
-        elif op == "create_mask" and set(item) == set(ACTION_SCHEMA["items"]["anyOf"][-1]["required"]):
-            fields = {k: item[k] for k in ("name","start","end","inverted","exposure_ev","highlights","shadows","warmth")}
+        elif op == "create_mask" and set(item) in (
+            {"operation", "kind", "name", "start", "end", "exposure_ev", "warmth", "highlights", "shadows", "inverted", "angle", "feather"},
+            set(ACTION_SCHEMA["items"]["anyOf"][-1]["required"]),
+        ):
+            fields = {k: item[k] for k in ("name", "start", "end", "inverted", "exposure_ev", "highlights", "shadows", "warmth")}
             fields["id"] = "coach-" + uuid4().hex
+            fields["luma_min"] = item.get("luma_min", 0.0)
+            fields["luma_max"] = item.get("luma_max", 1.0)
+            fields["luma_feather"] = item.get("luma_feather", DEFAULT_LUMA_FEATHER)
+            fields["edge_aware"] = item.get("edge_aware", False)
             if item["kind"] == "radial":
                 mask = RadialGradient(**fields, angle=item["angle"], feather=item["feather"])
             elif (item["kind"] == "linear" and all(type(item[k]) in (int, float) and item[k] == 0
@@ -1047,9 +1120,15 @@ def resolve_actions(items, baseline, size=None):
             name = "local_gradients"
             control = f"{name}.{mask.id}"
             value = (*values.local_gradients, map_preview_mask(mask, baseline, size))
+            extra_notes = []
+            if mask.has_luma_range:
+                extra_notes.append(f"luma {mask.luma_min:.2f}..{mask.luma_max:.2f}")
+            if mask.edge_aware:
+                extra_notes.append("edge-aware")
+            extra_suffix = (", " + ", ".join(extra_notes)) if extra_notes else ""
             label = (f"{mask.name} ({item['kind']}) {mask.start} → {mask.end}, exposure {mask.exposure_ev:g} EV, "
                      f"warmth {mask.warmth:g}, highlights {mask.highlights:g}, shadows {mask.shadows:g}, "
-                     f"invert {mask.inverted}, angle {item['angle']:g}°, feather {item['feather']:g}")
+                     f"invert {mask.inverted}, angle {item['angle']:g}°, feather {item['feather']:g}{extra_suffix}")
         else:
             raise ValueError("Unknown or incomplete coach action.")
         if op in ("set_curve", "set_wb") and name in targets:

@@ -657,3 +657,153 @@ def test_live_progress_renders_completed_spans_and_active_step_in_main_window(ap
     window._close_approved = True
     window.close()
     window.deleteLater()
+
+
+def test_trial_compare_widget_and_apply_anyway_override_with_single_undo(application, tmp_path):
+    import numpy as np
+    from photocoach.coach_actions import resolve_actions
+    from photocoach.coach_agent import AgentPlan, AgentReport, Finding, VerificationCheck
+    from photocoach.coach_view import TrialCompareWidget
+
+    # 1. TrialCompareWidget supports split/hold/side_by_side + zoom/pan and paints cleanly.
+    widget = TrialCompareWidget()
+    widget.resize(800, 500)
+    before = np.full((64, 96, 3), 60, np.uint8)
+    after = np.full((64, 96, 3), 140, np.uint8)
+    widget.set_images(before, after, "Before", "Trial")
+    for mode in ("split", "hold", "side_by_side"):
+        widget.set_mode(mode)
+        widget.set_zoom(2.0)
+        widget.grab()
+    widget.set_zoom(1.0)
+    widget.deleteLater()
+
+    # 2. Check-failed ("blocked") trial on recommend decision hides main Apply but enables Apply anyway in Preview trial.
+    window = MainWindow(settings_store=SettingsStore(tmp_path / "settings.json"), credentials=NoVault())
+    state = window.store.activate(Path("synthetic.ARW"), "photo-override")
+    window._set_controls(True)
+    actions = resolve_actions([{"operation": "add", "parameter": "exposure_ev", "value": 0.5}], state.values)
+    plan = AgentPlan(
+        decision="recommend",
+        objective="Brighten the dark subject cleanly.",
+        findings=(Finding("center", "Dim subject.", "Exposure +0.5 EV.", "technical", "high"),),
+        checks=(VerificationCheck("center", "mean_luminance", "increase", "Raise subject brightness."),),
+        uncertainty="Reduced preview only.",
+    )
+    blocked_report = AgentReport(
+        status="blocked",
+        can_apply=False,
+        notices=(("Held for ceiling warning.", "请核对高光提示。"),),
+        current_preview=before,
+        trial_preview=after,
+    )
+    fb = CoachFeedback(
+        photo_id=state.photo_id,
+        session_id=state.session_id,
+        state_version=state.revision,
+        main_change="Exposure +0.5 EV",
+        reason="Brightens dark subject.",
+        next_step_or_stop="Compare in Preview trial.",
+        observe_and_stop_when="Check highlight separation.",
+        evidence=("Observed: dim.", "Inference: lift.", "Preference: natural."),
+        actions=actions,
+        agent_plan=plan,
+        agent_report=blocked_report,
+    )
+    window.coach_text.show_feedback(fb)
+    assert not window.coach_response.apply_button.isEnabled()
+    assert window.coach_response.trial_button.isEnabled()
+    window.coach_response.open_trial()
+    assert window.coach_response.trial_apply.isVisible() and window.coach_response.trial_apply.isEnabled()
+    assert "Apply anyway" in window.coach_response.trial_apply.text()
+
+    window.coach_response.trial_apply.click()
+    assert not window.coach_response.trial.isVisible()
+    assert window.store.current.values.exposure_ev == 0.5
+    assert len(window.store.undo_stack) == 1
+    window.undo()
+    assert window.store.current.values.exposure_ev == 0.0
+
+    # 3. Stop / inspect / policy-blocked outputs must NEVER offer Apply anyway override.
+    for blocked_decision, notice in (("inspect", ""), ("recommend", "Policy blocked.")):
+        bad_plan = replace(plan, decision=blocked_decision)
+        bad_fb = replace(fb, state_version=window.store.current.revision, agent_plan=bad_plan, action_notice=notice)
+        window.coach_text.show_feedback(bad_fb)
+        window.coach_response.open_trial()
+        assert not window.coach_response.trial_apply.isVisible()
+        assert window._apply_coach_suggestion(0, allow_previewed_override=True) is False
+        window.coach_response.trial.hide()
+
+    window._close_approved = True
+    window.close()
+    window.deleteLater()
+
+
+def test_send_review_dialog_zero_jitter_on_turns_and_details(application):
+    import numpy as np
+    from photocoach.coach import CoachRequest
+    from photocoach.coach_ui import SendReviewDialog
+    from photocoach.state import EDIT_PIPELINE_VERSION, EditValues
+
+    px = np.zeros((120, 160, 3), dtype=np.uint8)
+    ev = EditValues().to_dict()
+    req = CoachRequest(
+        request_id="r1",
+        photo_id="p1",
+        session_id="s1",
+        state_version=1,
+        before_state_version=0,
+        pipeline_version=EDIT_PIPELINE_VERSION,
+        goal="",
+        question="Fix lighting",
+        parameters=ev,
+        before_parameters=ev,
+        recent_operations=(),
+        before_preview=px,
+        current_preview=px,
+    )
+    cfg = ApiConfig("http://127.0.0.1:11435/api/chat", "qwen3.6:27b", "ollama", 300, 0)
+    dialog = SendReviewDialog(None, req, cfg, SessionBudget(call_limit=100))
+    dialog.show()
+    for _ in range(3):
+        application.processEvents()
+
+    for width in (480, 520, 600, 720):
+        dialog.resize(width, 540)
+        for _ in range(3):
+            application.processEvents()
+        baseline_vp = dialog.body_scroll.viewport().width()
+        baseline_summary_h = dialog._summary_label.height()
+        baseline_spin = dialog.agent_max_turns.geometry()
+        baseline_details_btn = dialog.details_button.geometry()
+        for turns in (1, 2, 6, 9, 10, 12):
+            dialog.agent_max_turns.setValue(turns)
+            for _ in range(2):
+                application.processEvents()
+            assert dialog.body_scroll.viewport().width() == baseline_vp
+            assert dialog._summary_label.height() == baseline_summary_h
+            assert dialog.agent_max_turns.geometry() == baseline_spin
+            assert dialog.details_button.geometry() == baseline_details_btn
+        dialog.agent_loop_enabled.click()
+        for _ in range(2):
+            application.processEvents()
+        assert dialog.body_scroll.viewport().width() == baseline_vp
+        assert dialog._summary_label.height() == baseline_summary_h
+        assert dialog.agent_max_turns.geometry() == baseline_spin
+        assert dialog.details_button.geometry() == baseline_details_btn
+        dialog.agent_loop_enabled.click()
+        for _ in range(2):
+            application.processEvents()
+        dialog.details_button.click()
+        for _ in range(2):
+            application.processEvents()
+        assert dialog.body_scroll.viewport().width() == baseline_vp
+        assert dialog._summary_label.height() == baseline_summary_h
+        assert dialog.agent_max_turns.geometry() == baseline_spin
+        assert dialog.details_button.geometry() == baseline_details_btn
+        dialog.details_button.click()
+        for _ in range(2):
+            application.processEvents()
+
+    dialog.reject()
+    dialog.deleteLater()

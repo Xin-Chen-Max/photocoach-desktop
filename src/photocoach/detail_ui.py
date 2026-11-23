@@ -30,6 +30,7 @@ class DetailEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.note = QLabel("Inspect at 100% · Luminance USM and color NR")
         self.note.setProperty("secondary", True)
+        self.note.setWordWrap(True)
         self.note.setToolTip(
             "Detail controls operate on encoded luminance and opponent chroma with 20-pixel strip halo padding so 100% previews and exports match."
         )

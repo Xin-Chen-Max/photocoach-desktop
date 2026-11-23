@@ -150,8 +150,12 @@ def test_ten_new_edits_restore_history_and_ai_snapshot(tmp_path):
     old=snapshot_project(oldstore)
     def walk(v):
         if isinstance(v,dict):
+            v.pop('compare_snapshot_id', None)
+            v.pop('snapshots', None)
             if 'white_balance' in v:
                 v.pop('base_rendering')
+                v.pop('color_grading')
+                v.pop('spots')
                 v.pop('local_gradients')
                 v.pop('lens_corrections')
                 for name in ('whites','blacks','vibrance'): v.pop(name)

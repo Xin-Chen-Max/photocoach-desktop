@@ -112,10 +112,14 @@ def test_composition_history_reset_roundtrip_and_strict_v2_upgrade(tmp_path):
     # Build the exact previous-v2 shape, including its history snapshots.
     def strip(value):
         if isinstance(value,dict):
+            value.pop("compare_snapshot_id", None)
+            value.pop("snapshots", None)
             if "white_balance" in value:
                 value.pop("base_rendering")
                 value.pop("composition")
                 value.pop("color_mixer")
+                value.pop("color_grading")
+                value.pop("spots")
                 value.pop("local_gradients")
                 value.pop("lens_corrections")
                 for name in ("whites", "blacks", "vibrance"): value.pop(name)
@@ -128,7 +132,7 @@ def test_composition_history_reset_roundtrip_and_strict_v2_upgrade(tmp_path):
     before=copy.deepcopy(old)
     upgraded=upgrade_project(old)
     validate_project(upgraded)
-    assert old==before and upgraded["schema_version"]==9
+    assert old==before and upgraded["schema_version"]==14
     bad=copy.deepcopy(old)
     bad["state"]["parameters"]["composition"]={}
     with pytest.raises(ValueError): validate_project(bad)

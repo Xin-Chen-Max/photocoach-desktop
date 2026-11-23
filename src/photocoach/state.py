@@ -14,9 +14,12 @@ from .composition import Composition
 from .lens import LensCorrections
 from .detail import DetailControls
 from .color_mixer import ColorMixer
+from .color_grading import ColorGrading
 from .gradients import LinearGradient, validate_gradients, gradient_from_dict
+from .spots import SpotRemoval, validate_spots
+from .snapshots import EditSnapshot, MAX_SNAPSHOTS, validate_snapshot_name, validate_snapshots
 
-EDIT_PIPELINE_VERSION = "phase1-sdr-srgb-v9"
+EDIT_PIPELINE_VERSION = "phase1-sdr-srgb-v14"
 IDENTITY_CURVE = ((0.0, 0.0), (1.0, 1.0))
 
 
@@ -61,15 +64,20 @@ class EditValues:
     lens_corrections: LensCorrections = LensCorrections()
     detail: DetailControls = DetailControls()
     base_rendering: str = "legacy_v1"
+    color_grading: ColorGrading = ColorGrading()
+    spots: tuple[SpotRemoval, ...] = ()
 
     def __post_init__(self):
         if self.base_rendering not in BASE_RENDERINGS:
             raise ValueError("Unknown base rendering version.")
         validate_gradients(self.local_gradients)
+        validate_spots(self.spots)
         if not isinstance(self.lens_corrections, LensCorrections):
             raise ValueError("Invalid manual lens correction parameters.")
         if not isinstance(self.detail, DetailControls):
             raise ValueError("Invalid detail parameters.")
+        if not isinstance(self.color_grading, ColorGrading):
+            raise ValueError("Invalid color grading parameters.")
         object.__setattr__(self, "exposure_ev", finite_number(self.exposure_ev, -5, 5, "Exposure"))
         object.__setattr__(self, "contrast", finite_number(self.contrast, -1, 1, "Contrast"))
         object.__setattr__(self, "saturation", finite_number(self.saturation, 0, 2, "Saturation"))
@@ -99,7 +107,9 @@ class EditValues:
             "composition": self.composition.to_dict(),
             "lens_corrections": self.lens_corrections.to_dict(),
             "color_mixer": self.color_mixer.to_dict(),
+            "color_grading": self.color_grading.to_dict(),
             "local_gradients": [g.to_dict() for g in self.local_gradients],
+            "spots": [s.to_dict() for s in self.spots],
             "rgb_curve": [list(point) for point in self.rgb_curve], "goal": self.goal,
             **({"detail": self.detail.to_dict()} if self.detail != DetailControls() else {})}
 
@@ -117,6 +127,8 @@ class EditValues:
         gains = tuple(finite_number(v, .25, 4, "WB gain") for v in gains)
         if not isinstance(value["local_gradients"],list):
             raise ValueError("Invalid gradient collection.")
+        if not isinstance(value["spots"], list):
+            raise ValueError("Invalid spot removal collection.")
         return cls(value["exposure_ev"], RawOptions(wb["mode"], gains), value["contrast"],
                    value["saturation"], validate_curve(value["rgb_curve"]), value["goal"],
                    value["highlights"], value["shadows"], Composition.from_dict(value["composition"]),
@@ -124,7 +136,9 @@ class EditValues:
                    tuple(gradient_from_dict(g) for g in value["local_gradients"]),
                    LensCorrections.from_dict(value["lens_corrections"]),
                    DetailControls.from_dict(value["detail"]) if "detail" in value else DetailControls(),
-                   value["base_rendering"])
+                   value["base_rendering"],
+                   ColorGrading.from_dict(value["color_grading"]),
+                   tuple(SpotRemoval.from_dict(s) for s in value["spots"]))
 
 
 @dataclass(frozen=True)
@@ -151,12 +165,19 @@ class EditState:
     lens_corrections: LensCorrections = LensCorrections()
     detail: DetailControls = DetailControls()
     base_rendering: str = "legacy_v1"
+    color_grading: ColorGrading = ColorGrading()
+    spots: tuple[SpotRemoval, ...] = ()
+    compare_snapshot: EditSnapshot | None = None
+
+    @property
+    def compare_snapshot_id(self) -> str | None:
+        return None if self.compare_snapshot is None else self.compare_snapshot.id
 
     @property
     def values(self) -> EditValues:
         return EditValues(self.exposure_ev, self.raw_options, self.contrast, self.saturation, self.rgb_curve,
                           self.goal, self.highlights, self.shadows, self.composition, self.color_mixer,
-                          self.whites, self.blacks, self.vibrance, self.local_gradients, self.lens_corrections, self.detail, self.base_rendering)
+                          self.whites, self.blacks, self.vibrance, self.local_gradients, self.lens_corrections, self.detail, self.base_rendering, self.color_grading, self.spots)
 
     def with_values(self, values: EditValues) -> EditState:
         return replace(self, **values.fields())
@@ -181,6 +202,7 @@ class StateStore:
         self.preview_revision: int | None = None
         self.undo_stack: list[HistoryEntry] = []
         self.redo_stack: list[HistoryEntry] = []
+        self.snapshots: list[EditSnapshot] = []
         self.project_id = str(uuid4())
         self.created_utc = self._now()
         self._transaction: str | None = None
@@ -188,6 +210,7 @@ class StateStore:
         self._transaction_parameter = "exposure_ev"
         self._event_start = 0
         self._saved_revision = 0
+        self._saved_snapshots: tuple[EditSnapshot, ...] = ()
         self.load_warnings: list[str] = []
 
     @staticmethod
@@ -196,14 +219,18 @@ class StateStore:
 
     @property
     def dirty(self) -> bool:
-        return self.current is not None and self.current.revision != self._saved_revision
+        return self.current is not None and (
+            self.current.revision != self._saved_revision
+            or tuple(self.snapshots) != self._saved_snapshots
+        )
 
     @property
     def gesture_active(self) -> bool:
         return self._transaction is not None
 
-    def mark_saved(self, revision: int) -> None:
+    def mark_saved(self, revision: int, snapshots: tuple[EditSnapshot, ...] | None = None) -> None:
         self._saved_revision = revision
+        self._saved_snapshots = tuple(self.snapshots) if snapshots is None else tuple(snapshots)
 
     def _record(self, kind, parameter, before, after, phase="end", *, previous_revision=None,
                 edit_before=None, entry=None, undo_of=None, redo_of=None) -> dict:
@@ -233,8 +260,10 @@ class StateStore:
         self.preview_revision = None
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self.snapshots.clear()
         self._event_start = len(self.events)
         self._saved_revision = 0
+        self._saved_snapshots = ()
         self.project_id = str(uuid4())
         self.created_utc = self._now()
         self._record("photo_switch", "photo_id", previous, photo_id)
@@ -243,7 +272,7 @@ class StateStore:
     def begin_drag(self, parameter: str = "exposure_ev") -> None:
         if self.current is not None:
             self.end_drag()
-            if parameter not in ("exposure_ev", "contrast", "saturation", "rgb_curve", "highlights", "shadows", "color_mixer", "whites", "blacks", "vibrance", "local_gradients", "lens_corrections", "detail", "raw_options"):
+            if parameter not in ("exposure_ev", "contrast", "saturation", "rgb_curve", "highlights", "shadows", "color_mixer", "color_grading", "whites", "blacks", "vibrance", "local_gradients", "spots", "lens_corrections", "detail", "raw_options"):
                 raise ValueError("This parameter cannot be dragged.")
             self._transaction = str(uuid4())
             self._transaction_before = self.current.values
@@ -283,14 +312,18 @@ class StateStore:
         return values.to_dict().get(key)
 
     def _apply_values(self, values: EditValues, kind: str, parameter: str, *, history=True,
-                      undo_of=None, redo_of=None) -> None:
+                      undo_of=None, redo_of=None, label: str | None = None) -> None:
         if self.current is None:
             raise RuntimeError("Open a photo first.")
         old = self.current
         if old.values == values:
             return
         self.current = replace(old.with_values(values), revision=old.revision + 1)
-        entry = self._commit(old.values, parameter) if history and self._transaction is None else None
+        entry = (
+            self._commit(old.values, parameter if label is None else label)
+            if history and self._transaction is None
+            else None
+        )
         all_values = parameter == "all"
         self._record(kind, parameter,
                      old.values.to_dict() if all_values else self._parameter_value(old.values, parameter),
@@ -347,10 +380,84 @@ class StateStore:
         if self.current is None:
             raise RuntimeError("Open a photo first.")
         enabled = bool(enabled)
+        if enabled and self.current.compare_snapshot is not None:
+            self.set_compare_snapshot(None)
         old = self.current
         if old.compare_baseline != enabled:
             self.current = replace(old, compare_baseline=enabled, revision=old.revision + 1)
             self._record("compare", "compare_baseline", old.compare_baseline, enabled, previous_revision=old.revision)
+
+    def get_snapshot(self, snapshot_id: str) -> EditSnapshot:
+        for snapshot in self.snapshots:
+            if snapshot.id == snapshot_id:
+                return snapshot
+        raise ValueError("Snapshot not found.")
+
+    def save_snapshot(self, name: str) -> EditSnapshot:
+        if self.current is None:
+            raise RuntimeError("Open a photo first.")
+        self.end_drag()
+        cleaned = validate_snapshot_name(name)
+        if len(self.snapshots) >= MAX_SNAPSHOTS:
+            raise ValueError(f"At most {MAX_SNAPSHOTS} snapshots are supported per project.")
+        if any(existing.name.casefold() == cleaned.casefold() for existing in self.snapshots):
+            raise ValueError(f"Snapshot '{cleaned}' already exists. Choose a new name or delete the old one.")
+        snapshot = EditSnapshot(str(uuid4()), cleaned, self._now(), self.current.values)
+        self.snapshots.append(snapshot)
+        validate_snapshots(self.snapshots)
+        self._record("snapshot_save", "snapshots", None, {"id": snapshot.id, "name": snapshot.name})
+        return snapshot
+
+    def delete_snapshot(self, snapshot_id: str) -> EditSnapshot:
+        if self.current is None:
+            raise RuntimeError("Open a photo first.")
+        self.end_drag()
+        index = next((idx for idx, item in enumerate(self.snapshots) if item.id == snapshot_id), None)
+        if index is None:
+            raise ValueError("Snapshot not found.")
+        if self.current.compare_snapshot_id == snapshot_id:
+            self.set_compare_snapshot(None)
+        removed = self.snapshots.pop(index)
+        self._record("snapshot_delete", "snapshots", {"id": removed.id, "name": removed.name}, None)
+        return removed
+
+    def restore_snapshot(self, snapshot_id: str) -> bool:
+        if self.current is None:
+            raise RuntimeError("Open a photo first.")
+        self.end_drag()
+        snapshot = self.get_snapshot(snapshot_id)
+        if self.current.compare_baseline:
+            self.set_compare(False)
+        if self.current.compare_snapshot is not None:
+            self.set_compare_snapshot(None)
+        if self.current.values == snapshot.values:
+            return False
+        self._apply_values(
+            snapshot.values,
+            "snapshot_restore",
+            "all",
+            label=f"Restore snapshot: {snapshot.name}",
+        )
+        return True
+
+    def set_compare_snapshot(self, snapshot_id: str | None) -> None:
+        self.end_drag()
+        if self.current is None:
+            raise RuntimeError("Open a photo first.")
+        target = None if snapshot_id is None else self.get_snapshot(snapshot_id)
+        if target is not None and self.current.compare_baseline:
+            self.set_compare(False)
+        old = self.current
+        target_id = None if target is None else target.id
+        if old.compare_snapshot_id != target_id:
+            self.current = replace(old, compare_snapshot=target, revision=old.revision + 1)
+            self._record(
+                "compare_snapshot",
+                "compare_snapshot_id",
+                old.compare_snapshot_id,
+                target_id,
+                previous_revision=old.revision,
+            )
 
     def reset(self) -> None:
         self.end_drag()
@@ -396,5 +503,5 @@ class StateStore:
                     start = next(e for e in self.events[self._event_start:]
                                  if e["transaction_id"] == event["transaction_id"] and e["phase"] == "begin")
                     version = start["state_version"]
-                return replace(self.current.with_values(values), revision=version, compare_baseline=False)
-        return replace(self.current, compare_baseline=False)
+                return replace(self.current.with_values(values), revision=version, compare_baseline=False, compare_snapshot=None)
+        return replace(self.current, compare_baseline=False, compare_snapshot=None)

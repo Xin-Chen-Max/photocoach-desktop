@@ -29,11 +29,12 @@ def _sampled_histogram(linear, values, *, source_size=None):
     sampled = (linear[::step, ::step] if values.composition == Composition() else
                sample_composition(linear, values.composition,
                    target_size=(math.ceil(size[0]/step), math.ceil(size[1]/step))))
-    if any(g.active for g in values.local_gradients) or values.lens_corrections.distortion or values.lens_corrections.vignetting_ev:
+    if any(g.active for g in values.local_gradients) or any(s.active for s in values.spots) or values.lens_corrections.distortion or values.lens_corrections.vignetting_ev:
         sampled=sample_composition(linear,values.composition,source_size=source_size,
                                    target_size=(sampled.shape[1],sampled.shape[0]),distortion=values.lens_corrections.distortion)
     pixels = quantize_srgb(render_edit(sampled, values,
-        geometry=RenderGeometry.full(source_size,values.composition,(sampled.shape[1],sampled.shape[0]),values.lens_corrections.distortion)))
+        geometry=RenderGeometry.full(source_size,values.composition,(sampled.shape[1],sampled.shape[0]),values.lens_corrections.distortion),
+        source_linear=linear))
     count = pixels.shape[0] * pixels.shape[1]
     return {"rgb": [np.bincount(pixels[...,channel].ravel(), minlength=256).tolist() for channel in range(3)],
             "samples": count, "stride": step,
@@ -113,11 +114,18 @@ class HistogramView(QWidget):
         self.title.setText("Histogram · Updating… (previous)" if self.plot.data is not None
                            else "Histogram · Updating…")
 
-    def display(self, data, *, baseline=False):
+    def display(self, data, *, baseline=False, snapshot_name: str | None = None):
         if data is None:
             self.clear("Unavailable")
             return
-        self.title.setText("Histogram · " + ("Baseline" if baseline else "Edited"))
+        if baseline:
+            label = "Baseline"
+        elif snapshot_name:
+            short = snapshot_name if len(snapshot_name) <= 22 else snapshot_name[:21] + "…"
+            label = f"A/B ({short})"
+        else:
+            label = "Edited"
+        self.title.setText("Histogram · " + label)
         self.plot.data = data
         self.plot.update()
         self.limits.setText(self._limits_text(data))

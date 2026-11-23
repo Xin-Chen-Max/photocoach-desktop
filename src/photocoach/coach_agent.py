@@ -11,7 +11,8 @@ from typing import Callable
 
 import numpy as np
 
-from .gradients import RadialGradient
+from .composition import Composition
+from .gradients import RadialGradient, RenderGeometry, gradient_weight
 from .state import EditValues
 
 
@@ -338,6 +339,23 @@ def evaluate_trial_candidate(request, plan: AgentPlan, actions, render: Callable
             zh = "偏暗画面中的暖色聚光灯缺少局部阴影提亮（shadows），建议补充 +0.20..+0.38 避免仅亮起浅色地面。"
             notices.append((en, zh))
             warnings.append(en)
+    brightening_radials = [
+        g for g in new_masks
+        if isinstance(g, RadialGradient) and not g.inverted and (g.exposure_ev >= 0.18 or g.shadows >= 0.18)
+    ]
+    if same_geometry and brightening_radials and any(
+        _detect_radial_halo_bleed(
+            before, after, g, source_size=request.source_size, candidate=candidate,
+        )
+        for g in brightening_radials
+    ):
+        en = (
+            "Radial mask bleeds a glowing halo or warm cast onto adjacent smooth background/sky "
+            "(halo_bleed); lower luma_max, enable edge_aware, reduce exposure/warmth, or use global/linear adjustments."
+        )
+        zh = "径向提亮蒙版向周围平滑天空/背景溢出了发光假光晕（halo_bleed）；请降低 luma_max 并开启 edge_aware、减弱局部曝光与暖度，或改用全局与线性渐变调整。"
+        notices.append((en, zh))
+        warnings.append(en)
     whole_luma_delta = (right["whole"]["mean_luminance"] - left["whole"]["mean_luminance"]) if same_geometry else None
     ceiling_delta = (right["whole"]["display_ceiling_fraction"] - left["whole"]["display_ceiling_fraction"]) if same_geometry else None
     floor_delta = (right["whole"]["display_floor_fraction"] - left["whole"]["display_floor_fraction"]) if same_geometry else None
@@ -353,6 +371,48 @@ def evaluate_trial_candidate(request, plan: AgentPlan, actions, render: Callable
         "warnings": warnings,
     }
     return report, metrics_delta
+
+
+def _detect_radial_halo_bleed(
+    before_px: np.ndarray,
+    after_px: np.ndarray,
+    mask: RadialGradient,
+    *,
+    source_size: tuple[int, int] | None,
+    candidate: EditValues,
+) -> bool:
+    """Detect glowing halos or warm cast bleeding onto smooth brighter backdrop/sky around a dark subject."""
+    h, w = before_px.shape[:2]
+    if h < 12 or w < 12 or after_px.shape != before_px.shape:
+        return False
+    src = source_size if (source_size and all(v > 0 for v in source_size)) else (w, h)
+    geom = RenderGeometry.full(src, candidate.composition, (w, h), candidate.lens_corrections.distortion)
+    spatial_w = gradient_weight(mask, geom)
+    region = spatial_w >= 0.25
+    if int(region.sum()) < 32:
+        return False
+    b_f = before_px.astype(np.float32) / 255.0
+    a_f = after_px.astype(np.float32) / 255.0
+    l0 = 0.2126 * b_f[..., 0] + 0.7152 * b_f[..., 1] + 0.0722 * b_f[..., 2]
+    l1 = 0.2126 * a_f[..., 0] + 0.7152 * a_f[..., 1] + 0.0722 * a_f[..., 2]
+    gx = np.abs(np.diff(l0, axis=1, prepend=l0[:, :1]))
+    gy = np.abs(np.diff(l0, axis=0, prepend=l0[:1, :]))
+    grad = gx + gy
+    p30 = float(np.percentile(l0[region], 30))
+    smooth_bg = region & (grad < 0.035) & (l0 > p30 + 0.05)
+    if int(smooth_bg.sum()) < max(24, int(0.08 * int(region.sum()))):
+        return False
+    dark_subj = region & (l0 <= p30 + 0.03)
+    bg_lift = float((l1 - l0)[smooth_bg].mean())
+    subj_lift = float((l1 - l0)[dark_subj].mean()) if bool(dark_subj.any()) else 0.0
+    bg_rb0 = float((b_f[..., 0] - b_f[..., 2])[smooth_bg].mean())
+    bg_rb1 = float((a_f[..., 0] - a_f[..., 2])[smooth_bg].mean())
+    warm_spill = (bg_rb1 - bg_rb0) > 0.045 and bg_rb0 <= 0.05
+    return (
+        bg_lift > 0.055
+        or (bg_lift > 0.030 and bg_lift > max(0.015, subj_lift * 1.15))
+        or warm_spill
+    )
 
 
 def build_reflexion_prompt_summary(report: AgentReport, metrics_delta: dict) -> dict:
@@ -373,8 +433,10 @@ def build_reflexion_prompt_summary(report: AgentReport, metrics_delta: dict) -> 
         )
     else:
         instruction = (
-            "Numeric checks passed cleanly. Inspect the rendered trial preview visually for halos, color casts, or "
-            "unnatural transitions; if the result meets the user's goal cleanly, deliver your final structured feedback."
+            'Numeric checks passed cleanly. Inspect the rendered trial preview visually for halos, color casts, or '
+            'unnatural transitions; if you recommend this verified trial, deliver your final structured feedback with '
+            'workflow.decision="recommend" and copy the EXACT verified actions array into top-level "actions" '
+            '(leaving "actions" empty or setting decision="inspect" disables the user\'s Apply button).'
         )
     return {"needs_repair": needs_repair, "reasons": reasons, "instruction": instruction}
 

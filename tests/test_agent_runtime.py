@@ -523,3 +523,156 @@ def test_agent_runtime_precomputes_lighting_anchors_and_retries_turn2_rate_limit
     # Rate limit on Turn 2 retried once and completed Turn 2 final guidance cleanly
     assert calls == 3 and budget.attempts == 3 and budget.in_flight == 0
     assert res.feedback.agent_report and res.feedback.agent_report.can_apply
+
+
+def test_recommend_with_omitted_actions_recovers_verified_best_trial():
+    _, state, request = _make_request()
+    cfg = api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini")
+    calls = 0
+
+    def transport(c, key, payload_bytes, cancel):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 200, _tool_response("gemini", "propose_and_preview_trial", {
+                "actions": [{"operation": "add", "parameter": "exposure_ev", "value": 0.5}],
+                "workflow": _sample_workflow(metric="mean_luminance", direction="increase"),
+            })
+        return 200, _final_response("gemini", _final_json(
+            actions=[],
+            workflow=_sample_workflow(decision="recommend", metric="mean_luminance", direction="increase"),
+        ))
+
+    def render_trial(values):
+        return quantize_srgb(render_edit(np.full((64, 96, 3), 0.10, dtype=np.float32), values))
+
+    runtime = AgentRuntime(
+        api.ApiCoach(cfg, "test-key", transport=transport),
+        build_default_tool_registry(),
+        run_budget=RunBudget(max_llm_turns=3),
+    )
+    res = runtime.run(request, state=state, render_trial=render_trial)
+    assert res.turns_used == 2
+    assert res.feedback.agent_report and res.feedback.agent_report.can_apply is True
+    assert len(res.feedback.actions) == 1
+    assert res.feedback.actions[0].new_value == 0.5
+
+
+@pytest.mark.parametrize("decision", ["stop", "inspect"])
+def test_stop_or_inspect_after_trial_does_not_force_apply(decision):
+    _, state, request = _make_request()
+    cfg = api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini")
+    calls = 0
+
+    def transport(c, key, payload_bytes, cancel):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 200, _tool_response("gemini", "propose_and_preview_trial", {
+                "actions": [{"operation": "add", "parameter": "exposure_ev", "value": 0.5}],
+                "workflow": _sample_workflow(metric="mean_luminance", direction="increase"),
+            })
+        return 200, _final_response("gemini", _final_json(
+            actions=[],
+            workflow=_sample_workflow(decision=decision, metric="visual", direction="visual"),
+        ))
+
+    def render_trial(values):
+        return quantize_srgb(render_edit(np.full((64, 96, 3), 0.10, dtype=np.float32), values))
+
+    runtime = AgentRuntime(
+        api.ApiCoach(cfg, "test-key", transport=transport),
+        build_default_tool_registry(),
+        run_budget=RunBudget(max_llm_turns=3),
+    )
+    res = runtime.run(request, state=state, render_trial=render_trial)
+    assert res.feedback.actions == ()
+    assert res.feedback.agent_report is not None
+    assert res.feedback.agent_report.status == "no_edit"
+    assert res.feedback.agent_report.can_apply is False
+
+
+def test_policy_blocked_final_actions_are_not_overridden_by_best_trial():
+    store = StateStore()
+    state = store.activate(Path("C:/secret-dir/private-raw.ARW"), "secret-hash-pref")
+    pixels = np.full((64, 96, 3), 72, dtype=np.uint8)
+    request = build_request(state, state, store.events, pixels, pixels, question="", source_size=(96, 64))
+    cfg = api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini")
+    calls = 0
+
+    def transport(c, key, payload_bytes, cancel):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 200, _tool_response("gemini", "propose_and_preview_trial", {
+                "actions": [{"operation": "add", "parameter": "exposure_ev", "value": 0.4}],
+                "workflow": _sample_workflow(metric="mean_luminance", direction="increase"),
+            })
+        pref_wf = _sample_workflow(decision="recommend", metric="visual", direction="visual")
+        pref_wf["findings"][0]["category"] = "preference"
+        return 200, _final_response("gemini", _final_json(
+            actions=[{"operation": "add", "parameter": "saturation", "value": 0.1}],
+            workflow=pref_wf,
+        ))
+
+    def render_trial(values):
+        return quantize_srgb(render_edit(np.full((64, 96, 3), 0.10, dtype=np.float32), values))
+
+    runtime = AgentRuntime(
+        api.ApiCoach(cfg, "test-key", transport=transport),
+        build_default_tool_registry(),
+        run_budget=RunBudget(max_llm_turns=3),
+    )
+    res = runtime.run(request, state=state, render_trial=render_trial)
+    assert res.feedback.actions == ()
+    assert res.feedback.action_notice != ""
+    assert res.feedback.agent_report is not None and res.feedback.agent_report.can_apply is False
+
+
+def test_full_retouch_mode_allows_multipass_trial_refinement_without_early_exit():
+    _, state, request = _make_request()
+    cfg = api.ApiConfig(api.GEMINI_ENDPOINT, "gemini-3.5-flash", "gemini")
+    seen_docs: list[dict] = []
+
+    def transport(c, key, payload_bytes, cancel):
+        doc = json.loads(payload_bytes.decode("utf-8"))
+        seen_docs.append(doc)
+        step_n = len(seen_docs)
+        if step_n == 1:
+            return 200, _tool_response("gemini", "propose_and_preview_trial", {
+                "actions": [{"operation": "set", "parameter": "exposure_ev", "value": 0.6}],
+                "workflow": _sample_workflow(metric="mean_luminance", direction="increase"),
+            })
+        if step_n == 2:
+            # In full_retouch mode, tools must STILL remain enabled on Turn 2 after clean Trial #1!
+            assert "tools" in doc and doc["tools"]
+            return 200, _tool_response("gemini", "propose_and_preview_trial", {
+                "actions": [
+                    {"operation": "set", "parameter": "exposure_ev", "value": 0.6},
+                    {"operation": "set", "parameter": "contrast", "value": 0.25},
+                ],
+                "workflow": _sample_workflow(metric="mean_luminance", direction="increase"),
+            })
+        return 200, _final_response("gemini", _final_json(
+            actions=[
+                {"operation": "set", "parameter": "exposure_ev", "value": 0.6},
+                {"operation": "set", "parameter": "contrast", "value": 0.25},
+            ],
+            workflow=_sample_workflow(decision="recommend", metric="mean_luminance", direction="increase"),
+        ))
+
+    def render_trial(values):
+        return quantize_srgb(render_edit(np.full((64, 96, 3), 0.12, dtype=np.float32), values))
+
+    runtime = AgentRuntime(
+        api.ApiCoach(cfg, "test-key", transport=transport),
+        build_default_tool_registry(),
+        run_budget=RunBudget(max_llm_turns=5, max_trial_renders=4, retouch_mode="full_retouch"),
+    )
+    res = runtime.run(request, state=state, render_trial=render_trial)
+    assert res.turns_used == 3
+    assert res.trial_renders_used == 2
+    assert res.feedback.agent_report and res.feedback.agent_report.can_apply is True
+    assert "Multi-Pass Full Retouch Workflow" in seen_docs[0]["systemInstruction"]["parts"][0]["text"]
+    assert res.feedback.actions[0].changes == (("exposure_ev", 0.6), ("contrast", 0.25))
+

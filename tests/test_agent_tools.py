@@ -212,3 +212,29 @@ def test_detect_lighting_som_overlay_build_rig_and_trial_comparison():
     assert trial_res.ok and trial_res.payload["can_apply"] is True
     assert not trial_res.payload["reflexion"]["needs_repair"]
     assert len(trial_res.images) == 1 and max(trial_res.images[0].pixels.shape[:2]) <= 768
+
+
+def test_build_lighting_rig_isolates_sky_backed_silhouette():
+    from photocoach.coach_actions import analyze_scene_lighting, resolve_actions
+
+    h, w = 180, 270
+    scene = np.empty((h, w, 3), dtype=np.uint8)
+    scene[:, :] = [64, 80, 104]  # twilight sky backdrop
+    scene[55:145, 95:175] = [18, 16, 14]  # dark silhouette subject
+    anchors = analyze_scene_lighting(scene, question="Relight the central silhouette")
+    cands = anchors.get("subject_candidates", [])
+    assert cands and cands[0]["sky_backed_silhouette"] is True
+
+    store = StateStore()
+    state = store.activate(Path("dusk.ARW"), "dusk-id")
+    req = build_request(state, state, [], scene, scene, question="Relight subject", source_size=(w, h))
+    reg = build_default_tool_registry()
+    ctx = ToolContext(request=req, state=state, render_trial=lambda _: scene)
+    rig = reg.execute(ToolCall("c1", "build_lighting_rig", {"recipe": "spotlight", "subject_id": 1}), ctx)
+    assert rig.ok and rig.payload["sky_backed_silhouette"] is True
+    assert len(rig.payload["actions"]) == 2  # No stacked 3rd positive crest orb
+    key = rig.payload["actions"][0]
+    assert key["edge_aware"] is True
+    assert 0.16 <= key["luma_max"] <= 0.42
+    assert key["warmth"] <= 0.12
+    assert resolve_actions(rig.payload["actions"], state.values, (w, h))

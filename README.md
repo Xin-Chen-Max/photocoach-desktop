@@ -8,6 +8,26 @@ The original photograph stays untouched. Editing, project recovery, and export r
 
 *Workspace demonstration using a public-domain JPEG. It shows the interface and controls, not RAW decoding. [Image credit](THIRD_PARTY_NOTICES.md#demonstration-photograph).*
 
+## Before & After Showcase
+
+All edits below run through PhotoCoach's non-destructive 16-bit linear/sRGB RAW pipeline (**Schema 14 / `phase1-sdr-srgb-v14`**) with read-only `.ARW`/`.NEF` originals and single-step Undo.
+
+**Twilight Cityscape (`DSC_0900.NEF` · Local `qwen3.6:27b` Full Retouch · 11 edits / 4 trials)** — `Exposure +1.8 EV`, `Shadows +0.7`, `Highlights -0.4`, `Contrast +0.1`, S-curve, warm sunset & blue sky HSL, Teal/Orange 3-way Color Grading, `Vignetting -0.4 EV`:
+
+![Twilight cityscape before and after full retouch](docs/images/showcase/twilight-cityscape-before-after.jpg)
+
+**Dusk Skyline Sunset (`DSC_0906.NEF` · Local `qwen3.6:27b` Full Retouch · 8 edits / 5 trials)** — `Exposure +1.8 EV`, `Highlights -0.7`, `Shadows +0.7`, `Contrast +0.25`, S-curve, sunset red/orange/yellow HSL + cool shadow / warm highlight Color Grading, `Vignetting -0.6 EV`:
+
+![Dusk skyline sunset before and after full retouch](docs/images/showcase/sunset-skyline-before-after.jpg)
+
+**Sunlit Rocky Hillside (`7C204108.ARW` · Local `qwen3.6:27b` Full Retouch · 10 edits / 2 trials)** — `Exposure +1.5 EV`, `Shadows +0.6`, `Highlights -0.2`, `Contrast +0.2`, S-curve, warm midtone / cool shadow Color Grading, earthy HSL boost, `Vignetting -0.5 EV`:
+
+![Sunlit rocky hillside before and after full retouch](docs/images/showcase/sunlit-hillside-before-after.jpg)
+
+**Edge-Aware Luminance-Range Local Masking (Schema 14 Anti-Halo)** — 4-panel comparison of dusk silhouette lighting (`Before` vs. `Unmasked Orb Halo` vs. `Luma Range + Edge-Aware Guided Filter` vs. `Effective Mask Overlay`):
+
+![Edge-aware luminance-range local masking before and after anti-halo comparison](docs/images/showcase/local-mask-antihalo-before-after.png)
+
 ## Download for Windows
 
 [Download PhotoCoach 0.12.1 for Windows 64-bit](https://github.com/Xin-Chen-Max/photocoach-desktop/releases/tag/v0.12.1) ([0.12.0 archive](https://github.com/Xin-Chen-Max/photocoach-desktop/releases/tag/v0.12.0)).
@@ -17,13 +37,14 @@ Extract the whole ZIP and run **PhotoCoach/PhotoCoach.exe**. Keep `_internal` be
 ## Features
 
 - Exposure, highlights, shadows, whites, blacks, contrast, saturation, vibrance, and sensor white balance.
-- Natural / As Shot and Neutral base rendering, a shared RGB curve, and an eight-color HSL mixer.
-- Crop, straighten, manual lens distortion/vignetting, and up to four linear or radial masks (with 3D spotlight rig lighting).
+- Natural / As Shot and Neutral base rendering, a shared RGB curve, 3-way Color Grading (Shadows / Midtones / Highlights wheels with blend & balance), and an eight-color HSL mixer.
+- Crop, straighten, manual lens distortion/vignetting, non-destructive spot removal / healing (`Heal` / `Clone`), and up to four linear, radial, or brush masks with perceptual luminance-range (`Luma min` / `Luma max` / `Range feather`) and edge-aware guided filtering (anti-halo).
 - Calibrated detail engine: sharpening, edge masking, luminance noise reduction, and color noise reduction running before display reduction.
 - Progressive previews, 100% detail inspection, seamless zoom pyramid, histogram, clipping overlays, and a neutral white balance picker.
-- Grouped undo/redo and local projects that preserve edit history.
+- Named snapshots with zoom/pan-preserving A/B comparison, grouped undo/redo, and local Schema 14 projects that preserve full edit history.
 - Full-resolution JPEG and 16-bit TIFF export with an embedded sRGB profile.
-- Autonomous multimodal coaching agent (Agent v2) with a bounded ReAct state-graph runtime (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`), visual reflexion self-repair, and strict turn/budget limits.
+- Autonomous multimodal coaching agent (Agent v2) with a bounded ReAct state-graph runtime (`observe -> reason -> tool_call -> trial_render -> reflect -> finalize`), default multi-pass **Full Retouch** & **Coach** modes, visual reflexion trial self-repair (including `halo_bleed` anti-halo checks & silhouette isolation), manual **Did it help?** follow-up review, and strict turn/budget limits.
+- Built-in **Local LLM Multi-Model Manager** (`Manage local AI`: curated catalog, VRAM fit detection, Managed/Existing Ollama modes, live download/verification, and darkroom `TrialCompareWidget` split/side-by-side viewer) alongside Cloud Gemini / OpenAI connections.
 - Active Vision toolset: 1:1 demosaiced crop inspection (`inspect_region_100pct`), normalized Bayer CFA sensor headroom probing (`probe_sensor_headroom`), and 8-band HSL/CIELAB zoning (`analyze_hsl_zones`).
 - Unified multi-protocol tool calling across Gemini (`thoughtSignature` + `$ref` multimodal `FunctionResponse.parts`), OpenAI Responses, Chat Completions, and local Ollama (`qwen3.6:27b`).
 - Read-only Model Context Protocol (MCP `2025-06-18`) stdio server (`photocoach-mcp`) sharing editing and sensor diagnostic tools with external agents.
@@ -94,7 +115,7 @@ To build a portable executable on Windows:
 - The pipeline is SDR. LibRaw's integer output can clip highlights or out-of-gamut colors before later edits; negative exposure cannot recover those values.
 - Natural is an independent baseline look. It does not reproduce a camera JPEG or a commercial RAW processor. Camera profiles, monitor-profile conversion and HDR display are not implemented.
 - Native detail processing makes large Fit updates slower. Retained-cache limits do not bound total process peak memory.
-- Brush masks, healing, a photo library, automatic saving and AI denoise are not included.
+- A photo library, automatic saving, automatic lens profiles, and AI denoise are not included.
 - Model capability checks do not establish aesthetic judgment, account quota or repeated coaching quality. A local model and Ollama require separate installation/preparation.
 - The executable is unsigned. Another physical Windows machine and ARM64 have not been validated.
 

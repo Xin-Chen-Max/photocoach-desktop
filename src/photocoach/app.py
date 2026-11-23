@@ -100,6 +100,40 @@ TIMED_JOB_KINDS = ("preview", "detail", "adjusting")
 ADJUSTING_MAX_EDGE = 960
 
 
+def display_render_spec(state: ProbeState) -> tuple[RawOptions, EditValues]:
+    """Return the (RawOptions, EditValues) pair to render on canvas without altering state.values.
+
+    - Baseline comparison keeps current crop/angle and distortion with neutral vignetting.
+    - Snapshot A/B comparison keeps the snapshot's tone/color/detail/local masks while
+      aligning crop/angle and distortion to the active viewport geometry so pan/zoom stay intact.
+    """
+    if state.compare_baseline:
+        return (
+            RawOptions(),
+            EditValues(
+                base_rendering=state.base_rendering,
+                composition=state.composition,
+                lens_corrections=LensCorrections(state.lens_corrections.distortion),
+            ),
+        )
+    if state.compare_snapshot is not None:
+        snap = state.compare_snapshot.values
+        if (
+            snap.composition != state.composition
+            or snap.lens_corrections.distortion != state.lens_corrections.distortion
+        ):
+            snap = replace(
+                snap,
+                composition=state.composition,
+                lens_corrections=replace(
+                    snap.lens_corrections,
+                    distortion=state.lens_corrections.distortion,
+                ),
+            )
+        return snap.raw_options, snap
+    return state.raw_options, state.values
+
+
 class PreviewEngine:
     """Used exclusively by the serial worker; never decode for an EV change."""
     def __init__(self) -> None:
@@ -141,7 +175,7 @@ class PreviewEngine:
         key = (photo.metadata["sha256"], photo.options, photo.half_size, values)
         if key != self._histogram_key:
             with timed(self.timer, "histogram"):
-                options={} if not (any(g.active for g in values.local_gradients) or values.lens_corrections != LensCorrections()) else {
+                options={} if not (any(g.active for g in values.local_gradients) or any(s.active for s in values.spots) or values.lens_corrections != LensCorrections()) else {
                     'source_size':(photo.linear_rgb.shape[1],photo.linear_rgb.shape[0]) if not photo.half_size else oriented_size(photo.metadata)}
                 self._histogram = sampled_histogram(photo.linear_rgb, values,**options)
             self._histogram_key = key
@@ -170,8 +204,7 @@ class PreviewEngine:
         return replace(photo, metadata=self._display_metadata(photo, values)), quantize_srgb(render_edit(small, values))
 
     def render(self, state: ProbeState):
-        values = EditValues(base_rendering=state.base_rendering, composition=state.composition,
-            lens_corrections=LensCorrections(state.lens_corrections.distortion)) if state.compare_baseline else state.values
+        options, values = display_render_spec(state)
         if values.detail.active:
             # A half-size decode changes the radius/noise represented by detail
             # controls. Restored projects must use the same native filters too.
@@ -181,11 +214,9 @@ class PreviewEngine:
             request = DetailRequest(0, full, (0, 0, *full),
                                     max(1, int(np.ceil(max(full) / 1600))), size)
             return self.detail(state, request)
-        options = RawOptions() if state.compare_baseline else state.raw_options
         photo, small = self.photo(state.source_path, options)
         if photo.metadata["sha256"] != state.photo_id:
             raise RuntimeError("The source file has changed. Reopen the photo.")
-        values = EditValues(base_rendering=state.base_rendering, composition=state.composition, lens_corrections=LensCorrections(state.lens_corrections.distortion)) if state.compare_baseline else state.values
         started = time.perf_counter()
         pixels = self._render_small(photo, small, values, cancel=self.cancel, timer=self.timer)
         metadata = self._display_metadata(photo, values)
@@ -195,7 +226,7 @@ class PreviewEngine:
 
     def backdrop(self, state: ProbeState):
         """Render a viewport-independent full-frame backdrop strictly from already-decoded RAM cache."""
-        options = RawOptions() if state.compare_baseline else state.raw_options
+        options, values = display_render_spec(state)
         photo = self.cache.peek_loaded(state.photo_id, options)
         if photo is None:
             return None
@@ -204,28 +235,19 @@ class PreviewEngine:
             if self._small is not None and self._small_key == (state.photo_id, options)
             else reduce_linear(photo.linear_rgb)
         )
-        values = (
-            EditValues(
-                base_rendering=state.base_rendering,
-                composition=state.composition,
-                lens_corrections=LensCorrections(state.lens_corrections.distortion),
-            )
-            if state.compare_baseline
-            else state.values
-        )
         if values.detail.active:
             values = replace(values, detail=DetailControls())
         pixels = self._render_small(photo, small, values, cancel=self.cancel, timer=None)
         return pixels, output_size(oriented_size(photo.metadata), values.composition)
 
     def _source_size(self, state):
-        options = RawOptions() if state.compare_baseline else state.raw_options
+        options, _ = display_render_spec(state)
         warm = self.cache.full_identity == (state.photo_id, options)
         photo = self.cache.get(state.source_path, options, half_size=not warm, before_decode=self._clear_derived)
         return oriented_size(photo.metadata)
 
     def detail(self, state: ProbeState, request: DetailRequest, *, include_metadata=True):
-        options = RawOptions() if state.compare_baseline else state.raw_options
+        options, values = display_render_spec(state)
         started = time.perf_counter()
         size = request.source_size or request.full_size
         photo = self.cache.get(state.source_path, options, half_size=False,
@@ -233,7 +255,6 @@ class PreviewEngine:
                                before_decode=self._clear_derived)
         if photo.metadata["sha256"] != state.photo_id:
             raise RuntimeError("The source file has changed. Reopen the photo.")
-        values = EditValues(base_rendering=state.base_rendering, composition=state.composition, lens_corrections=LensCorrections(state.lens_corrections.distortion)) if state.compare_baseline else state.values
         small_bytes = 0 if self._small is None else self._small.nbytes
         temporary_bytes = 0 if self._adjusting_pixels is None else self._adjusting_pixels.nbytes
         if values.detail.active:
@@ -255,8 +276,7 @@ class PreviewEngine:
     def adjusting(self, state, request):
         """Fast tonal approximation; native spatial filters before reduction."""
         started = time.perf_counter()
-        values = EditValues(base_rendering=state.base_rendering, composition=state.composition,
-            lens_corrections=LensCorrections(state.lens_corrections.distortion)) if state.compare_baseline else state.values
+        options, values = display_render_spec(state)
         edge = ADJUSTING_MAX_EDGE if request.adjusting_edge is None else request.adjusting_edge
         if type(edge) is not int or not 160 <= edge <= 1280:
             raise ValueError("Invalid adjustment preview resolution.")
@@ -266,15 +286,13 @@ class PreviewEngine:
             l, t, r, b = request.rect
             native_request = replace(request, step=max(request.step, int(np.ceil(max(r-l, b-t) / edge))))
             return self.detail(state, native_request, include_metadata=False)
-        options = RawOptions() if state.compare_baseline else state.raw_options
         warm = self.cache.full_identity == (state.photo_id, options)
         photo = self.cache.get(state.source_path, options, half_size=not warm,
                                before_decode=self._clear_derived)
         if photo.metadata["sha256"] != state.photo_id:
             raise RuntimeError("The source file has changed. Reopen the photo.")
-        values = EditValues(base_rendering=state.base_rendering, composition=state.composition, lens_corrections=LensCorrections(state.lens_corrections.distortion)) if state.compare_baseline else state.values
         key = (state.photo_id, options, photo.half_size, id(photo.linear_rgb),
-               state.composition, request.full_size, request.rect, edge, values.lens_corrections.distortion)
+               values.composition, request.full_size, request.rect, edge, values.lens_corrections.distortion)
         if self._adjusting_key != key:
             self._adjusting_pixels = None
             self._adjusting_key = None
@@ -303,7 +321,8 @@ class PreviewEngine:
             self._adjusting_pixels, self._adjusting_key = pixels, key
         geometry=RenderGeometry(tuple(request.source_size or request.full_size),values.composition,
                                 request.rect,(self._adjusting_pixels.shape[1],self._adjusting_pixels.shape[0]),values.lens_corrections.distortion)
-        rendered = render_edit(self._adjusting_pixels, values, cancel=self.cancel, timer=self.timer,geometry=geometry)
+        rendered = render_edit(self._adjusting_pixels, values, cancel=self.cancel, timer=self.timer,geometry=geometry,
+                               source_linear=photo.linear_rgb)
         with timed(self.timer, "quantize"):
             pixels = quantize_srgb(rendered)
         metadata={}
@@ -323,21 +342,22 @@ class PreviewEngine:
         pixels, _, metadata = self.render(store.current)
         return store, pixels, metadata
 
-    def coach_request(self, state, before, events, question):
+    def coach_request(self, state, before, events, question, *, follow_up=None):
         images = []
         for snapshot in (before, state):
             photo, small = self.photo(snapshot.source_path, snapshot.raw_options)
             if photo.metadata["sha256"] != state.photo_id:
                 raise RuntimeError("The source changed. Reopen it before analysis.")
             images.append(self._render_small(photo, small, snapshot.values, 768))
-        return build_request(state, before, events, *images, question, source_size=oriented_size(photo.metadata))
+        return build_request(state, before, events, *images, question,
+                             source_size=oriented_size(photo.metadata), follow_up=follow_up)
 
     def render_trial_values(self, state, values: EditValues, *, source_size=None, cancel=None) -> np.ndarray:
         """Render one immutable EditValues candidate at <=768px using the formal Detail path."""
         if cancel is not None and cancel.is_set():
             raise CancelledError()
         from .composition import output_size
-        snapshot = replace(state.with_values(values), compare_baseline=False)
+        snapshot = replace(state.with_values(values), compare_baseline=False, compare_snapshot=None)
         size = source_size or self._source_size(snapshot)
         full = output_size(size, values.composition)
         detail = DetailRequest(0, full, (0, 0, *full), max(1, int(np.ceil(max(full) / 768))), size)
@@ -368,7 +388,7 @@ class PreviewEngine:
             raise ValueError("Crop coordinates must lie within [0, 1].")
         from .composition import output_size
         from .coach_agent import measure_preview
-        snapshot = replace(state, compare_baseline=not apply_current_edits)
+        snapshot = replace(state, compare_baseline=not apply_current_edits, compare_snapshot=None)
         size = self._source_size(snapshot)
         full = output_size(size, snapshot.composition)
         edge = max(128, min(512, int(size_px)))
@@ -419,7 +439,8 @@ class PreviewEngine:
             with timed(timer, "reduction"):
                 reduced = reduce_linear(small, max_edge)
             rendered = render_edit(reduced, values, cancel=cancel, timer=timer,
-                geometry=RenderGeometry.full(oriented_size(photo.metadata),values.composition,(reduced.shape[1],reduced.shape[0])))
+                geometry=RenderGeometry.full(oriented_size(photo.metadata),values.composition,(reduced.shape[1],reduced.shape[0])),
+                source_linear=reduced)
         else:
             rendered = render_photo(small, values, source_size=oriented_size(photo.metadata), max_edge=max_edge,
                                     cancel=cancel, timer=timer)
@@ -485,7 +506,7 @@ class MainWindow(QMainWindow):
         self._session_settings = {}
         self._session_only_ids = set()
         self.api_budget = SessionBudget()
-        self.local_budget = SessionBudget(call_limit=20, input_usd_per_million=0, output_usd_per_million=0)
+        self.local_budget = SessionBudget(call_limit=100, input_usd_per_million=0, output_usd_per_million=0)
         self._network_budget = None
         self._local_dialog = None
         self.credentials = credentials if credentials is not None else WindowsCredentialStore()
@@ -523,6 +544,16 @@ class MainWindow(QMainWindow):
             self.local_config = LocalConfig()
             startup_notice += " Local AI settings need to be configured again."
         self.local_budget.configure(call_limit=self.local_config.call_limit)
+        if self.api_settings is not None and self.api_settings.config.protocol == "ollama":
+            try:
+                synced_cfg = replace(
+                    self.api_settings.config,
+                    endpoint=self.local_config.endpoint,
+                    model=self.local_config.model,
+                )
+                self.api_settings = replace(self.api_settings, config=synced_cfg)
+            except Exception:
+                pass
         self.network_pool = QThreadPool(self)
         self.network_pool.setMaxThreadCount(1)
         self._network_active = None
@@ -532,6 +563,7 @@ class MainWindow(QMainWindow):
         self._network_timer.timeout.connect(self._update_network_progress)
         self._reviewing = False
         self._coach_generation = 0
+        self._pending_follow_up = False
         self._expanded_coach_height = 280
         self._coach_cancel_requested = False
         self._highlighted_label = None
@@ -562,11 +594,13 @@ class MainWindow(QMainWindow):
         self.style_memory_enabled.blockSignals(False)
         self.style_memory_enabled.toggled.connect(self.style_memory.set_enabled)
         self.clear_style_memory_button.clicked.connect(self.style_memory.clear)
-        self._notice_timer.timeout.connect(self.local_controller.show_notice)
+        self._notice_timer.timeout.connect(self._refresh_view_notice)
         self.coach_collapse.setChecked(True)
         self.coach_text.set_question_draft(self.question.text())
         for slider in (self.exposure_slider, *self.adjustment_sliders.values(), *self.color_mixer.sliders,
+                       *self.color_grading.sliders.values(),
                        *self.local_gradients.sliders.values(), self.local_gradients.feather, self.local_gradients.angle,
+                       *self.spots_editor.sliders.values(),
                        *self.lens_editor.sliders.values(), *self.detail_editor.sliders.values()):
             slider.installEventFilter(self)
         if not self.dev_mode:
@@ -598,7 +632,7 @@ class MainWindow(QMainWindow):
         for widget in (self.exposure_slider, self.base_rendering, self.wb_mode, self.apply_wb, self.compare, self.edited_button,
                        self.fit_button, self.actual_size_button, self.composition_button, self.crop_open_button,
                        self.export_button, self.report_button, self.save_project_button,
-                       self.reset_button, self.curve, self.reset_curve_button, self.lens_editor, self.detail_editor, self.color_mixer, self.local_gradients,self.clipping,self.goal, self.question, self.coach_light_menu_button,
+                       self.reset_button, self.curve, self.reset_curve_button, self.lens_editor, self.detail_editor, self.color_mixer, self.color_grading, self.local_gradients, self.spots_editor, self.snapshots_panel, self.clipping, self.goal, self.question, self.coach_light_menu_button,
                        *self.adjustment_sliders.values()):
             widget.setEnabled(enabled)
         self.pick_wb.setEnabled(enabled and not self._wb_sampling)
@@ -611,6 +645,7 @@ class MainWindow(QMainWindow):
         self.undo_button.setEnabled(enabled and bool(self.store.undo_stack))
         self.redo_button.setEnabled(enabled and bool(self.store.redo_stack))
         self.coach_text.set_edit_values(self.store.current.values if (enabled and self.store.current) else None)
+        self._sync_snapshots()
         self._update_crop_summary()
         self._update_coach_status()
 
@@ -666,7 +701,9 @@ class MainWindow(QMainWindow):
         self.apply_wb.setEnabled(self.wb_mode.isEnabled())
 
     def _pick_wb_toggled(self, enabled):
-        if enabled:self.local_gradients.edit_on_photo.setChecked(False)
+        if enabled:
+            self.local_gradients.edit_on_photo.setChecked(False)
+            self.spots_editor.edit_on_photo.setChecked(False)
         self.preview.set_neutral_picker(enabled)
         self.pick_wb.setText("Cancel white balance picker" if enabled else "Pick neutral white balance")
         if enabled:
@@ -697,6 +734,8 @@ class MainWindow(QMainWindow):
         self._formal_preview_session = None
         self.local_controller.layer.finish()
         self.local_gradients.edit_on_photo.setChecked(False)
+        self.spots_controller.layer.finish()
+        self.spots_editor.edit_on_photo.setChecked(False)
         self._cancel_obsolete_render()
         self._interactive_preview = False
         self._gesture_preview_edge = None
@@ -705,6 +744,7 @@ class MainWindow(QMainWindow):
         self._settle_timer.stop()
         self.store.end_drag()
         self._opening_project = None
+        self._pending_follow_up = False
         self._invalidate_coach("A new photo is opening.")
         self._generation += 1
         self._render_timer.stop()
@@ -852,7 +892,10 @@ class MainWindow(QMainWindow):
                 photo, pixels = result
                 state = self.store.activate(photo.source_path, photo.metadata["photo_id"], base_rendering="natural_v1")
                 self.agent_memory.clear()
+                self._pending_follow_up = False
                 self._project_path = None
+                self.snapshots_panel.clear_name_input()
+                self.snapshots_panel.set_feedback("")
                 for widget in (self.exposure_slider, self.compare, self.wb_mode):
                     widget.blockSignals(True)
                 self.exposure_slider.setValue(0)
@@ -903,7 +946,7 @@ class MainWindow(QMainWindow):
                 self._show_metadata(metadata)
                 self._record_render_details(job, elapsed, presentation=time.perf_counter() - presented)
                 self.status.clear()
-                options = RawOptions() if job.snapshot.compare_baseline else job.snapshot.raw_options
+                options, _ = display_render_spec(job.snapshot)
                 if (
                     not self.preview.has_current_full_frame()
                     and not self._interactive_preview
@@ -931,7 +974,10 @@ class MainWindow(QMainWindow):
             elif job.kind == "project_load":
                 self.store, pixels, metadata = result
                 self.agent_memory.clear()
+                self._pending_follow_up = False
                 self._project_path = self._opening_project
+                self.snapshots_panel.clear_name_input()
+                self.snapshots_panel.set_feedback("")
                 self.store.mark_preview(self.store.current)
                 self.filename.setText(self.store.current.source_path.name)
                 self.preview.configure_photo(oriented_size(metadata))
@@ -943,7 +989,8 @@ class MainWindow(QMainWindow):
                 self.open_button.setEnabled(True)
                 self.open_project_button.setEnabled(True)
                 self._set_controls(True)
-                self.status.setText("Project restored, including edit history and undo/redo.")
+                self._refresh_view_notice()
+                self.status.setText("Project restored, including edit history, snapshots, and undo/redo.")
                 self.coach_text.setPlainText("Project ready. Ask about the restored edit.")
                 self._auto_observed = self._auto_edit_key()
                 if self.local_controller.overlay_spec() is not None:self.preview.quick_current=False
@@ -965,6 +1012,7 @@ class MainWindow(QMainWindow):
                 self.output_status.show()
                 self.status.clear()
             elif job.kind in ("coach", "coach_check"):
+                self._record_coach_advice(result, job.snapshot.values, spans=getattr(result, "agent_trace", ()))
                 self.coach_text.show_feedback(result)
             elif job.kind == "api_prepare":
                 # Finish the serial render queue before entering a modal review.
@@ -991,7 +1039,7 @@ class MainWindow(QMainWindow):
             if job.kind in TIMED_JOB_KINDS and error is None and metadata.get('overlay_error'):
                 self.view_notice.setText(metadata['overlay_error'])
             elif job.kind in TIMED_JOB_KINDS and error is None and not self._notice_timer.isActive():
-                self.local_controller.show_notice()
+                self._refresh_view_notice()
         if job.kind in ("coach", "coach_check", "api_prepare"):
             if not valid:
                 self.coach.last_request = None
@@ -1029,11 +1077,17 @@ class MainWindow(QMainWindow):
     def _show_metadata(self, metadata: dict) -> None:
         self._metadata = metadata
         state = self.store.current
-        self.histogram.display(metadata.get("display_histogram"), baseline=bool(state and state.compare_baseline))
+        snap_name = state.compare_snapshot.name if (state and state.compare_snapshot is not None) else None
+        self.histogram.display(
+            metadata.get("display_histogram"),
+            baseline=bool(state and state.compare_baseline),
+            snapshot_name=snap_name,
+        )
         self._metadata_binding = None if state is None else {
             "photo_id": state.photo_id, "session_id": state.session_id,
             "preview_revision": self.store.preview_revision,
             "is_baseline": state.compare_baseline,
+            "compare_snapshot_id": state.compare_snapshot_id,
         }
         self.metadata_label.setText(
             f"{metadata.get('make', '—')} {metadata.get('model', '—')}\n"
@@ -1050,8 +1104,10 @@ class MainWindow(QMainWindow):
         self._refresh_history()
 
     def _record_render_details(self, job, elapsed, presentation=None):
+        snap_name = job.snapshot.compare_snapshot.name if job.snapshot.compare_snapshot is not None else None
         self._render_diagnostics = {"kind": job.kind, "revision": job.snapshot.revision,
             "elapsed_ms": round(elapsed * 1000, 1), "baseline": job.snapshot.compare_baseline,
+            "compare_snapshot_id": job.snapshot.compare_snapshot_id,
             "view_generation": self.preview.view_generation, "zoom": self.preview.zoom,
             "dpr": self.preview.devicePixelRatioF()}
         # Detailed timing stays in diagnostics; stage totals are summed worker
@@ -1060,10 +1116,15 @@ class MainWindow(QMainWindow):
             self._render_diagnostics.update(job.timing)
         if presentation is not None:
             self._render_diagnostics["presentation_ms"] = round(presentation * 1000, 1)
+        mode_label = (
+            "Baseline"
+            if job.snapshot.compare_baseline
+            else f"Snapshot ({snap_name})" if snap_name else "Edited"
+        )
         self.render_details.setText(
             f"{'Full detail' if job.kind == 'detail' else 'Quick preview'} · v{job.snapshot.revision}\n"
             f"Worker time: {elapsed * 1000:.0f} ms\n"
-            f"{'Baseline' if job.snapshot.compare_baseline else 'Edited'} · "
+            f"{mode_label} · "
             f"{self.preview.zoom * 100:.0f}% · DPR {self.preview.devicePixelRatioF():g}")
 
     def _show_preview_details(self):
@@ -1072,17 +1133,55 @@ class MainWindow(QMainWindow):
 
     def _sync_comparison_buttons(self):
         baseline = bool(self.store.current and self.store.current.compare_baseline)
+        comparing_snapshot = bool(self.store.current and self.store.current.compare_snapshot is not None)
         self.compare.blockSignals(True)
         self.compare.setChecked(baseline)
         self.compare.blockSignals(False)
-        self.edited_button.setChecked(not baseline)
+        self.edited_button.setChecked(not baseline and not comparing_snapshot)
+
+    def _sync_snapshots(self, *, selected_id: str | None = None) -> None:
+        if not hasattr(self, "snapshots_panel"):
+            return
+        state = self.store.current
+        self.snapshots_panel.set_snapshots(
+            self.store.snapshots if state else (),
+            compare_snapshot_id=state.compare_snapshot_id if state else None,
+            selected_id=selected_id,
+        )
+
+    def _refresh_view_notice(self) -> None:
+        state = self.store.current
+        if state and state.compare_snapshot is not None:
+            from .i18n import get_language
+            zh = get_language() == "zh"
+            snap = state.compare_snapshot
+            geom_aligned = (
+                snap.values.composition != state.composition
+                or snap.values.lens_corrections.distortion != state.lens_corrections.distortion
+            )
+            if zh:
+                text = f"A/B 对比：{snap.name}" + ("（已对齐当前构图）" if geom_aligned else "")
+            else:
+                text = f"Comparing A/B: {snap.name}" + (" (aligned crop)" if geom_aligned else "")
+            self.view_notice.setText(text)
+            return
+        self.local_controller.show_notice()
+        if not self.view_notice.text() and self.spots_editor.edit_on_photo.isChecked():
+            from .i18n import tr
+            self.view_notice.setText(tr("Spot removal overlay · display only", "污点修复标记 · 仅用于显示"))
 
     def _ensure_edited_view(self):
-        if self.store.current and self.store.current.compare_baseline:
-            # Do this before begin_drag: set_compare ends an existing transaction.
-            self.store.set_compare(False)
+        state = self.store.current
+        if state and (state.compare_baseline or state.compare_snapshot is not None):
+            # Do this before begin_drag: set_compare / set_compare_snapshot ends an existing transaction.
+            if state.compare_baseline:
+                self.store.set_compare(False)
+            if self.store.current and self.store.current.compare_snapshot is not None:
+                self.store.set_compare_snapshot(None)
             self._sync_comparison_buttons()
-            self.view_notice.setText("Showing edited photo")
+            self._sync_snapshots()
+            from .i18n import tr
+            self.view_notice.setText(tr("Showing edited photo", "当前显示编辑效果"))
             self._notice_timer.start()
 
     def _begin_parameter_gesture(self, name):
@@ -1124,15 +1223,121 @@ class MainWindow(QMainWindow):
 
     def change_compare(self, checked: bool) -> None:
         if self.store.current:
+            self._finish_gesture()
             self._interactive_preview = False
             self._gesture_preview_edge = None
             self._native_detail_preview = False
             self._settle_timer.stop()
             self._pending_backdrop = None
+            if not checked and self.store.current.compare_snapshot is not None:
+                self.store.set_compare_snapshot(None)
             self.store.set_compare(checked)
             self._sync_comparison_buttons()
+            self._sync_snapshots()
+            self._refresh_view_notice()
             self._invalidate_coach(keep_reference=True)
             self.request_preview()
+
+    def save_named_snapshot(self, name: str) -> None:
+        if not self.store.current or self._exporting or not self.snapshots_panel.isEnabled():
+            return
+        self._finish_gesture()
+        self.change_goal()
+        try:
+            snapshot = self.store.save_snapshot(name)
+        except ValueError as error:
+            self.snapshots_panel.set_feedback(str(error), error=True)
+            self.status.setText(str(error))
+            return
+        self.snapshots_panel.clear_name_input()
+        self.snapshots_panel.set_feedback("")
+        self._sync_snapshots(selected_id=snapshot.id)
+        self._refresh_history()
+        from .i18n import get_language
+        zh = get_language() == "zh"
+        self.status.setText(
+            f"已保存快照：{snapshot.name}" if zh else f"Saved snapshot: {snapshot.name}"
+        )
+
+    def delete_named_snapshot(self, snapshot_id: str) -> None:
+        if not self.store.current or self._exporting or not self.snapshots_panel.isEnabled():
+            return
+        self._finish_gesture()
+        was_comparing = self.store.current.compare_snapshot_id == snapshot_id
+        try:
+            removed = self.store.delete_snapshot(snapshot_id)
+        except ValueError as error:
+            self.snapshots_panel.set_feedback(str(error), error=True)
+            return
+        self.snapshots_panel.set_feedback("")
+        self._sync_comparison_buttons()
+        self._sync_snapshots()
+        self._refresh_view_notice()
+        self._refresh_history()
+        if was_comparing:
+            self._invalidate_coach(keep_reference=True)
+            self.request_preview()
+        from .i18n import get_language
+        zh = get_language() == "zh"
+        self.status.setText(
+            f"已删除快照：{removed.name}" if zh else f"Deleted snapshot: {removed.name}"
+        )
+
+    def restore_named_snapshot(self, snapshot_id: str) -> None:
+        if not self.store.current or self._exporting or not self.snapshots_panel.isEnabled():
+            return
+        self._finish_gesture()
+        was_comparing = (
+            self.store.current.compare_baseline
+            or self.store.current.compare_snapshot is not None
+        )
+        try:
+            snap = self.store.get_snapshot(snapshot_id)
+            changed = self.store.restore_snapshot(snapshot_id)
+        except ValueError as error:
+            self.snapshots_panel.set_feedback(str(error), error=True)
+            return
+        self.snapshots_panel.set_feedback("")
+        self._sync_controls()
+        self._refresh_view_notice()
+        if changed or was_comparing:
+            self._after_edit()
+        from .i18n import get_language
+        zh = get_language() == "zh"
+        self.status.setText(
+            (f"已恢复快照：{snap.name}（Ctrl+Z 可撤销）" if zh else f"Restored snapshot: {snap.name} · Undo (Ctrl+Z) reverts")
+            if changed
+            else (f"当前已与快照“{snap.name}”一致" if zh else f"Current edits already match snapshot: {snap.name}")
+        )
+
+    def change_compare_snapshot(self, snapshot_id: str | None) -> None:
+        if not self.store.current or self._exporting or not self.snapshots_panel.isEnabled():
+            return
+        self._finish_gesture()
+        self._interactive_preview = False
+        self._gesture_preview_edge = None
+        self._native_detail_preview = False
+        self._settle_timer.stop()
+        self._pending_backdrop = None
+        try:
+            self.store.set_compare_snapshot(snapshot_id)
+        except ValueError as error:
+            self.snapshots_panel.set_feedback(str(error), error=True)
+            self._sync_snapshots()
+            return
+        self.snapshots_panel.set_feedback("")
+        self._sync_comparison_buttons()
+        self._sync_snapshots(selected_id=snapshot_id)
+        self._refresh_view_notice()
+        self._invalidate_coach(keep_reference=True)
+        self.request_preview()
+        from .i18n import get_language
+        zh = get_language() == "zh"
+        if self.store.current.compare_snapshot is not None:
+            snap_name = self.store.current.compare_snapshot.name
+            self.status.setText(f"A/B 对比：{snap_name}" if zh else f"Comparing A/B: {snap_name}")
+        else:
+            self.status.setText("已切回编辑效果" if zh else "Returned to edited view")
 
     def request_preview(self, *, interactive=False) -> None:
         if self.store.current and not self._exporting and not self._closing:
@@ -1155,7 +1360,7 @@ class MainWindow(QMainWindow):
                 self._queue(Job("adjusting", self._generation, lambda: self.engine.adjusting(state, request),
                                 state, view_request=request))
                 return
-            options = RawOptions() if state.compare_baseline else state.raw_options
+            options, _ = display_render_spec(state)
             if (self._refining_preview or (self.preview.needs_detail() and
                     self.engine.cache.full_identity == (state.photo_id, options))):
                 # Refine gestures through the formal path even at Fit. A cold
@@ -1217,7 +1422,7 @@ class MainWindow(QMainWindow):
             return
         # A quick render already queued for the current edit takes precedence.
         state = self.store.current
-        options = RawOptions() if state.compare_baseline else state.raw_options
+        options, _ = display_render_spec(state)
         if (not self._refining_preview and self.store.preview_revision != state.revision and
                 self.engine.cache.full_identity != (state.photo_id, options)):
             return
@@ -1244,7 +1449,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Output unavailable", str(error))
             return
-        self._freeze_output("Exporting full resolution using the current parameters. Baseline view does not change the export.")
+        self._freeze_output("Exporting full resolution using the current parameters. Baseline / A/B view does not change the export.")
 
         def export():
             self.engine.clear()
@@ -1304,10 +1509,12 @@ class MainWindow(QMainWindow):
 
     def _finish_gesture(self) -> None:
         self.local_controller.layer.finish()
+        self.spots_controller.layer.finish()
         was_dragging = self.store.gesture_active
         self.curve.finish()
         self.store.end_drag()
         self._refresh_history()
+        self._sync_coach_presentation()
         self.auto_schedule.released()
         if was_dragging:
             self._finalize_preview()
@@ -1364,9 +1571,11 @@ class MainWindow(QMainWindow):
         if self.store.current:
             self.preview.set_composition(self.store.current.composition, distortion=self.store.current.lens_corrections.distortion)
             self.local_controller.sync()
+            self.spots_controller.sync()
         self.preview.invalidate_edit("Adjusting" if interactive else "Refining")
         self.histogram.mark_updating()
         self._invalidate_coach(keep_reference=True, clear_auto=False)
+        self._sync_coach_presentation()
         self._auto_note_edit()
         self._show_version()
         if not self._render_timer.isActive():
@@ -1423,6 +1632,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         from .i18n import tr
+        if not self.question.text().strip():
+            self._pending_follow_up = False
         self.coach_text.set_question_draft(self.question.text())
         self._invalidate_coach(tr("Question updated. Analyze when ready.", "提问已更新，准备好后点击分析。"), keep_reference=True)
 
@@ -1442,7 +1653,7 @@ class MainWindow(QMainWindow):
             self.adjustment_labels[name].setText(f"{name.title()}  {value:.2f}")
         if sync:
             self._sync_controls()
-        self._after_edit(interactive=not sync and name in ("contrast", "saturation", "highlights", "shadows", "whites", "blacks", "vibrance", "rgb_curve", "color_mixer", "local_gradients", "lens_corrections", "detail"))
+        self._after_edit(interactive=not sync and name in ("contrast", "saturation", "highlights", "shadows", "whites", "blacks", "vibrance", "rgb_curve", "color_mixer", "color_grading", "local_gradients", "spots", "lens_corrections", "detail"))
 
     def change_goal(self) -> None:
         if self.store.current and not self._exporting and self.goal.text() != self.store.current.goal:
@@ -1473,15 +1684,18 @@ class MainWindow(QMainWindow):
                 self.adjustment_labels[name].setText(f"{name.title()}  {value:.2f}")
             self.curve.set_points(state.rgb_curve)
             self.color_mixer.set_values(state.color_mixer)
+            self.color_grading.set_values(state.color_grading)
             self.lens_editor.set_values(state.lens_corrections)
             self.detail_editor.set_values(state.detail)
             self.local_controller.sync()
+            self.spots_controller.sync()
             self.goal.setText(state.goal)
         finally:
             for widget in widgets:
                 widget.blockSignals(False)
         self._wb_form_enabled()
         self._sync_comparison_buttons()
+        self._sync_snapshots()
         self._update_crop_summary()
         self._refresh_history()
 
@@ -1495,21 +1709,51 @@ class MainWindow(QMainWindow):
         self.history_list.clear()
         events = self.store.events[self.store._event_start:]
         meaningful = [event for event in events if event.get("history_entry") or
-                      event["type"] in ("undo", "redo", "compare", "photo_switch", "project_open")]
+                      event["type"] in ("undo", "redo", "compare", "compare_snapshot", "snapshot_save", "snapshot_delete", "snapshot_restore", "photo_switch", "project_open")]
         from .coach_view import CONTROL_NAMES
-        type_names = {
-            "photo_switch": "Opened photo",
-            "project_open": "Opened project",
-            "compare": "View comparison",
-            "reset": "Reset all edits",
-            "undo": "Undo",
-            "redo": "Redo",
-        }
+        from .i18n import get_language
+        zh = get_language() == "zh"
+        type_names = (
+            {
+                "photo_switch": "打开照片",
+                "project_open": "打开工程",
+                "compare": "切换基准对比",
+                "compare_snapshot": "A/B 快照对比",
+                "snapshot_save": "保存快照",
+                "snapshot_delete": "删除快照",
+                "snapshot_restore": "恢复快照",
+                "reset": "重置全部修改",
+                "undo": "撤销",
+                "redo": "重做",
+            }
+            if zh
+            else {
+                "photo_switch": "Opened photo",
+                "project_open": "Opened project",
+                "compare": "View comparison",
+                "compare_snapshot": "A/B snapshot comparison",
+                "snapshot_save": "Saved snapshot",
+                "snapshot_delete": "Deleted snapshot",
+                "snapshot_restore": "Restored snapshot",
+                "reset": "Reset all edits",
+                "undo": "Undo",
+                "redo": "Redo",
+            }
+        )
         for event in meaningful[-100:]:
             etype = event["type"]
             param = event["parameter"] or ""
             if etype == "parameter":
                 detail = CONTROL_NAMES.get(param, param.replace("_", " ").title())
+            elif etype in ("snapshot_save", "snapshot_delete") and isinstance(event.get("after") or event.get("before"), dict):
+                snap_meta = event.get("after") or event.get("before")
+                detail = f"{type_names[etype]}: {snap_meta.get('name', '')}"
+            elif etype == "snapshot_restore" and isinstance(event.get("history_entry"), dict):
+                entry_label = event["history_entry"].get("label") or ""
+                if zh and entry_label.startswith("Restore snapshot: "):
+                    detail = f"恢复快照：{entry_label.removeprefix('Restore snapshot: ')}"
+                else:
+                    detail = entry_label or type_names[etype]
             else:
                 detail = type_names.get(etype, etype.replace("_", " ").title())
             self.history_list.addItem(f"{event['sequence']} · v{event['state_version']} · {detail}")
@@ -1517,8 +1761,16 @@ class MainWindow(QMainWindow):
             if item is not None:
                 item.setToolTip(f"{event['sequence']} · v{event['state_version']} · {etype} · {param}")
         self.history_list.scrollToBottom()
-        self.history_summary.setText(f"{len(events)} audit events · {len(self.store.undo_stack)} undo / {len(self.store.redo_stack)} redo\n"
-                                     + ("Unsaved changes" if self.store.dirty else "Saved state"))
+        if zh:
+            self.history_summary.setText(
+                f"{len(events)} 条审计事件 · {len(self.store.undo_stack)} 可撤销 / {len(self.store.redo_stack)} 可重做\n"
+                + ("有未保存修改" if self.store.dirty else "已保存状态")
+            )
+        else:
+            self.history_summary.setText(
+                f"{len(events)} audit events · {len(self.store.undo_stack)} undo / {len(self.store.redo_stack)} redo\n"
+                + ("Unsaved changes" if self.store.dirty else "Saved state")
+            )
         self.unsaved_label.setVisible(bool(self.store.current and self.store.dirty))
 
     def undo(self) -> None:
@@ -1544,6 +1796,7 @@ class MainWindow(QMainWindow):
     def reset_edits(self) -> None:
         if self.store.current and not self._exporting:
             self.local_controller.layer.finish()
+            self.spots_controller.layer.finish()
             self.curve.finish()
             self._ensure_edited_view()
             self.store.reset()
@@ -1569,6 +1822,10 @@ class MainWindow(QMainWindow):
 
     def open_project(self, path: Path, source_override: Path | None = None) -> None:
         self._formal_preview_session = None
+        self.local_controller.layer.finish()
+        self.local_gradients.edit_on_photo.setChecked(False)
+        self.spots_controller.layer.finish()
+        self.spots_editor.edit_on_photo.setChecked(False)
         self._cancel_obsolete_render()
         self._interactive_preview = False
         self._settle_timer.stop()
@@ -1577,6 +1834,7 @@ class MainWindow(QMainWindow):
         self._native_detail_preview = False
         self._refining_preview = False
         self._opening_project = path
+        self._pending_follow_up = False
         self._generation += 1
         self._render_timer.stop()
         self._stop_detail()
@@ -1693,7 +1951,20 @@ class MainWindow(QMainWindow):
         dialog = LocalModelsDialog(self, self.local_runtime, self.local_config)
         self._local_dialog = dialog
         dialog.selected.connect(self._use_local_config)
-        dialog.finished.connect(lambda: setattr(self, "local_config", dialog.config))
+        def _sync_local_on_close():
+            self.local_config = dialog.config
+            if self.api_settings is not None and self.api_settings.config.protocol == "ollama":
+                try:
+                    synced_cfg = replace(
+                        self.api_settings.config,
+                        endpoint=self.local_config.endpoint,
+                        model=self.local_config.model,
+                    )
+                    self.api_settings = replace(self.api_settings, config=synced_cfg)
+                except Exception:
+                    pass
+            self._update_coach_status()
+        dialog.finished.connect(_sync_local_on_close)
         dialog.show()
 
     def _use_local_config(self, config):
@@ -1704,7 +1975,8 @@ class MainWindow(QMainWindow):
         from .ollama_client import ENDPOINT
         self.local_config = config
         self.local_budget.configure(call_limit=config.call_limit)
-        settings = ApiSettings(ApiConfig(ENDPOINT, config.model, "ollama", 300, 4096),
+        endpoint = getattr(config, "endpoint", ENDPOINT)
+        settings = ApiSettings(ApiConfig(endpoint, config.model, "ollama", 300, 0),
                                {"call_limit": config.call_limit}, key_environment="", remember_settings=True)
         book = self.connection_book or ConnectionBook()
         if self.api_settings and book.active:
@@ -1772,7 +2044,8 @@ class MainWindow(QMainWindow):
         from .model_catalog import DEFAULT_CURATED, KNOWN_VISION_MODELS, is_ui_selectable_model; config = self.api_settings.config
         provider, scope = infer_provider(config), credential_target(config)
         if provider == "ollama":
-            return {self.local_config.model: self.local_config.model}
+            verified = tuple(getattr(self.local_config, "verified_models", ()) or ())
+            return {mid: mid for mid in (self.local_config.model, *verified) if mid}
         stored = self.model_catalog_store.get_models(provider, scope) if self.model_catalog_store else ()
         catalog = {m.id: m.id for m in stored if is_ui_selectable_model(provider, m.id)}
         for mid in (*DEFAULT_CURATED.get(provider, ()), *KNOWN_VISION_MODELS.get(provider, ())):
@@ -1806,6 +2079,12 @@ class MainWindow(QMainWindow):
         if self.connection_book and self.connection_book.active:
             self.connection_book = self.connection_book.with_model(self.connection_book.active, model)
         self.api_settings = replace(self.api_settings, config=config)
+        if config.protocol == "ollama" and hasattr(self.local_config, "with_active_model"):
+            try:
+                self.local_config = self.local_config.with_active_model(model)
+                self.local_runtime.store.save(self.local_config)
+            except Exception:
+                pass
         self._clear_model_prices()
         idx = self.coach_model_picker.findData(model)
         if idx >= 0:
@@ -2055,7 +2334,40 @@ class MainWindow(QMainWindow):
         self.analyze_button.setText(action)
         self.analyze_button.setEnabled(enabled and not self._closing and not self._exporting and not self.coach.paused)
         self.analyze_button.setToolTip(text("Ctrl+Enter to analyze. Enter adds a line.", "Ctrl+Enter 分析，Enter 换行。"))
+        ready_to_send = bool(
+            self.store.current and self.exposure_slider.isEnabled()
+            and not self._exporting and not self._closing and not self.coach.paused
+            and not self._reviewing and not busy
+            and (demo or config is not None)
+            and not (local and not self.local_config.verified_digest)
+        )
+        can_follow_up = ready_to_send and self._can_follow_up()
+        self.followup_button.setText(text("Did it help?", "效果复盘"))
+        self.followup_button.setEnabled(can_follow_up)
+        self.followup_button.setToolTip(
+            text(
+                "Evaluate adjustments since the previous coach advice against your goal.",
+                "基于上一轮教练建议与之后的调整，评估这次修改是否有效。",
+            )
+            if can_follow_up else
+            text(
+                "Enabled after receiving coach advice and making an edit or Undo on this photo.",
+                "需先对当前照片获取一轮教练建议，并继续编辑或撤销后才可复盘。",
+            )
+        )
         self.coach_questions_button.setEnabled(not busy and not self._reviewing and not self._closing)
+
+    def _can_follow_up(self) -> bool:
+        state = self.store.current
+        if state is None:
+            return False
+        return self.agent_memory.has_subsequent_edits(
+            state.photo_id,
+            state.session_id,
+            state.revision,
+            self.store.project_events(),
+            current_values=state.values,
+        )
 
     def _coach_primary_action(self):
         if not self.analyze_button.isEnabled():
@@ -2099,11 +2411,32 @@ class MainWindow(QMainWindow):
         if checked:
             self.goal.setFocus()
 
-    def _use_coach_question(self, text):
+    def _use_coach_question(self, text, *, follow_up: bool = False):
         self.coach_collapse.setChecked(False)
         self.question.selectAll()
         self.question.insert(text)
+        self._pending_follow_up = bool(follow_up)
         self.question.setFocus()
+
+    def ask_follow_up(self) -> None:
+        if (not self._can_follow_up() or self._coach_busy() or self._reviewing
+                or self._closing or self._exporting or self.coach.paused):
+            return
+        self.coach_collapse.setChecked(False)
+        state = self.store.current
+        prior = self.agent_memory.last_advice_for(state.photo_id, state.session_id) if state else None
+        current_q = self.question.text().strip()
+        from .i18n import get_language
+        zh = get_language() == "zh"
+        default_q = (
+            "结合上一轮教练建议和我的编辑目标，这次调整有帮助吗？请区分客观画面变化与主观偏好，并说明是否该停下。"
+            if zh else
+            "Did my adjustment help relative to your previous advice and my editing goal? Separate objective preview changes from preference, and tell me if I should stop."
+        )
+        if not current_q or (prior is not None and current_q == prior.question.strip()):
+            self.question.selectAll()
+            self.question.insert(default_q)
+        self.analyze(follow_up=True)
 
     def _show_coach_details(self) -> None:
         self.coach_details.show()
@@ -2162,6 +2495,9 @@ class MainWindow(QMainWindow):
         if name=='local_gradients' or name.startswith('local_gradients.'):
             self.local_controller.locate(name.partition('.')[2] or None)
             return
+        if name == "spots" or name.startswith("spots."):
+            self.spots_controller.locate()
+            return
         def reveal(widget, *, in_editor=True):
             self._navigation_target = widget
             def after_layout():
@@ -2169,12 +2505,22 @@ class MainWindow(QMainWindow):
                     return
                 widget.setFocus(Qt.FocusReason.OtherFocusReason)
                 if in_editor:
+                    panel = self.edit_scroll.widget()
+                    vp = self.edit_scroll.viewport()
+                    if panel is not None and vp is not None:
+                        for parent_widget in (widget.parentWidget(), self.color_grading, self.color_section, panel):
+                            if parent_widget is not None and parent_widget.layout() is not None:
+                                parent_widget.layout().activate()
+                        target_h = panel.heightForWidth(vp.width()) if panel.hasHeightForWidth() else panel.sizeHint().height()
+                        panel.resize(vp.width(), max(vp.height(), target_h))
+                        if panel.layout() is not None:
+                            panel.layout().activate()
                     self.edit_scroll.ensureWidgetVisible(widget, 0, 30)
             # Expanding a group posts a scroll-area resize. Scroll only after
             # that layout request, so a newly visible control is actually reached.
             QTimer.singleShot(0, self, after_layout)
         if name != "composition":
-            section = (self.detail_section if name == "detail" or name.startswith("detail.") else self.lens_section if name.startswith("lens_corrections") else self.color_section if name.startswith("color_mixer") or name in
+            section = (self.detail_section if name == "detail" or name.startswith("detail.") else self.lens_section if name.startswith("lens_corrections") else self.color_section if name.startswith("color_mixer") or name.startswith("color_grading") or name in
                        ("white_balance", "vibrance", "saturation") else
                        self.curve_section if name == "rgb_curve" else self.light_section)
             section.set_expanded(True)
@@ -2185,6 +2531,21 @@ class MainWindow(QMainWindow):
             self.color_mixer.locate(color)
             self.tabs.setCurrentIndex(0)
             reveal(self.color_mixer.color)
+            return
+        if name == "color_grading" or name.startswith("color_grading."):
+            sub = name.partition(".")[2]
+            widget, label = self.color_grading.locate(sub or None)
+            self.color_section.layout().activate()
+            self.edit_scroll.widget().layout().activate()
+            self._clear_control_highlight()
+            self.tabs.setCurrentIndex(0)
+            reveal(widget)
+            self._highlighted_label = label
+            label.setProperty("coachTarget", True)
+            label.style().unpolish(label)
+            label.style().polish(label)
+            label.update()
+            self._highlight_timer.start()
             return
         targets = {"exposure_ev": (self.exposure_slider, self.exposure_label),
                    "white_balance": (self.wb_mode, self.wb_form.labelForField(self.wb_mode)),
@@ -2231,7 +2592,11 @@ class MainWindow(QMainWindow):
         if not action.is_applied(self.store.current.values):
             self.status.setText("The edit does not match all suggested targets.")
             return False
-        self.agent_memory.mark_last_applied(action.label)
+        self.agent_memory.mark_last_applied(
+            action.label,
+            photo_id=self.store.current.photo_id,
+            session_id=self.store.current.session_id,
+        )
         try:
             self.style_memory.record_applied_edit(before_values, self.store.current.values, self.store.current.goal)
         except Exception:
@@ -2248,7 +2613,7 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Applied coach suggestion: {action.label} · Use Undo (Ctrl+Z) to compare.")
         return True
 
-    def _apply_coach_suggestion(self, index: int = 0) -> bool:
+    def _apply_coach_suggestion(self, index: int = 0, *, allow_previewed_override: bool = False) -> bool:
         state = self.store.current
         feedback = self.coach_text._feedback
         if state is None or feedback is None or self._exporting or not self.exposure_slider.isEnabled():
@@ -2258,8 +2623,14 @@ class MainWindow(QMainWindow):
                 or self.coach_text._superseded_question or self.coach_text._superseded_coach or self.store.gesture_active or self.coach_text.reference_revision is not None):
             return False
         actions = feedback.actions
-        if feedback.agent_plan and (not feedback.agent_report or not feedback.agent_report.can_apply):
-            return False
+        if feedback.agent_plan:
+            if not allow_previewed_override:
+                if not feedback.agent_report or not feedback.agent_report.can_apply:
+                    return False
+            else:
+                if (feedback.agent_plan.decision != "recommend" or bool(feedback.action_notice)
+                        or not feedback.agent_report or feedback.agent_report.trial_preview is None):
+                    return False
         if not (0 <= index < len(actions)):
             return False
         return not actions[index].is_applied(state.values) and self.apply_coach_action(actions[index])
@@ -2285,6 +2656,7 @@ class MainWindow(QMainWindow):
     def set_language(self, lang: str) -> None:
         from .i18n import apply_workspace_language
         apply_workspace_language(self, lang)
+        self._refresh_history()
         self._update_coach_status()
 
     def test_text_only(self) -> None:
@@ -2391,15 +2763,27 @@ class MainWindow(QMainWindow):
             self.coach_text.setPlainText(budget.blocked_reason, kind="error")
             return
         settings = self.api_settings
-        effective_cfg = (replace(settings.config,
-                                 max_output_tokens=max(settings.config.max_output_tokens, 8192),
-                                 timeout_seconds=max(settings.config.timeout_seconds, 90))
-                         if settings.config.protocol == "gemini" and (
-                             settings.config.max_output_tokens <= 1500 or settings.config.timeout_seconds <= 60
-                         )
-                         else settings.config)
+        if settings.config.protocol == "ollama":
+            local_out = 0 if settings.config.max_output_tokens in (0, 4096, 8192) else settings.config.max_output_tokens
+            effective_cfg = replace(
+                settings.config,
+                endpoint=self.local_config.endpoint,
+                model=self.local_config.model,
+                max_output_tokens=local_out,
+            )
+        elif settings.config.protocol == "gemini" and (
+            settings.config.max_output_tokens <= 1500 or settings.config.timeout_seconds <= 60
+        ):
+            effective_cfg = replace(
+                settings.config,
+                max_output_tokens=max(settings.config.max_output_tokens, 8192),
+                timeout_seconds=max(settings.config.timeout_seconds, 90),
+            )
+        else:
+            effective_cfg = settings.config
         skip_session = False
         max_turns = 1
+        retouch_mode = "full_retouch"
         self._reviewing = True
         self._update_coach_status()
         try:
@@ -2407,12 +2791,14 @@ class MainWindow(QMainWindow):
                 accepted = True
                 include_before = self._review_include_before
                 max_turns = getattr(self, "_review_max_turns", 1)
+                retouch_mode = getattr(self, "_review_retouch_mode", "full_retouch")
             else:
                 dialog = SendReviewDialog(self, request, effective_cfg, budget)
                 accepted = dialog.exec() == QDialog.DialogCode.Accepted
                 include_before = dialog.include_before.isChecked()
                 skip_session = dialog.skip_session.isChecked()
                 max_turns = getattr(dialog, "selected_max_turns", lambda: 1)()
+                retouch_mode = getattr(dialog, "selected_retouch_mode", lambda: "full_retouch")()
                 dialog.deleteLater()
         finally:
             self._reviewing = False
@@ -2429,12 +2815,21 @@ class MainWindow(QMainWindow):
             self._review_settings = settings
             self._review_include_before = include_before
             self._review_max_turns = max_turns
+            self._review_retouch_mode = retouch_mode
         while max_turns > 1 and budget.can_authorize_turns(max_turns) is not None:
             max_turns -= 1
+        if max_turns <= 1:
+            retouch_mode = "coach"
         try:
             # Credentials are read only for a user-confirmed request, never logged or serialized.
             key = resolve_api_key(settings, self.credentials)
             adapter = ApiCoach(effective_cfg, key)
+            if effective_cfg.protocol == "ollama":
+                if not getattr(self.local_config, "supports_tools", True):
+                    adapter.supports_tools = False
+                if not getattr(adapter, "supports_tools", False):
+                    max_turns = 1
+                    retouch_mode = "coach"
             if effective_cfg.protocol == "ollama" and self._local_dialog and self._local_dialog.busy:
                 raise ApiError("busy")
             ticket = budget.reserve()
@@ -2459,7 +2854,10 @@ class MainWindow(QMainWindow):
                 build_default_tool_registry(),
                 run_budget=RunBudget(
                     max_llm_turns=max_turns,
-                    max_wall_seconds=max(60.0, float(effective_cfg.timeout_seconds) * max_turns),
+                    max_tool_calls=min(48, max(12, max_turns * 4)),
+                    max_trial_renders=min(10, max(3, max_turns - 1)),
+                    max_wall_seconds=min(3600.0, max(120.0, float(effective_cfg.timeout_seconds) * max_turns)),
+                    retouch_mode=retouch_mode,
                 ),
                 session_budget=budget,
                 playbook=self.playbook,
@@ -2498,11 +2896,15 @@ class MainWindow(QMainWindow):
             if effective_cfg.protocol == "ollama":
                 try:
                     self.local_runtime.ensure_ready(local_config, cancel)
-                except Exception:
-                    raise ApiError("configuration") from None
+                except Exception as exc:
+                    raise ApiError("configuration", local_detail=str(exc)) from None
                 if not self.local_runtime.inference_lock.acquire(blocking=False):
                     raise ApiError("busy")
                 try:
+                    from .ollama_client import model_supports_tools
+                    if use_agent_loop and not model_supports_tools(effective_cfg.model, port=local_config.port):
+                        adapter.supports_tools = False
+                        return adapter.analyze(request, cancel_event=cancel, include_before=include_before, progress=progress)
                     return run_coach_call()
                 finally:
                     self.local_runtime.inference_lock.release()
@@ -2567,6 +2969,30 @@ class MainWindow(QMainWindow):
                                 f"{TRANSPORT_STAGES[stage].capitalize()} · {limit:g}s total connection limit · {context}")
         self._sync_coach_presentation()
 
+    def _record_coach_advice(self, feedback: CoachFeedback, values: EditValues | None, *, spans=()) -> None:
+        plan = getattr(feedback, "agent_plan", None)
+        actions = tuple(getattr(feedback, "actions", ()) or ())
+        self.agent_memory.record(
+            feedback.photo_id,
+            feedback.session_id,
+            TurnSummary(
+                state_version=feedback.state_version,
+                question=feedback.question,
+                decision=plan.decision if plan else "legacy",
+                objective=plan.objective if plan else (feedback.answer or feedback.main_change)[:120],
+                tools_used=tuple(
+                    s.name for s in spans if getattr(s, "node", "") in ("tool_call", "trial_render")
+                ),
+                action_label=actions[0].label if actions else "",
+                applied=bool(actions) and values is not None and all(a.is_applied(values) for a in actions),
+                parameters=values.to_dict() if values is not None else None,
+                proposed_actions=tuple(a.label for a in actions[:6]),
+                next_step=feedback.next_step_or_stop,
+                watch_stop=feedback.observe_and_stop_when,
+                goal=values.goal if values is not None else "",
+            ),
+        )
+
     def _network_done(self, result, error) -> None:
         if self._network_active is None:
             return
@@ -2604,20 +3030,6 @@ class MainWindow(QMainWindow):
                             })
                     except Exception:
                         pass
-                    plan = result.feedback.agent_plan
-                    self.agent_memory.record(
-                        result.feedback.photo_id, result.feedback.session_id,
-                        TurnSummary(
-                            state_version=result.feedback.state_version,
-                            question=result.feedback.question,
-                            decision=plan.decision if plan else "legacy",
-                            objective=plan.objective if plan else result.feedback.main_change[:80],
-                            tools_used=tuple(
-                                s.name for s in result.spans if s.node in ("tool_call", "trial_render")
-                            ),
-                            action_label=result.feedback.actions[0].label if result.feedback.actions else "",
-                        ),
-                    )
                     if result.feedback.agent_plan is not None and result.feedback.agent_report is None:
                         request = job.coach_request
                         if request is None:
@@ -2626,10 +3038,12 @@ class MainWindow(QMainWindow):
                             from .i18n import tr
                             self.coach_text.setPlainText(tr("Rendering and checking the proposed edit…", "正在生成并检查试调…"))
                             trial_cancel = threading.Event()
+                            pending_feedback = replace(result.feedback, agent_trace=result.spans)
                             self._queue(Job("coach_check", self._generation,
-                                lambda: self.engine.check_coach_trial(job.snapshot, request, result.feedback, cancel=trial_cancel),
+                                lambda: self.engine.check_coach_trial(job.snapshot, request, pending_feedback, cancel=trial_cancel),
                                 job.snapshot, job.coach_token, cancel=trial_cancel))
                     else:
+                        self._record_coach_advice(result.feedback, job.snapshot.values, spans=result.spans)
                         self.coach_text.show_feedback(result.feedback)
                 elif result.feedback.agent_plan is not None:
                     request = job.coach_request
@@ -2643,6 +3057,7 @@ class MainWindow(QMainWindow):
                             lambda: self.engine.check_coach_trial(job.snapshot, request, result.feedback, cancel=trial_cancel),
                             job.snapshot, job.coach_token, cancel=trial_cancel))
                 else:
+                    self._record_coach_advice(result.feedback, job.snapshot.values)
                     self.coach_text.show_feedback(result.feedback)
                 if (result.live_photo_response and self.api_settings and self.api_settings.config.model
                         and self.api_settings.remember_settings):
@@ -2754,7 +3169,7 @@ class MainWindow(QMainWindow):
             self._auto_timer.stop()
         self._update_auto_status()
 
-    def analyze(self, *, automatic=False) -> None:
+    def analyze(self, *, automatic=False, follow_up: bool = False) -> None:
         if self._coach_busy() or self._reviewing or self._closing:
             return
         if automatic and (not self.auto_mock.isChecked() or self.coach_mode.currentIndex() != 0):
@@ -2769,6 +3184,8 @@ class MainWindow(QMainWindow):
             return
         if not self.store.current or self.coach.paused or self._exporting or not self.analyze_button.isEnabled():
             return
+        want_follow_up = (not automatic) and (follow_up or self._pending_follow_up)
+        self._pending_follow_up = False
         self._finish_gesture()
         self.change_goal()
         self._coach_cancel_requested = False
@@ -2778,6 +3195,18 @@ class MainWindow(QMainWindow):
         state = self.store.current
         before = self.store.before_last_edit()
         events = self.store.project_events()
+        follow_up_ctx = None
+        if want_follow_up:
+            prior = self.agent_memory.last_advice_for(state.photo_id, state.session_id)
+            if prior is not None:
+                follow_up_ctx = self.agent_memory.follow_up_context(events, state)
+                if prior.parameters is not None:
+                    before = replace(
+                        state.with_values(EditValues.from_dict(prior.parameters)),
+                        revision=prior.state_version,
+                        compare_baseline=False,
+                        compare_snapshot=None,
+                    )
         question = self.question.text()
         token = self._coach_generation
         from .i18n import tr
@@ -2793,15 +3222,21 @@ class MainWindow(QMainWindow):
                     self.configure_api()
                 return
             self._queue(Job("api_prepare", self._generation,
-                lambda: self.engine.coach_request(state, before, events, question), state, token))
+                lambda: (self.engine.coach_request(state, before, events, question)
+                         if follow_up_ctx is None
+                         else self.engine.coach_request(state, before, events, question, follow_up=follow_up_ctx)),
+                state, token))
             return
         def analyze_current():
-            request = self.engine.coach_request(state, before, events, question)
+            request = (self.engine.coach_request(state, before, events, question)
+                       if follow_up_ctx is None
+                       else self.engine.coach_request(state, before, events, question, follow_up=follow_up_ctx))
             return self.engine.check_coach_trial(state, request, self.coach.analyze(request))
         self._queue(Job("coach", self._generation, analyze_current, state, token, automatic=automatic))
 
     def closeEvent(self, event) -> None:
         self.local_controller.layer.finish()
+        self.spots_controller.layer.finish()
         if not self._close_approved:
             if self.isVisible() and not self._allow_discard():
                 event.ignore()
